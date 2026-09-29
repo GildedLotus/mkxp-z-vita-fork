@@ -29,8 +29,13 @@ typedef enum THEORAPLAY_VideoFormat
     THEORAPLAY_VIDFMT_YV12,  /* NTSC colorspace, planar YCrCb 4:2:0 */
     THEORAPLAY_VIDFMT_IYUV,  /* NTSC colorspace, planar YCbCr 4:2:0 */
     THEORAPLAY_VIDFMT_RGB,   /* 24 bits packed pixel RGB */
-    THEORAPLAY_VIDFMT_RGBA   /* 32 bits packed pixel RGBA (full alpha). */
+    THEORAPLAY_VIDFMT_RGBA,  /* 32 bits packed pixel RGBA (full alpha). */
+    THEORAPLAY_VIDFMT_YUVTEX /* mkxp-z: planar YCbCr 4:2:0 for one RGBA texture:
+                                height Y rows, then height/2 rows of Cb|Cr side
+                                by side, every row THEORAPLAY_YUVTEX_PITCH bytes. */
 } THEORAPLAY_VideoFormat;
+
+#define THEORAPLAY_YUVTEX_PITCH(w) ((((unsigned int) (w)) + 7u) & ~7u)
 
 typedef struct THEORAPLAY_VideoFrame
 {
