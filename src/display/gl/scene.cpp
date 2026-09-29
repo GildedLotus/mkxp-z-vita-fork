@@ -72,10 +72,46 @@ void Scene::insertAfter(SceneElement &element, SceneElement &after)
 	elements.append(element.link);
 }
 
+/* The list is strictly sorted by operator< (creationStamp breaks every
+ * tie), so the element's slot is unique: walk to it from where it is
+ * instead of from the head. A camera scroll shifts every sprite's Y but
+ * rarely their order, so most calls stop at the neighbour check
+ * (the head search was quadratic per frame). */
 void Scene::reinsert(SceneElement &element)
 {
-	elements.remove(element.link);
-	insert(element);
+	IntruListLink<SceneElement> &link = element.link;
+	IntruListLink<SceneElement> *end = elements.end();
+
+	if (!link.next)
+	{
+		insert(element);
+		return;
+	}
+
+	IntruListLink<SceneElement> *iter = link.prev;
+
+	if (iter != end && element < *iter->data)
+	{
+		elements.remove(link);
+
+		while (iter != end && element < *iter->data)
+			iter = iter->prev;
+
+		elements.insertBefore(link, *iter->next);
+		return;
+	}
+
+	iter = link.next;
+
+	if (iter != end && *iter->data < element)
+	{
+		elements.remove(link);
+
+		while (iter != end && !(element < *iter->data))
+			iter = iter->next;
+
+		elements.insertBefore(link, *iter);
+	}
 }
 
 void Scene::notifyGeometryChange()
@@ -88,6 +124,17 @@ void Scene::notifyGeometryChange()
 	}
 }
 
+/* Draw-ordering epoch: one increment per element actually
+ * drawn. graphics.cpp compares it across viewport effect passes; content
+ * drawn in between forbids batching them onto one render-target switch.
+ * Composition runs on the RGSS thread only, like the rest of scene state. */
+static unsigned long long vitaSceneDrawEpoch = 0;
+
+unsigned long long sceneDrawEpoch()
+{
+	return vitaSceneDrawEpoch;
+}
+
 void Scene::composite()
 {
 	IntruListLink<SceneElement> *iter;
@@ -97,7 +144,10 @@ void Scene::composite()
 		SceneElement *e = iter->data;
 
 		if (e->visible)
+		{
 			e->draw();
+			++vitaSceneDrawEpoch;
+		}
 	}
 }
 

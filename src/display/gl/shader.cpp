@@ -25,9 +25,20 @@
 #include "sharedstate.h"
 #include "glstate.h"
 #include "exception.h"
+#include "bootprofile.h"
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "vita_glue.h"
+#include <SDL_video.h>
+#endif
+
+#ifdef __vita__
+#include "shader-cache.h"
+#endif
 
 #include <assert.h>
 #include <string.h>
+#include <stdio.h>
 #include <iostream>
 
 #ifndef MKXPZ_BUILD_XCODE
@@ -46,9 +57,11 @@
 #include "simpleAlphaUni.frag.xxd"
 #include "tilemap.frag.xxd"
 #include "flashMap.frag.xxd"
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 #include "bicubic.frag.xxd"
 #include "lanczos3.frag.xxd"
-#ifdef MKXPZ_SSL
+#endif
+#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
 #include "xbrz.frag.xxd"
 #endif
 #include "minimal.vert.xxd"
@@ -64,8 +77,11 @@
 #include "kglInvert.frag.xxd"
 #include "kglCompressAlpha.frag.xxd"
 #include "kglSubtract.frag.xxd"
+#include "movieYuv.frag.xxd"
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 #include "kglShadowH.frag.xxd"
 #include "kglShadowV.frag.xxd"
+#endif
 #endif
 
 #ifdef MKXPZ_BUILD_XCODE
@@ -112,7 +128,7 @@ static void printProgramLog(GLuint program)
 	std::clog << "Program log:\n" << log;
 }
 
-Shader::Shader() : initialized(false)
+Shader::Shader() : initialized(false), finalPresentationVariant(false)
 {
 #ifdef MKXPZ_BUILD_XCODE
     if (Shader::shaderCommon.empty())
@@ -122,6 +138,16 @@ Shader::Shader() : initialized(false)
 	fragShader = gl.CreateShader(GL_FRAGMENT_SHADER);
 
 	program = gl.CreateProgram();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* ShaderSet default-constructs ~25 of these; only scream on failure. */
+	if (!vertShader || !fragShader || !program) {
+		char tb[160];
+		snprintf(tb, sizeof(tb),
+		         "trace: Shader::Shader FAIL vert=%u frag=%u prog=%u",
+		         (unsigned)vertShader, (unsigned)fragShader, (unsigned)program);
+		vita_glue_trace(tb);
+	}
+#endif
 }
 
 Shader::~Shader()
@@ -149,14 +175,23 @@ std::string &Shader::commonHeader() {
 #endif
 
 static void setupShaderSource(GLuint shader, GLenum type,
-                              const unsigned char *body, int bodySize)
+                              const unsigned char *body, int bodySize, bool finalPresentation
+#ifdef __vita__
+                              , ShaderCache::Key *key = nullptr
+#endif
+                              )
 {
 	static const char glesDefine[] = "#define GLSLES\n";
 	static const char fragDefine[] = "#define FRAGMENT_SHADER\n";
 
-	const GLchar *shaderSrc[4];
-	GLint shaderSrcSize[4];
+	const GLchar *shaderSrc[5];
+	GLint shaderSrcSize[5];
 	size_t i = 0;
+	static const char probeDefine[] = "#define FINAL_PRESENTATION_PROBE\n";
+	if (finalPresentation) {
+		shaderSrc[i] = probeDefine;
+		shaderSrcSize[i++] = sizeof(probeDefine)-1;
+	}
 
 	if (gl.glsles)
 	{
@@ -185,6 +220,12 @@ static void setupShaderSource(GLuint shader, GLenum type,
 	shaderSrcSize[i] = bodySize;
 	++i;
 
+#ifdef __vita__
+	if (key) {
+		key->number(type); key->number(i);
+		for (size_t j = 0; j < i; ++j) key->bytes(shaderSrc[j], shaderSrcSize[j]);
+	}
+#endif
 	gl.ShaderSource(shader, i, shaderSrc, shaderSrcSize);
 }
 
@@ -202,10 +243,53 @@ void Shader::init(const unsigned char *vert, int vertSize,
 	                    "Attempted to call Shader::init() more than once");
 	}
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* Every program the engine can use is compiled and
+	 * linked in ShaderSet's constructor, at boot. A program built after the
+	 * boot seal would need a code-heap segment from an exhausted GPU pool
+	 * and hard-fail. */
+	GPUBudget::creationSite("shader program");
+#endif
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	{
+		char tb[160];
+		snprintf(tb, sizeof(tb), "trace: Shader::init %s", programName);
+		vita_glue_trace(tb);
+	}
+#endif
+
+	BootProfile::begin(BootProfile::Shaders);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	double compileMS = 0, linkMS = 0, binaryMS = 0;
+#endif
+	const struct { GLuint index; const char *name; } attributes[] = {
+		{Position, "position"}, {TexCoord, "texCoord"}, {Color, "color"}
+	};
+#ifdef __vita__
+	ShaderCache::Session &cache = ShaderCache::session();
+	ShaderCache::Key key = cache.identity();
+	for (const auto &attribute : attributes) { key.number(attribute.index); key.text(attribute.name); }
+	setupShaderSource(vertShader, GL_VERTEX_SHADER, vert, vertSize, finalPresentationVariant, &key);
+	setupShaderSource(fragShader, GL_FRAGMENT_SHADER, frag, fragSize, finalPresentationVariant, &key);
+	double binaryStart = vita_glue_frame_profile_now_us();
+	const char *cacheResult = cache.load(program, key);
+	binaryMS = (vita_glue_frame_profile_now_us() - binaryStart) / 1000.0;
+	bool cacheHit = !std::strcmp(cacheResult, "hit");
+#else
+	bool cacheHit = false;
+	const char *cacheResult = "disabled";
+	(void)cacheResult;
+	setupShaderSource(vertShader, GL_VERTEX_SHADER, vert, vertSize, finalPresentationVariant);
+	setupShaderSource(fragShader, GL_FRAGMENT_SHADER, frag, fragSize, finalPresentationVariant);
+#endif
+	if (!cacheHit) {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	double compileStart = vita_glue_frame_profile_now_us();
+#endif
 	GLint success;
 
 	/* Compile vertex shader */
-	setupShaderSource(vertShader, GL_VERTEX_SHADER, vert, vertSize);
 	gl.CompileShader(vertShader);
 
 	gl.GetShaderiv(vertShader, GL_COMPILE_STATUS, &success);
@@ -219,7 +303,6 @@ void Shader::init(const unsigned char *vert, int vertSize,
 	}
 
 	/* Compile fragment shader */
-	setupShaderSource(fragShader, GL_FRAGMENT_SHADER, frag, fragSize);
 	gl.CompileShader(fragShader);
 
 	gl.GetShaderiv(fragShader, GL_COMPILE_STATUS, &success);
@@ -232,13 +315,16 @@ void Shader::init(const unsigned char *vert, int vertSize,
 	                    fragName, programName);
 	}
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	compileMS = (vita_glue_frame_profile_now_us() - compileStart) / 1000.0;
+	double linkStart = vita_glue_frame_profile_now_us();
+#endif
 	/* Link shader program */
 	gl.AttachShader(program, vertShader);
 	gl.AttachShader(program, fragShader);
 
-	gl.BindAttribLocation(program, Position, "position");
-	gl.BindAttribLocation(program, TexCoord, "texCoord");
-	gl.BindAttribLocation(program, Color, "color");
+	for (const auto &attribute : attributes)
+		gl.BindAttribLocation(program, attribute.index, attribute.name);
 
 	gl.LinkProgram(program);
 
@@ -247,12 +333,44 @@ void Shader::init(const unsigned char *vert, int vertSize,
 	if (!success)
 	{
 		printProgramLog(program);
+#ifdef MKXPZ_VITAGL_BACKEND
+		throw Exception(Exception::MKXPError,
+	                    "GLSL: Cannot build program '%s' (vertex '%s', fragment '%s'): "
+	                    "its precompiled shader is missing or stale and no shader compiler is installed",
+	                    programName, vertName, fragName);
+#endif
 		throw Exception(Exception::MKXPError,
 	                    "GLSL: An error occurred while linking program '%s' (vertex '%s', fragment '%s')",
 	                    programName, vertName, fragName);
 	}
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	linkMS = (vita_glue_frame_profile_now_us() - linkStart) / 1000.0;
+#endif
+#ifdef __vita__
+	cache.save(program, key);
+#endif
+	}
 	initialized = true;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	{
+		char tb[160];
+		snprintf(tb, sizeof(tb), "vita-shader: name=%s compile_ms=%.3f link_ms=%.3f binary_ms=%.3f cache=%s prog=%u",
+		         programName, compileMS, linkMS, binaryMS, cacheResult, (unsigned)program);
+		vita_glue_trace(tb);
+	}
+#endif
+}
+
+void shaderBootComplete()
+{
+	BootProfile::end(BootProfile::Shaders);
+#ifdef MKXPZ_VITAGL_BACKEND
+	vita_glue_vgl_pool_ledger("shaders");
+#endif
+#ifdef __vita__
+	ShaderCache::session().summary();
+#endif
 }
 
 void Shader::initFromFile(const char *_vertFile, const char *_fragFile,
@@ -356,17 +474,145 @@ void FlatColorShader::setColor(const Vec4 &value)
 }
 
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+
+// Bounded boot-only selector; the eighth byte rejects any trailing content.
+static bool finalPresentationBoot(int &selected, bool &coordinates)
+{
+	unsigned char bytes[8] = {};
+	size_t count = 0;
+	FILE *file = fopen("app0:/diagnostics/final-presentation-probe", "rb");
+	const bool present = file != nullptr;
+	bool readable = true;
+	if (file) {
+		count = fread(bytes, 1, sizeof(bytes), file);
+		readable = !ferror(file);
+		fclose(file);
+	}
+	selected = 0;
+	if (readable) {
+		if (count == 6 && !memcmp(bytes, "highp\n", 6)) selected = 1;
+		if (count == 7 && !memcmp(bytes, "center\n", 7)) selected = 2;
+		if (count == 7 && !memcmp(bytes, "affine\n", 7)) selected = 3;
+	}
+	char hex[17] = {};
+	for (size_t i = 0; i < count; ++i)
+		snprintf(hex + i * 2, 3, "%02x", bytes[i]);
+	GLint range[2] = {}, precision = 0;
+	GLenum error = GL_NO_ERROR;
+	bool supported = false;
+	if (gl.glsles) {
+		typedef void (APIENTRYP Query)(GLenum, GLenum, GLint *, GLint *);
+		Query query = reinterpret_cast<Query>(SDL_GL_GetProcAddress("glGetShaderPrecisionFormat"));
+		if (query) {
+			query(GL_FRAGMENT_SHADER, 0x8DF2 /* GL_HIGH_FLOAT */, range, &precision);
+			error = gl.GetError();
+			supported = error == GL_NO_ERROR && range[0] > 0 && range[1] > 0 && precision > 0;
+		}
+	}
+	coordinates = supported && precision >= 23 && range[0] >= 23 && range[1] >= 23;
+	char line[320];
+	snprintf(line, sizeof(line),
+	         "final-presentation: selector=%s bytes=%u hex=%s readable=%d highp=%s range=%d,%d precision=%d error=0x%x mode=%d coordinates=%d sentinel=ff00fd",
+	         !present ? "absent" : selected ? "selected" : "malformed",
+	         (unsigned)count, hex, (int)readable, supported ? "supported" : "unsupported",
+	         range[0], range[1], precision, (unsigned)error, selected, (int)coordinates);
+	vita_glue_trace(line);
+	if (selected && (!supported || (selected >= 2 && !coordinates)))
+		throw Exception(Exception::MKXPError, "final-presentation: REJECT unsupported fragment highp");
+	/* The instrumented variant exists only for an explicitly selected mode.
+	 * Hardware highp support alone used to enable it, so every product boot on
+	 * the Vita compiled and drew the extra highp varying and its inline
+	 * branches. The probe still reports support and
+	 * still rejects an unsupported explicit selection above. */
+	return selected != 0 && supported;
+}
+#endif
+
 SimpleShader::SimpleShader()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	finalPresentationVariant = finalPresentationBoot(finalPresentationSelected, finalPresentationCoordinates);
+#endif
 	INIT_SHADER(simple, simple, SimpleShader);
 
 	ShaderBase::init();
 
 	GET_U(texOffsetX);
+	u_finalPresentationHighp = finalPresentationVariant
+	    ? gl.GetUniformLocation(program, "finalPresentationHighp") : -1;
+	if (finalPresentationVariant && u_finalPresentationHighp < 0)
+		throw Exception(Exception::MKXPError, "final-presentation: missing selector uniform");
+	if (finalPresentationVariant) {
+		u_finalOrigin = gl.GetUniformLocation(program, "finalOrigin");
+		u_finalExtent = gl.GetUniformLocation(program, "finalExtent");
+		u_finalTexture = gl.GetUniformLocation(program, "finalTexture");
+		u_finalInvM = gl.GetUniformLocation(program, "finalInvM");
+		u_finalInvT = gl.GetUniformLocation(program, "finalInvT");
+		if (u_finalOrigin < 0 || u_finalExtent < 0 || u_finalTexture < 0 ||
+		    u_finalInvM < 0 || u_finalInvT < 0)
+			throw Exception(Exception::MKXPError, "final-presentation: missing geometry uniform");
+	}
 }
 
 SimpleShader::SimpleShader(const ShaderNoConstructTag &)
 {
+}
+
+void SimpleShader::setFinalPresentation(const Presentation &value)
+{
+	if (u_finalPresentationHighp < 0 || glState.program.get() != program) return;
+	if (!value.mode && !finalPresentationValue.mode) return;
+	gl.Uniform1i(u_finalPresentationHighp, value.mode);
+	gl.Uniform2f(u_finalOrigin, value.origin.x, value.origin.y);
+	gl.Uniform2f(u_finalExtent, value.extent.x, value.extent.y);
+	gl.Uniform2f(u_finalTexture, value.texture.x, value.texture.y);
+	gl.Uniform2f(u_finalInvM, value.extent.x > 0 ? 1.0f/(2.0f*value.extent.x) : 0.0f,
+	             value.extent.y > 0 ? 1.0f/(2.0f*value.extent.y) : 0.0f);
+	gl.Uniform2f(u_finalInvT, value.texture.x > 0 ? 1.0f/value.texture.x : 0.0f,
+	             value.texture.y > 0 ? 1.0f/value.texture.y : 0.0f);
+	finalPresentationValue = value;
+}
+
+int SimpleShader::finalPresentationFor(bool screen, bool smooth,
+                                      const IntRect &src, const IntRect &dst,
+                                      const IntRect &viewport, const Vec2i &texture, bool native)
+{
+	if (!finalPresentationSelected) return 0;
+	const char *reason = nullptr;
+	if (!finalPresentationVariant) reason = "capability";
+	else if (native) reason = "native";
+	else if (glState.program.get() != program) reason = "program";
+	else if (!screen) reason = "offscreen";
+	else if (smooth) reason = "smooth";
+	else if (std::abs((long long)src.w) == std::abs((long long)dst.w) &&
+	         std::abs((long long)src.h) == std::abs((long long)dst.h)) reason = "one-to-one";
+	else if (finalPresentationSelected >= 2) {
+		if (!finalPresentationCoordinates) reason = "precision";
+		else if (texture.x <= 0 || texture.y <= 0 || texture.x > 4096 || texture.y > 4096)
+			reason = "texture-bounds";
+		else if (src.x != 0 || src.y != texture.y || src.w != texture.x || src.h != -texture.y)
+			reason = "full-source-flip";
+		else if (viewport.x != 0 || viewport.y != 0 || viewport.w <= 0 || viewport.h <= 0 ||
+		         viewport.w > 960 || viewport.h > 544) reason = "viewport";
+		else if (dst.w <= 0 || dst.h <= 0 || dst.w > 960 || dst.h > 960 ||
+		         dst.x < 0 || dst.y < 0 || dst.x > viewport.w-dst.w || dst.y > viewport.h-dst.h)
+			reason = "destination";
+	}
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	bool &logged = reason ? finalFallbackLogged : finalEligibleLogged;
+	if (!logged) {
+		char line[384];
+		snprintf(line, sizeof(line),
+		         "final-presentation: mode=%d %s=%s src=%d,%d,%d,%d dst=%d,%d,%d,%d viewport=%d,%d,%d,%d texture=%d,%d native=%d screen=%d smooth=%d",
+		         finalPresentationSelected, reason ? "fallback" : "eligible", reason ? reason : "selected",
+		         src.x,src.y,src.w,src.h,dst.x,dst.y,dst.w,dst.h,
+		         viewport.x,viewport.y,viewport.w,viewport.h,texture.x,texture.y,(int)native,(int)screen,(int)smooth);
+		vita_glue_trace(line);
+		logged = true;
+	}
+#endif
+	return reason ? 0 : finalPresentationSelected;
 }
 
 void SimpleShader::setTexOffsetX(int value)
@@ -409,6 +655,7 @@ void SimpleSpriteShader::setSpriteMat(const float value[16])
 	gl.UniformMatrix4fv(u_spriteMat, 1, GL_FALSE, value);
 }
 
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 BicubicSpriteShader::BicubicSpriteShader() : Lanczos3SpriteShader(ShaderNoConstructTag())
 {
 	INIT_SHADER(sprite, bicubic, BicubicSpriteShader);
@@ -462,6 +709,7 @@ void XbrzSpriteShader::setTargetScale(const Vec2 &value)
 	gl.Uniform2f(u_targetScale, value.x, value.y);
 }
 #endif
+#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
 
 AlphaSpriteShader::AlphaSpriteShader()
 {
@@ -884,6 +1132,23 @@ KglSubtractShader::KglSubtractShader() : BltShader(ShaderNoConstructTag())
 	BltShader::init();
 }
 
+MovieYuvShader::MovieYuvShader()
+{
+	INIT_SHADER(simple, movieYuv, MovieYuvShader);
+
+	ShaderBase::init();
+
+	GET_U(planeInfo);
+	GET_U(chromaMax);
+}
+
+void MovieYuvShader::setPlanes(const Vec2i &texSize, int chromaRow, int crColumn, const Vec2i &chromaLast)
+{
+	gl.Uniform4f(u_planeInfo, 1.f / texSize.x, 1.f / texSize.y, chromaRow, crColumn);
+	gl.Uniform2f(u_chromaMax, chromaLast.x, chromaLast.y);
+}
+
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 KglShadowShaderH::KglShadowShaderH()
 {
 	INIT_SHADER(simple, kglShadowH, KglShadowShaderH);
@@ -1003,3 +1268,54 @@ void XbrzShader::setTargetScale(const Vec2 &value)
 	gl.Uniform2f(u_targetScale, value.x, value.y);
 }
 #endif
+#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+/* Mirrors ShaderSet's member list exactly, including its #ifdefs. BlurShader
+ * is not a ShaderBase -- it is a pair of them -- so it contributes two
+ * entries, which is also how many programs it compiles. */
+void shaderSetEnumerate(ShaderSet &set, std::vector<ShaderBase*> &out)
+{
+	out.clear();
+
+	out.push_back(&set.flatColor);
+	out.push_back(&set.simple);
+	out.push_back(&set.simpleColor);
+	out.push_back(&set.simpleAlpha);
+	out.push_back(&set.simpleSprite);
+	out.push_back(&set.alphaSprite);
+	out.push_back(&set.sprite);
+	out.push_back(&set.plane);
+	out.push_back(&set.gray);
+	out.push_back(&set.tilemap);
+	out.push_back(&set.flashMap);
+	out.push_back(&set.trans);
+	out.push_back(&set.simpleTrans);
+	out.push_back(&set.hue);
+	out.push_back(&set.blt);
+	out.push_back(&set.simpleMatrix);
+	out.push_back(&set.blur.pass1);
+	out.push_back(&set.blur.pass2);
+	out.push_back(&set.tilemapVX);
+	out.push_back(&set.kglInvert);
+	out.push_back(&set.kglCompressAlpha);
+	out.push_back(&set.kglSubtract);
+	out.push_back(&set.movieYuv);
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
+	out.push_back(&set.kglShadowH);
+	out.push_back(&set.kglShadowV);
+	out.push_back(&set.bicubic);
+	out.push_back(&set.lanczos3);
+#endif
+#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
+	out.push_back(&set.xbrz);
+#endif
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
+	out.push_back(&set.lanczos3Sprite);
+	out.push_back(&set.bicubicSprite);
+#ifdef MKXPZ_SSL
+	out.push_back(&set.xbrzSprite);
+#endif
+#endif
+}
+#endif /* MKXPZ_SOFTWARE_BITMAPS */

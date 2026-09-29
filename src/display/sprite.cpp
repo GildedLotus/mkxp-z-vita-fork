@@ -21,6 +21,9 @@
 
 #include "sprite.h"
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "frameprofile.h"
+#endif
 #include "sharedstate.h"
 #include "bitmap.h"
 #include "debugwriter.h"
@@ -122,6 +125,9 @@ struct SpritePrivate
     EtcTemps tmp;
     
     sigslot::connection prepareCon;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    bool profileFirstBind = true;
+#endif
     
     SpritePrivate()
     : bitmap(0),
@@ -162,6 +168,7 @@ struct SpritePrivate
         wave.length = 180;
         wave.speed = 360;
         wave.phase = 0.0f;
+        wave.active = false;
         wave.dirty = false;
     }
     
@@ -617,6 +624,9 @@ struct SpritePrivate
     
     void prepare()
     {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        FrameProfile::OperationScope profileOperation(FrameProfile::SpritePrepare);
+#endif
         // Skip preparations and drawing if the bitmap is disposed or the sprite or viewport is invisible
         if (nullOrDisposed(realBitmap) || !(*spriteVisible) || (viewport && !viewport->getVisible()))
         {
@@ -699,6 +709,9 @@ void Sprite::setBitmap(Bitmap *bitmap)
     
     p->bitmap = bitmap;
     p->realBitmap = bitmap;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    if (vita_glue_frame_profile_interval) p->profileFirstBind = true;
+#endif
     
     p->bitmapDispCon.disconnect();
     
@@ -944,6 +957,9 @@ void Sprite::update()
 /* SceneElement */
 void Sprite::draw()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    FrameProfile::OperationScope profileOperation(FrameProfile::SpriteDraw);
+#endif
     if (!p->isVisible)
         return;
     
@@ -998,11 +1014,25 @@ void Sprite::draw()
         scalingMethod = shState->config().bitmapSmoothScaling;
     }
 
+#ifdef MKXPZ_NO_OPTIONAL_SHADERS
+    /* Bicubic / Lanczos3 sprite shaders are not built; clamp so the switch
+     * below never selects those cases. */
+    if (scalingMethod >= Bicubic)
+        scalingMethod = Bilinear;
+#endif
+
     if (renderEffect)
     {
         if (scalingMethod != NearestNeighbor)
         {
-            Debug() << "BUG: Smooth SpriteShader not implemented:" << scalingMethod;
+            /* Report each unsupported method once, not once per draw: this
+             * branch runs on every frame of an affected sprite. */
+            static unsigned reported = 0;
+            if (scalingMethod < 32 && !(reported & (1u << scalingMethod)))
+            {
+                reported |= 1u << scalingMethod;
+                Debug() << "BUG: Smooth SpriteShader not implemented:" << scalingMethod;
+            }
             scalingMethod = NearestNeighbor;
         }
 
@@ -1019,7 +1049,11 @@ void Sprite::draw()
         
         if (p->pattern && p->patternOpacity > 0) {
             if (p->pattern->hasHires()) {
-                Debug() << "BUG: High-res Sprite pattern not implemented";
+                static bool reportedHiresPattern = false;
+                if (!reportedHiresPattern) {
+                    reportedHiresPattern = true;
+                    Debug() << "BUG: High-res Sprite pattern not implemented";
+                }
             }
 
             shader.setPattern(p->pattern->getGLTypes().tex, Vec2(p->pattern->width(), p->pattern->height()));
@@ -1049,7 +1083,13 @@ void Sprite::draw()
     {
         if (scalingMethod != NearestNeighbor)
         {
-            Debug() << "BUG: Smooth AlphaSpriteShader not implemented:" << scalingMethod;
+            /* Once per method, as above. */
+            static unsigned reported = 0;
+            if (scalingMethod < 32 && !(reported & (1u << scalingMethod)))
+            {
+                reported |= 1u << scalingMethod;
+                Debug() << "BUG: Smooth AlphaSpriteShader not implemented:" << scalingMethod;
+            }
             scalingMethod = NearestNeighbor;
         }
 
@@ -1065,6 +1105,7 @@ void Sprite::draw()
     {
         switch (scalingMethod)
         {
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
         case Bicubic:
         {
             BicubicSpriteShader &shader = shState->shaders().bicubicSprite;
@@ -1102,6 +1143,7 @@ void Sprite::draw()
         }
             break;
 #endif
+#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
         default:
         {
             SimpleSpriteShader &shader = shState->shaders().simpleSprite;
@@ -1114,11 +1156,21 @@ void Sprite::draw()
         }        
     }
     
-    glState.blendMode.pushSet(p->blendType);
+    GLProperty<BlendType>::Guard blendMode(glState.blendMode);
+    glState.blendMode.set(p->blendType);
     
-    p->bitmap->bindTex(*base, false);
+    {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        FrameProfile::OperationScope profileBind(p->profileFirstBind ?
+            FrameProfile::SpriteFirstBind : FrameProfile::SpriteBind);
+#endif
+        p->bitmap->bindTex(*base, false);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        if (vita_glue_frame_profile_interval) p->profileFirstBind = false;
+#endif
+    }
 
-#ifdef MKXPZ_SSL
+#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
     if (scalingMethod == xBRZ)
     {
         XbrzShader &shader = shState->shaders().xbrz;
@@ -1135,7 +1187,7 @@ void Sprite::draw()
     
     TEX::setSmooth(false);
 
-    glState.blendMode.pop();
+    blendMode.restore();
 }
 
 void Sprite::onGeometryChange(const Scene::Geometry &geo)

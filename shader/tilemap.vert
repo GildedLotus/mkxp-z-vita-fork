@@ -25,14 +25,22 @@ uniform lowp int atFrames[nAutotiles];
 void main()
 {
     vec2 tex = texCoord;
-    lowp int atIndex = int(tex.y / autotileH);
+    /* Rows below the autotile area, and its bottom edge, index past
+     * atFrames[nAutotiles]; clamp so every read is in range. */
+    lowp int atIndex = int(min(tex.y / autotileH, float(nAutotiles - 1)));
 
-    lowp int pred = int(tex.x <= atAreaW && tex.y <= atAreaH);
-    lowp int frame = int(aniIndex - atFrames[atIndex] * (aniIndex / atFrames[atIndex]));
-    lowp int row = frame / 8;
-    lowp int col = frame - 8 * row;
-    tex.x += atAniOffsetX * float(col * pred);
-    tex.y += atAniOffsetY * float(row * pred);
+    highp float pred = (tex.x <= atAreaW && tex.y <= atAreaH) ? 1.0 : 0.0;
+    /* Float arithmetic: Cg's vertex profile has no integer divide by a
+     * variable. Operands are small integers; +0.5 keeps floor() exact even
+     * if the GPU divides by multiplying with a reciprocal. nFrames >= 1
+     * keeps every value finite: 0 * inf would be NaN even when pred is 0. */
+    highp float ani = float(aniIndex);
+    highp float nFrames = max(float(atFrames[atIndex]), 1.0);
+    highp float frame = ani - nFrames * floor((ani + 0.5) / nFrames);
+    highp float atRow = floor((frame + 0.5) / 8.0);
+    highp float atCol = frame - 8.0 * atRow;
+    tex.x += atAniOffsetX * atCol * pred;
+    tex.y += atAniOffsetY * atRow * pred;
 
     gl_Position = projMat * vec4(position + translation, 0, 1);
 

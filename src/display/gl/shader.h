@@ -26,6 +26,10 @@
 #include "gl-util.h"
 #include "glstate.h"
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+#include <vector>
+#endif
+
 class ShaderNoConstructTag {};
 
 class Shader
@@ -61,6 +65,7 @@ protected:
 	GLuint vertShader, fragShader;
 	GLuint program;
 	bool initialized;
+	bool finalPresentationVariant;
     
 private:
 #ifdef MKXPZ_BUILD_XCODE
@@ -117,9 +122,38 @@ public:
 	SimpleShader(const ShaderNoConstructTag &);
 
 	void setTexOffsetX(int value);
+	bool hasFinalPresentation() const { return finalPresentationVariant; }
+	bool hasFinalCoordinates() const { return finalPresentationCoordinates; }
+	int finalPresentationFor(bool screen, bool smooth, const IntRect &src, const IntRect &dst,
+	                         const IntRect &viewport, const Vec2i &texture, bool native = false);
+	struct Presentation {
+		int mode;
+		Vec2i origin, extent, texture;
+		Presentation(int m = 0, Vec2i o = Vec2i(), Vec2i d = Vec2i(), Vec2i t = Vec2i())
+		    : mode(m), origin(o), extent(d), texture(t) {}
+	};
+	class PresentationScope {
+		SimpleShader &shader;
+		Presentation previous;
+	public:
+		PresentationScope(SimpleShader &s, Presentation value) : shader(s), previous(s.finalPresentationValue)
+		{ shader.setFinalPresentation(value); }
+		~PresentationScope() { shader.setFinalPresentation(previous); }
+		PresentationScope(const PresentationScope &) = delete;
+		PresentationScope &operator=(const PresentationScope &) = delete;
+	};
 
 protected:
 	GLint u_texOffsetX;
+private:
+	void setFinalPresentation(const Presentation &value);
+	GLint u_finalPresentationHighp = -1;
+	GLint u_finalOrigin = -1, u_finalExtent = -1, u_finalTexture = -1;
+	GLint u_finalInvM = -1, u_finalInvT = -1;
+	int finalPresentationSelected = 0;
+	bool finalPresentationCoordinates = false;
+	bool finalEligibleLogged = false, finalFallbackLogged = false;
+	Presentation finalPresentationValue;
 };
 
 class SimpleColorShader : public ShaderBase
@@ -357,6 +391,7 @@ public:
 	KglSubtractShader();
 };
 
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 class KglShadowShaderH : public ShaderBase
 {
 public:
@@ -401,8 +436,9 @@ public:
 protected:
 	GLint u_bc;
 };
+#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
 
-#ifdef MKXPZ_SSL
+#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
 class XbrzShader : public Lanczos3Shader
 {
 public:
@@ -415,6 +451,7 @@ protected:
 };
 #endif
 
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 class Lanczos3SpriteShader : public SimpleSpriteShader
 {
 public:
@@ -437,7 +474,9 @@ public:
 protected:
 	GLint u_bc;
 };
+#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
 
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 class XbrzSpriteShader : public Lanczos3SpriteShader
 {
 public:
@@ -448,8 +487,24 @@ public:
 protected:
 	GLint u_targetScale;
 };
+#endif
+
+/* Graphics.play_movie frames: packed Y/Cb/Cr planes converted on the GPU
+ * (THEORAPLAY_VIDFMT_YUVTEX). Built with the set at boot like every program. */
+class MovieYuvShader : public ShaderBase
+{
+public:
+	MovieYuvShader();
+
+	void setPlanes(const Vec2i &texSize, int chromaRow, int crColumn, const Vec2i &chromaLast);
+
+private:
+	GLint u_planeInfo, u_chromaMax;
+};
 
 /* Global object containing all available shaders */
+void shaderBootComplete();
+
 struct ShaderSet
 {
 	FlatColorShader flatColor;
@@ -473,18 +528,33 @@ struct ShaderSet
 	KglInvertShader kglInvert;
 	KglCompressAlphaShader kglCompressAlpha;
 	KglSubtractShader kglSubtract;
+	MovieYuvShader movieYuv;
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 	KglShadowShaderH kglShadowH;
 	KglShadowShaderV kglShadowV;
 	BicubicShader bicubic;
 	Lanczos3Shader lanczos3;
-#ifdef MKXPZ_SSL
+#endif
+#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
 	XbrzShader xbrz;
 #endif
+#ifndef MKXPZ_NO_OPTIONAL_SHADERS
 	Lanczos3SpriteShader lanczos3Sprite;
 	BicubicSpriteShader bicubicSprite;
 #ifdef MKXPZ_SSL
 	XbrzSpriteShader xbrzSprite;
 #endif
+#endif
 };
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+/* Every program in the set, in declaration order. The
+ * boot warm-up needs the list because a program's code variants are built
+ * on first use and draw on the same fixed GPU pools the render surfaces
+ * live in -- so first use has to happen at boot, not mid-game. Kept next to the set itself so a shader
+ * added to ShaderSet without being added here is one diff away from
+ * obvious. */
+void shaderSetEnumerate(ShaderSet &set, std::vector<ShaderBase*> &out);
+#endif
 
 #endif // SHADER_H

@@ -28,6 +28,16 @@
 
 #include <SDL_surface.h>
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+namespace GPUBudget
+{
+Vec2i renderScreenSize(const Config &conf, int width, int height);
+Vec2i bootScreenSize(const Config &conf, int rgssVersion, bool scaled);
+void resizeFixedSurfaces(const Vec2i &size, const Vec2i &integerSize);
+bool fixedSurfacesValid();
+}
+#endif
+
 namespace GLMeta
 {
 

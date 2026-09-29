@@ -23,6 +23,9 @@
 #define GLSTATE_H
 
 #include "etc.h"
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+#include "gl-fun.h"
+#endif
 
 #include <stack>
 #include <assert.h>
@@ -36,6 +39,31 @@ struct GLProperty
 	{
 		assert(stack.size() == 0);
 	}
+
+	/* Save values and stack depth without allocating, including legacy pushes
+	 * made by nested viewport/window draws that can throw. */
+	class Guard
+	{
+		GLProperty &property;
+		T value;
+		size_t depth;
+		bool active = true, refresh;
+	public:
+		explicit Guard(GLProperty &p, bool forceRefresh = false) : property(p),
+			value(p.current), depth(p.stack.size()), refresh(forceRefresh) {}
+		Guard(const Guard &) = delete;
+		Guard &operator=(const Guard &) = delete;
+		~Guard() { restore(); }
+		void release() { active = false; }
+		void restore()
+		{
+			if (!active) return;
+			while (property.stack.size() > depth) property.stack.pop();
+			if (refresh) property.init(value); // Raw blend calls bypass the cache.
+			else property.set(value);
+			active = false;
+		}
+	};
 
 	void init(const T &value)
 	{
@@ -134,5 +162,47 @@ public:
 
 	GLState(const Config &conf);
 };
+
+/* Release on success to keep the renderer's normal final state. */
+class GLStateGuard
+{
+	GLProperty<Vec4>::Guard clearColor;
+	GLProperty<IntRect>::Guard scissorBox, viewport;
+	GLProperty<bool>::Guard scissorTest, blend;
+	GLProperty<BlendType>::Guard blendMode;
+	GLProperty<unsigned int>::Guard program;
+public:
+	explicit GLStateGuard(GLState &s) : clearColor(s.clearColor),
+		scissorBox(s.scissorBox), viewport(s.viewport), scissorTest(s.scissorTest),
+		blend(s.blend), blendMode(s.blendMode, true), program(s.program) {}
+	void restore()
+	{
+		program.restore(); blendMode.restore(); blend.restore(); scissorTest.restore();
+		viewport.restore(); scissorBox.restore(); clearColor.restore();
+	}
+	void release()
+	{
+		clearColor.release(); scissorBox.release(); viewport.release();
+		scissorTest.release(); blend.release(); blendMode.release(); program.release();
+	}
+};
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+/* The RGSS thread owns this scope and the GL dispatch table. Remember errors
+ * even when upload checks or tracing consume them during a composition. */
+class GLRenderErrorScope
+{
+	static GLRenderErrorScope *active;
+	GLRenderErrorScope *outer;
+	_PFNGLGETERRORPROC previous, source;
+	GLenum error;
+public:
+	GLRenderErrorScope();
+	~GLRenderErrorScope();
+	GLRenderErrorScope(const GLRenderErrorScope &) = delete;
+	GLRenderErrorScope &operator=(const GLRenderErrorScope &) = delete;
+	void check(const char *operation);
+};
+#endif
 
 #endif // GLSTATE_H

@@ -26,8 +26,33 @@
 
 #include <SDL_video.h>
 #include <string>
+#include <cstdio>
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "vita_glue.h"
+#include <stdint.h>
+#endif
 
 GLFunctions gl;
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* Crash-safe one-liner. vita_glue_trace already fflushes. */
+static void glTrace(const char *msg)
+{
+	vita_glue_trace(msg);
+}
+
+static void glTracePtr(const char *tag, const void *p)
+{
+	char tb[160];
+	snprintf(tb, sizeof(tb), "%s %p", tag, p);
+	vita_glue_trace(tb);
+}
+
+#else
+#define glTrace(msg) do { } while (0)
+#define glTracePtr(tag, p) do { (void)(tag); (void)(p); } while (0)
+#endif
 
 typedef const GLubyte* (APIENTRYP _PFNGLGETSTRINGIPROC) (GLenum, GLuint);
 
@@ -76,11 +101,49 @@ Exception(Exception::MKXPError, "%s", msg)
 
 void initGLFunctions()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	glTrace("trace: initGLFunctions enter");
+#endif
 #define EXT_SUFFIX ""
     GL_20_FUN;
-    
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* vitaGL resolves every GLES2 entry point through SDL_GL_GetProcAddress;
+	 * no linked fallback is installed, so a lookup failure is never masked. */
+	glTracePtr("trace: GetString proc", (const void *)gl.GetString);
+	glTrace("trace: initGLFunctions GL_20_FUN loaded + fallbacks");
+	{
+		int nullCount = 0;
+#undef GL_FUN
+#define GL_FUN(name, type) if (!gl.name) ++nullCount; (void)0;
+		GL_20_FUN;
+#undef GL_FUN
+#define GL_FUN(name, type) \
+gl.name = (type) SDL_GL_GetProcAddress("gl" #name EXT_SUFFIX);
+		char tb[160];
+		snprintf(tb, sizeof(tb),
+		         "trace: initGLFunctions residual-null GL_20_FUN=%d", nullCount);
+		vita_glue_trace(tb);
+	}
+#endif
+
     /* Determine GL version */
-    const char *ver = (const char*) gl.GetString(GL_VERSION);
+    const char *ver = 0;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	if (!gl.GetString)
+		throw EXC("gl.GetString is NULL after GetProcAddress + linked fallback");
+	ver = (const char*) gl.GetString(GL_VERSION);
+	{
+		char tb[160];
+		snprintf(tb, sizeof(tb), "trace: glGetString(GL_VERSION)=%s",
+		         ver ? ver : "(null)");
+		vita_glue_trace(tb);
+	}
+	if (!ver)
+		throw EXC("glGetString(GL_VERSION) returned NULL");
+#else
+    ver = (const char*) gl.GetString(GL_VERSION);
+#endif
     
     const char glesPrefix[] = "OpenGL ES ";
     const size_t glesPrefixN = sizeof(glesPrefix)-1;
@@ -119,13 +182,35 @@ void initGLFunctions()
     {
         GL_ES_FUN;
     }
-    
+
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	{
+		char tb[160];
+		snprintf(tb, sizeof(tb),
+		         "trace: initGLFunctions version parsed gles=%d major=%d",
+		         (int)gles, glMajor);
+		vita_glue_trace(tb);
+	}
+#endif
+
     BoostSet<std::string> ext;
-    
+
     if (glMajor >= 3)
         parseExtensionsCore(gl.GetIntegerv, ext);
     else
         parseExtensionsCompat(gl.GetString, ext);
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	{
+		unsigned n = 0;
+		for (auto it = ext.cbegin(); it != ext.cend(); ++it)
+			++n;
+		char tb[160];
+		snprintf(tb, sizeof(tb), "trace: initGLFunctions ext count=%u", n);
+		vita_glue_trace(tb);
+	}
+#endif
     
 #define HAVE_EXT(_ext) ext.contains("GL_" #_ext)
     
@@ -156,7 +241,7 @@ void initGLFunctions()
     {
         throw EXC("No FBO support available");
     }
-    
+
     /* VAO entrypoints */
     if (HAVE_EXT(ARB_vertex_array_object) || glMajor >= 3)
     {
@@ -176,6 +261,18 @@ void initGLFunctions()
 #define EXT_SUFFIX "OES"
         GL_VAO_FUN;
     }
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* Native VAOs stay off: the software VAO path rebinds VBO/IBO/attribs
+	 * every draw and allocates no GL object per Quad. mkxp-z builds one VAO
+	 * per Sprite, Window and Plane, and each native VAO would take a GPU
+	 * program/object slot, so an allocation could fail at an arbitrary point
+	 * mid-game. Force HAVE_NATIVE_VAO false. */
+	gl.GenVertexArrays = 0;
+	gl.DeleteVertexArrays = 0;
+	gl.BindVertexArray = 0;
+	glTrace("trace: Vita forced software VAO (native VAO disabled)");
+#endif
     
     /* Debug callback entrypoints */
     if (HAVE_EXT(KHR_debug))
@@ -201,7 +298,59 @@ void initGLFunctions()
     /* Misc caps */
     if (!gles || glMajor >= 3 || HAVE_EXT(EXT_unpack_subimage))
         gl.unpack_subimage = true;
-    
+
     if (!gles || glMajor >= 3 || HAVE_EXT(OES_texture_npot))
         gl.npot_repeat = true;
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	{
+		char tb[256];
+		snprintf(tb, sizeof(tb),
+		         "trace: initGLFunctions leave FBO=%p Clear=%p CreateShader=%p "
+		         "GenBuffers=%p BindBuffer=%p BufferData=%p "
+		         "DrawElements=%p TexImage2D=%p UseProgram=%p",
+		         (const void *)gl.GenFramebuffers, (const void *)gl.Clear,
+		         (const void *)gl.CreateShader, (const void *)gl.GenBuffers,
+		         (const void *)gl.BindBuffer, (const void *)gl.BufferData,
+		         (const void *)gl.DrawElements, (const void *)gl.TexImage2D,
+		         (const void *)gl.UseProgram);
+		vita_glue_trace(tb);
+	}
+	/* Diagnostics: caps + extension list (NPOT / VAO / unpack). */
+	{
+		GLint maxTex = 0;
+		if (gl.GetIntegerv)
+			gl.GetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+		char tb[160];
+		snprintf(tb, sizeof(tb), "trace: GL_MAX_TEXTURE_SIZE=%d npot_repeat=%d unpack_subimage=%d",
+		         (int)maxTex, (int)gl.npot_repeat, (int)gl.unpack_subimage);
+		vita_glue_trace(tb);
+	}
+	{
+		char line[200];
+		int pos = 0;
+		unsigned n = 0;
+		for (auto it = ext.cbegin(); it != ext.cend(); ++it) {
+			const std::string &e = *it;
+			if (pos == 0) {
+				pos = snprintf(line, sizeof(line), "trace: GLext %u:", n);
+			}
+			int need = (int)e.size() + 1;
+			if (pos + need >= (int)sizeof(line) - 1) {
+				vita_glue_trace(line);
+				pos = snprintf(line, sizeof(line), "trace: GLext %u:", n);
+			}
+			pos += snprintf(line + pos, sizeof(line) - pos, " %s", e.c_str());
+			++n;
+		}
+		if (pos > 0)
+			vita_glue_trace(line);
+		snprintf(line, sizeof(line),
+		         "trace: ext OES_texture_npot=%d OES_vertex_array_object=%d EXT_unpack_subimage=%d",
+		         (int)HAVE_EXT(OES_texture_npot),
+		         (int)HAVE_EXT(OES_vertex_array_object),
+		         (int)HAVE_EXT(EXT_unpack_subimage));
+		vita_glue_trace(line);
+	}
+#endif
 }

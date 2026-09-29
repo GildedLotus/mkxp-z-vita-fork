@@ -298,10 +298,10 @@ vec4 pass1(vec2 p1_texCoord) {
   // info Mapping: x|y|
   //               w|z|
 
-  vec4 blendResult = floor(mod(info, 4.0));
-  vec4 doLineBlend = floor(mod(info / 4.0, 4.0));
-  vec4 haveShallowLine = floor(mod(info / 16.0, 4.0));
-  vec4 haveSteepLine = floor(mod(info / 64.0, 4.0));
+  vec4 blendResult = floor(info - 4.0 * floor(info / 4.0));
+  vec4 doLineBlend = floor((info / 4.0) - 4.0 * floor((info / 4.0) / 4.0));
+  vec4 haveShallowLine = floor((info / 16.0) - 4.0 * floor((info / 16.0) / 4.0));
+  vec4 haveSteepLine = floor((info / 64.0) - 4.0 * floor((info / 64.0) / 4.0));
 
   vec4 res = E;
 

@@ -23,7 +23,21 @@
 #define GLFUN_H
 
 #ifdef GLES2_HEADER
+#if defined(__vita__) && defined(MKXPZ_VITAGL_BACKEND)
+/* vitaGL backend: vitaGL.h is the GLES2 header surface. It ships
+ * no calling-convention macros, so provide the two this header spells.
+ * GL_APIENTRYP keeps its Khronos shape: GL_APIENTRY followed by '*', so
+ * the typedefs below stay function-POINTER types. */
+#include <vitaGL.h>
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+#ifndef GL_APIENTRYP
+#define GL_APIENTRYP *
+#endif
+#else
 #include <SDL_opengles2.h>
+#endif
 #define APIENTRYP GL_APIENTRYP
 #else
 #include <SDL_opengl.h>
@@ -106,6 +120,9 @@ typedef void (APIENTRYP _PFNGLGENFRAMEBUFFERSPROC) (GLsizei n, GLuint* framebuff
 typedef void (APIENTRYP _PFNGLDELETEFRAMEBUFFERSPROC) (GLsizei n, const GLuint* framebuffers);
 typedef void (APIENTRYP _PFNGLBINDFRAMEBUFFERPROC) (GLenum target, GLuint framebuffer);
 typedef void (APIENTRYP _PFNGLFRAMEBUFFERTEXTURE2DPROC) (GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+typedef GLenum (APIENTRYP _PFNGLCHECKFRAMEBUFFERSTATUSPROC) (GLenum target);
+#endif
 typedef void (APIENTRYP _PFNGLBLITFRAMEBUFFERPROC) (GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
 
 /* Vertex array object */
@@ -190,11 +207,24 @@ typedef void (APIENTRYP _PFNGLRELEASESHADERCOMPILERPROC) (void);
 #define GL_ES_FUN \
 	GL_FUN(ReleaseShaderCompiler, _PFNGLRELEASESHADERCOMPILERPROC)
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+/* TEXFBO::initChecked has to ASK whether a render surface
+ * really came up, so glCheckFramebufferStatus stops being optional. It loads
+ * on every path GL_FBO_FUN loads on, with the same EXT_SUFFIX, which is how
+ * the checked helper stays platform-neutral instead of reaching for a linked
+ * GLES2 symbol the way the __vita__ frame-trace helper does. */
+#define GL_FBO_STATUS_FUN \
+	GL_FUN(CheckFramebufferStatus, _PFNGLCHECKFRAMEBUFFERSTATUSPROC)
+#else
+#define GL_FBO_STATUS_FUN
+#endif
+
 #define GL_FBO_FUN \
 	/* Framebuffer object */ \
 	GL_FUN(GenFramebuffers, _PFNGLGENFRAMEBUFFERSPROC) \
 	GL_FUN(DeleteFramebuffers, _PFNGLDELETEFRAMEBUFFERSPROC) \
 	GL_FUN(BindFramebuffer, _PFNGLBINDFRAMEBUFFERPROC) \
+	GL_FBO_STATUS_FUN \
 	GL_FUN(FramebufferTexture2D, _PFNGLFRAMEBUFFERTEXTURE2DPROC)
 
 #define GL_FBO_BLIT_FUN \

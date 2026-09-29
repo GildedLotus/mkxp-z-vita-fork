@@ -74,7 +74,7 @@ void main()
     
     /* Apply pattern */
     if (renderPattern) {
-        vec4 pattfrag = texture2D(pattern, mod(v_patCoord, repeat));
+        vec4 pattfrag = texture2D(pattern, v_patCoord - repeat * floor(v_patCoord / repeat));
         if (patternBlendType == 1) {
             frag.rgb =  blendAdd(frag.rgb, pattfrag.rgb, pattfrag.a * patternOpacity);
         }

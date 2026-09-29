@@ -104,7 +104,22 @@ TexPool::~TexPool()
 
 TEXFBO TexPool::request(int width, int height)
 {
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* Every TEXFBO this pool hands out is a render target: it calls
+	 * TEXFBO::init + linkFBO on a miss, and caches the surface between users
+	 * on a hit. The software Bitmap, window base and tile atlas paths removed its
+	 * last caller under this backend, so a call arriving here is a regression
+	 * that would quietly start consuming the small fixed set of render
+	 * surfaces the whole process gets. Refuse it
+	 * where it happens rather than three frames later in the driver. */
+	throw Exception(Exception::MKXPError,
+	                "software_bitmaps: TexPool::request(%d, %d): this backend "
+	                "must not allocate render targets outside the fixed set "
+	                "reserved at boot",
+	                width, height);
+#else
 	CacheNode cnode;
+	TEXFBO::trace("pool request", cnode.obj, width, height);
 	Size size(width, height);
 
 	/* See if we can statisfy request from cache */
@@ -123,6 +138,7 @@ TEXFBO TexPool::request(int width, int height)
 
 //		Debug() << "TexPool: <?+> (" << width << height << ")";
 
+		TEXFBO::trace("pool HIT", cnode.obj);
 		return cnode.obj;
 	}
 
@@ -132,6 +148,7 @@ TEXFBO TexPool::request(int width, int height)
 		                "Texture dimensions [%d, %d] exceed hardware capabilities",
 		                width, height);
 
+	TEXFBO::trace("pool MISS", cnode.obj, width, height);
 	/* Nope, create it instead */
 	TEXFBO::init(cnode.obj);
 	TEXFBO::allocEmpty(cnode.obj, width, height);
@@ -140,10 +157,12 @@ TEXFBO TexPool::request(int width, int height)
 //	Debug() << "TexPool: <?-> (" << width << height << ")";
 
 	return cnode.obj;
+#endif
 }
 
 void TexPool::release(TEXFBO &obj)
 {
+	TEXFBO::trace("pool release", obj);
 	if (obj.tex == TEX::ID(0) || obj.fbo == FBO::ID(0))
 	{
 		TEXFBO::fini(obj);
@@ -185,25 +204,36 @@ void TexPool::release(TEXFBO &obj)
 
 		p->priorityQueue.pop_back();
 
+		TEXFBO::trace("pool EVICT", last.obj);
 		TEXFBO::fini(last.obj);
 
 		newMemSize -= byteCount(removedSize);
+		p->memSize -= byteCount(removedSize);
 		--p->objCount;
 
 //		Debug() << "TexPool: <!-> (" << last.obj.width << last.obj.height << ")";
 	}
 
+	/* Returning an object must also work while unwinding an allocation failure. */
+	try
+	{
+		CNodeList &bucket = p->poolHash[size];
+		p->priorityQueue.push_front(obj);
+		CacheNode cnode;
+		cnode.obj = obj;
+		cnode.prioIter = p->priorityQueue.begin();
+		try { bucket.push_back(cnode); }
+		catch (...) { p->priorityQueue.pop_front(); throw; }
+	}
+	catch (...)
+	{
+		TEXFBO::fini(obj);
+		return;
+	}
 	p->memSize = newMemSize;
 
-	/* Retain object */
-	p->priorityQueue.push_front(obj);
-	CacheNode cnode;
-	cnode.obj = obj;
-	cnode.prioIter = p->priorityQueue.begin();
-	CNodeList &bucket = p->poolHash[size];
-	bucket.push_back(cnode);
-
 	++p->objCount;
+	TEXFBO::trace("pool CACHED", obj);
 
 //	Debug() << "TexPool: <!+> (" << obj.width << obj.height << ") Current size:" << p->memSize;
 }
