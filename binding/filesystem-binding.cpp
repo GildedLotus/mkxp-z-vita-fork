@@ -38,6 +38,10 @@
 #include <ruby/thread.h>
 #endif
 
+#if RAPI_FULL >= 270
+static VALUE stringForceUTF8(RB_BLOCK_CALL_FUNC_ARGLIST(arg, callback_arg));
+#endif
+
 static void fileIntFreeInstance(void *inst) {
     SDL_RWops *ops = static_cast<SDL_RWops *>(inst);
     
@@ -57,13 +61,14 @@ static VALUE fileIntForPath(const char *path, bool rubyExc) {
     VALUE obj = rb_obj_alloc(klass);
     
     SDL_RWops *ops = SDL_AllocRW();
-    
+    if (!ops)
+        throw Exception(Exception::SDLError, "%s", SDL_GetError());
+
     try {
         shState->fileSystem().openReadRaw(*ops, path);
-    } catch (const Exception &e) {
+    } catch (...) {
         SDL_FreeRW(ops);
-        
-        throw e;
+        throw;
     }
     
     setPrivateData(obj, ops);
@@ -71,17 +76,23 @@ static VALUE fileIntForPath(const char *path, bool rubyExc) {
     return obj;
 }
 
-#if RAPI_MAJOR >= 2
 typedef struct {
     SDL_RWops *ops;
-    void *dst;
+    char *dst;
     int length;
+    int done;
 } fileIntReadCbArgs;
 
+/* SDL_RWread may return fewer bytes than asked before EOF; 0 is EOF or error. */
 void call_RWread_cb(fileIntReadCbArgs *args) {
-    SDL_RWread(args->ops, args->dst, 1, args->length);
+    while (args->done < args->length) {
+        size_t got = SDL_RWread(args->ops, args->dst + args->done, 1,
+                                args->length - args->done);
+        if (got == 0)
+            break;
+        args->done += (int)got;
+    }
 }
-#endif
 
 RB_METHOD(fileIntRead) {
     
@@ -89,8 +100,9 @@ RB_METHOD(fileIntRead) {
     rb_get_args(argc, argv, "|i", &length RB_ARG_END);
     
     SDL_RWops *ops = getPrivateData<SDL_RWops>(self);
+    const bool whole = length == -1;
     
-    if (length == -1) {
+    if (whole) {
         Sint64 cur = SDL_RWtell(ops);
         Sint64 end = SDL_RWseek(ops, 0, SEEK_END);
         
@@ -102,24 +114,39 @@ RB_METHOD(fileIntRead) {
         
         length = end - cur;
         SDL_RWseek(ops, cur, SEEK_SET);
+        if (end < 0 || length < 0)
+            rb_raise(rb_eIOError, "cannot determine file size");
+    } else if (length < 0) {
+        rb_raise(rb_eArgError, "negative length %d given", length);
     }
     
+    // Like IO#read, a whole read of an empty file is "", so Marshal says why.
     if (length == 0)
-        return Qnil;
+        return whole ? rb_str_new(0, 0) : Qnil;
     
     VALUE data = rb_str_new(0, length);
     
     
     
+    fileIntReadCbArgs cbargs {ops, RSTRING_PTR(data), length, 0};
 #if RAPI_MAJOR >= 2
-    fileIntReadCbArgs cbargs {ops, RSTRING_PTR(data), length};
     rb_thread_call_without_gvl([](void* args) -> void* {
         call_RWread_cb((fileIntReadCbArgs*)args);
         return 0;
     }, (void*)&cbargs, 0, 0);
 #else
-    SDL_RWread(ops, RSTRING_PTR(data), 1, length);
+    call_RWread_cb(&cbargs);
 #endif
+    RB_GC_GUARD(data);
+    
+    // A whole-file read that stops early would hand unread bytes to Marshal.
+    if (cbargs.done < length) {
+        if (whole)
+            rb_raise(rb_eIOError, "short read: %d of %d bytes", cbargs.done, length);
+        if (cbargs.done == 0)
+            return Qnil;
+        rb_str_set_len(data, cbargs.done);
+    }
     
     return data;
 }
@@ -163,6 +190,21 @@ VALUE
 kernelLoadDataInt(const char *filename, bool rubyExc, bool raw) {
     //rb_gc_start();
     
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    VALUE args[] = {fileIntForPath(filename, rubyExc), raw ? Qtrue : Qfalse};
+    return rb_ensure([](VALUE opaque) -> VALUE {
+        VALUE *args = reinterpret_cast<VALUE *>(opaque);
+        VALUE data = fileIntRead(0, 0, args[0]);
+        if (args[1] == Qtrue)
+            return data;
+        // Game data is the legacy text boundary: untagged strings are UTF-8.
+        VALUE load[] = {data, rb_proc_new(stringForceUTF8, Qnil)};
+        return rb_funcall2(rb_const_get(rb_cObject, rb_intern("Marshal")),
+                           rb_intern("load"), 2, load);
+    }, reinterpret_cast<VALUE>(args), [](VALUE port) -> VALUE {
+        return rb_funcall(port, rb_intern("close"), 0);
+    }, args[0]);
+#else
     VALUE port = fileIntForPath(filename, rubyExc);
     VALUE result;
     if (!raw) {
@@ -178,6 +220,7 @@ kernelLoadDataInt(const char *filename, bool rubyExc, bool raw) {
     rb_funcall2(port, rb_intern("close"), 0, NULL);
     
     return result;
+#endif
 }
 
 RB_METHOD_GUARD(kernelLoadData) {
@@ -202,6 +245,20 @@ RB_METHOD(kernelSaveData) {
     
     rb_get_args(argc, argv, "oS", &obj, &filename RB_ARG_END);
     
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* Stock's write, plus the close stock leaks when dump raises.
+     * The file is opened before serialization, so a _dump hook that changes
+     * the working directory cannot move the write to another slot. */
+    VALUE args[] = {obj, rb_file_open_str(filename, "wb")};
+    rb_ensure([](VALUE opaque) -> VALUE {
+        VALUE *args = reinterpret_cast<VALUE *>(opaque);
+        return rb_funcall2(rb_const_get(rb_cObject, rb_intern("Marshal")),
+                           rb_intern("dump"), 2, args);
+    }, reinterpret_cast<VALUE>(args), [](VALUE file) -> VALUE {
+        return rb_io_close(file);
+    }, args[1]);
+    return Qnil;
+#else
     VALUE file = rb_file_open_str(filename, "wb");
     
     VALUE marsh = rb_const_get(rb_cObject, rb_intern("Marshal"));
@@ -212,6 +269,7 @@ RB_METHOD(kernelSaveData) {
     rb_io_close(file);
     
     return Qnil;
+#endif
 }
 #if RAPI_FULL > 187
 #if RAPI_FULL < 270
@@ -226,6 +284,7 @@ static VALUE stringForceUTF8(RB_BLOCK_CALL_FUNC_ARGLIST(arg, callback_arg))
     return arg;
 }
 
+#if !defined(__vita__) && !defined(MKXPZ_HOST_PORT_LOGIC)
 #if RAPI_FULL < 270
 static VALUE customProc(VALUE arg, VALUE proc) {
     VALUE obj = stringForceUTF8(arg);
@@ -262,6 +321,7 @@ RB_METHOD(_marshalLoad) {
     return rb_funcall2(marsh, rb_intern("_mkxp_load_alias"), ARRAY_SIZE(v), v);
 }
 #endif
+#endif
 
 void fileIntBindingInit() {
     VALUE klass = rb_define_class("FileInt", rb_cIO);
@@ -287,11 +347,25 @@ void fileIntBindingInit() {
     _rb_define_module_function(rb_mKernel, "save_data", kernelSaveData);
     
 #if RAPI_FULL > 187
-    /* We overload the built-in 'Marshal::load()' function to silently
-     * insert our utf8proc that ensures all read strings will be
-     * UTF-8 encoded */
+#if defined(MKXPZ_HOST_PORT_LOGIC) && !defined(__vita__)
+    rb_load(rb_str_new_cstr("settings_file.rb"), 0); // Mapped package rubyLoadpaths.
+#endif
+#if !defined(__vita__) && !defined(MKXPZ_HOST_PORT_LOGIC)
+    /* Ports keep MRI's Marshal.load (proc, freeze:, binary strings); only
+     * load_data applies the legacy UTF-8 retag. */
     VALUE marsh = rb_const_get(rb_cObject, rb_intern("Marshal"));
     rb_define_alias(rb_singleton_class(marsh), "_mkxp_load_alias", "load");
     _rb_define_module_function(marsh, "load", _marshalLoad);
+#endif
+#endif
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#ifdef __vita__
+    /* The settings writer below needs this module whatever a game preloads.
+     * It wraps nothing: a game's saves are upstream's, above and in Ruby. */
+    rb_load(rb_str_new_cstr("app0:/preload/settings_file.rb"), 0);
+#endif
+    rb_funcall(rb_const_get(rb_cObject, rb_intern("VitaSettingsFile")),
+               rb_intern("recover"), 1,
+               rb_utf8_str_new_cstr(shState->config().userConfPath.c_str()));
 #endif
 }

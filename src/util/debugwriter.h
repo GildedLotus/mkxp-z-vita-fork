@@ -65,6 +65,10 @@ public:
 		__android_log_write(ANDROID_LOG_DEBUG, "mkxp", buf.str().c_str());
 #else
 		std::cerr << buf.str() << std::endl;
+		/* One failed write sets badbit for good, which would mute every
+		 * later line even after the sink recovers. */
+		if (!std::cerr)
+			std::cerr.clear();
 #endif
 	}
 

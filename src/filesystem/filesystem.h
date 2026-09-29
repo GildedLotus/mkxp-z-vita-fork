@@ -77,7 +77,7 @@ public:
 	/* Does not perform extension supplementing */
 	bool exists(const char *filename);
 
-	const char *desensitize(const char *filename);
+	std::string desensitize(const char *filename);
 
 private:
 	FileSystemPrivate *p;

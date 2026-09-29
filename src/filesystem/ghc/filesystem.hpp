@@ -2760,6 +2760,34 @@ GHC_INLINE int path::compare(const value_type* s) const
     return compare(path(s));
 }
 
+#if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) || defined(__psp2__)
+namespace detail {
+/* Length of a Vita device mount prefix -- 2 to 4 ASCII alphanumerics followed
+ * by ':' ("ux0:", "app0:", "uma0:", "vs0:") -- or 0 when the string has none.
+ * One rule with two users: path::root_name_length(), where the prefix is the
+ * root-name, and path::iterator::iterator(), where a '/' right after it is the
+ * root directory. Only the first ':' in range is considered, so neither
+ * "C:/x" nor "savedata0:/x" is a device mount. */
+GHC_INLINE std::string::size_type vitaRootNameLength(std::string::const_iterator first, std::string::const_iterator last) noexcept
+{
+    const std::string::difference_type length = last - first;
+    for (std::string::difference_type n = 2; n <= 4 && n < length; ++n) {
+        if (first[n] != ':') {
+            continue;
+        }
+        for (std::string::difference_type i = 0; i < n; ++i) {
+            const char c = first[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) {
+                return 0;
+            }
+        }
+        return static_cast<std::string::size_type>(n) + 1;
+    }
+    return 0;
+}
+}  // namespace detail
+#endif
+
 //-----------------------------------------------------------------------------
 // 30.10.8.4.9, decomposition
 GHC_INLINE path::string_type::size_type path::root_name_length() const noexcept
@@ -2767,6 +2795,16 @@ GHC_INLINE path::string_type::size_type path::root_name_length() const noexcept
 #ifdef GHC_OS_WINDOWS
     if (_path.length() >= 2 && std::toupper(static_cast<unsigned char>(_path[0])) >= 'A' && std::toupper(static_cast<unsigned char>(_path[0])) <= 'Z' && _path[1] == ':') {
         return 2;
+    }
+#endif
+#if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) || defined(__psp2__)
+    /* Vita device mounts ("ux0:", "app0:", "uma0:", "vs0:"). Treat the
+     * "name:" prefix as a root-name (same role as a Windows drive letter)
+     * so is_absolute() is true for "ux0:/...". Built as GHC_OS_LINUX,
+     * ghc otherwise treats those paths as relative and normalizePath /
+     * operator/ prepend cwd, corrupting them. */
+    if (impl_string_type::size_type vitaRootName = detail::vitaRootNameLength(_path.begin(), _path.end())) {
+        return vitaRootName;
     }
 #endif
     if (_path.length() > 2 && _path[0] == '/' && _path[1] == '/' && _path[2] != '/' && std::isprint(_path[2])) {
@@ -3031,9 +3069,24 @@ GHC_INLINE path::iterator::iterator(const path::impl_string_type::const_iterator
 {
     updateCurrent();
     // find the position of a potential root directory slash
+#if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) || defined(__psp2__)
+    /* Vita device mounts: in "ux0:/x" the root-name is "ux0:" (see
+     * path::root_name_length()) and the '/' right after it is the root
+     * directory. Record that slash, exactly as the GHC_OS_WINDOWS branch below
+     * does for "C:/", so iteration yields it and lexically_normal() keeps
+     * "ux0:/x" instead of rebuilding the device-relative spelling "ux0:x"
+     * operator++ and decrement already honour _root. */
+    const path::impl_string_type::difference_type vitaRootName = static_cast<path::impl_string_type::difference_type>(detail::vitaRootNameLength(_first, _last));
+#endif
 #ifdef GHC_OS_WINDOWS
     if (_last - _first >= 3 && std::toupper(static_cast<unsigned char>(*first)) >= 'A' && std::toupper(static_cast<unsigned char>(*first)) <= 'Z' && *(first + 1) == ':' && *(first + 2) == '/') {
         _root = _first + 2;
+    }
+    else
+#endif
+#if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) || defined(__psp2__)
+    if (vitaRootName != 0 && vitaRootName < _last - _first && *(_first + vitaRootName) == '/') {
+        _root = _first + vitaRootName;
     }
     else
 #endif

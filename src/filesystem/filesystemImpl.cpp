@@ -46,6 +46,13 @@ std::string filesystemImpl::contentsOfFileAsString(const char *path) {
 bool filesystemImpl::setCurrentDirectory(const char *path) {
     fs::path stdPath(path);
     fs::current_path(stdPath);
+#if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) || defined(__psp2__)
+    /* Vita getcwd may return a different spelling of the same directory
+     * than the chdir argument (trailing slash, ux0: vs ux0:/). equivalent()
+     * then reports false even though the chdir succeeded, and Config
+     * aborts with "Unable to switch into gameFolder". Trust chdir. */
+    return true;
+#else
     bool ret;
 
     try {
@@ -55,6 +62,7 @@ bool filesystemImpl::setCurrentDirectory(const char *path) {
         ret = false;
     }
     return ret;
+#endif
 }
 
 std::string filesystemImpl::getCurrentDirectory() {

@@ -72,18 +72,30 @@ struct RGSS_entryHandle
 	      currentMagic(data.startMagic),
 	      currentOffset(0)
 	{
+		/* May come back null: PHYSFS_Io::duplicate is allowed to fail,
+		 * so every caller has to check before using the handle. */
 		io = archIo->duplicate(archIo);
 	}
 
+	/* `io` is owned by this handle. A copy would hand the same stream to
+	 * a second owner and have both destructors destroy it; RGSS_ioDuplicate
+	 * goes through the constructor above instead. */
+	RGSS_entryHandle(const RGSS_entryHandle &) = delete;
+	RGSS_entryHandle &operator=(const RGSS_entryHandle &) = delete;
+
 	~RGSS_entryHandle()
 	{
-		io->destroy(io);
+		if (io)
+			io->destroy(io);
 	}
 };
 
 struct RGSS_archiveData
 {
 	PHYSFS_Io *archiveIo;
+	std::string mountName;
+	RGSS_archiveData *next = nullptr;
+	uint32_t entryCount = 0, indexNodes = 0, pathBytes = 0;
 
 	/* Maps: file path
 	 * to:   entry data */
@@ -94,19 +106,176 @@ struct RGSS_archiveData
 	BoostHash<std::string, BoostSet<std::string> > dirHash;
 };
 
-static bool
-readUint32(PHYSFS_Io *io, uint32_t &result)
-{
-	char buff[4];
-	PHYSFS_sint64 count = io->read(io, buff, 4);
+// Intrusive registration adds no file/OS handles and disappears on unmount.
+static RGSS_archiveData *mountedArchives = nullptr;
 
-	result = ((buff[0] << 0x00) & 0x000000FF) |
-	         ((buff[1] << 0x08) & 0x0000FF00) |
-	         ((buff[2] << 0x10) & 0x00FF0000) |
-	         ((buff[3] << 0x18) & 0xFF000000) ;
+static void
+registerArchive(RGSS_archiveData *data, const char *name)
+{
+	if (!name || strlen(name) >= 1024)
+		return;
+	data->mountName = name;
+	data->next = mountedArchives;
+	mountedArchives = data;
+}
+
+static int
+RGSS_entryType(const RGSS_archiveData *data, const char *path)
+{
+	if (data->entryHash.contains(path)) return PHYSFS_FILETYPE_REGULAR;
+	if (data->dirHash.contains(path)) return PHYSFS_FILETYPE_DIRECTORY;
+	return RGSS_PATH_ABSENT;
+}
+
+int
+RGSS_pathType(const char *archive, const char *path)
+{
+	for (const RGSS_archiveData *data = mountedArchives; data; data = data->next)
+		if (data->mountName == archive) return RGSS_entryType(data, path);
+	return RGSS_UNKNOWN_ARCHIVE;
+}
+
+struct RGSS_ioSource
+{
+	PHYSFS_Io *io;
+	int64_t readBytes(void *dest, size_t len)
+	{
+		return io->read(io, dest, len);
+	}
+};
+
+template<typename Src>
+static bool
+readUint32From(Src &src, uint32_t &result)
+{
+	/* Zeroed because a short read leaves bytes untouched and they are
+	 * still folded into `result` below. Unsigned because `(char)0x80` is
+	 * negative and shifting a negative value is undefined; widened to
+	 * uint32_t as well so nothing rests on the promoted int being able to
+	 * hold the result. Same value as before for every complete read. */
+	unsigned char buff[4] = {0, 0, 0, 0};
+	int64_t count = src.readBytes(buff, 4);
+
+	result = ((uint32_t) buff[0] << 0x00) |
+	         ((uint32_t) buff[1] << 0x08) |
+	         ((uint32_t) buff[2] << 0x10) |
+	         ((uint32_t) buff[3] << 0x18) ;
 
 	return (count == 4);
 }
+
+static bool
+readUint32(PHYSFS_Io *io, uint32_t &result)
+{
+	RGSS_ioSource src = { io };
+	return readUint32From(src, result);
+}
+
+/* The version 1/2 index interleaves entry headers with entry data, so it
+ * cannot be slurped whole. Headers and names arrive as 4-byte and 1-byte
+ * reads, and each PHYSFS_Io read is one card access on the Vita (Middens'
+ * 300 MB archive spent ~12 s of tiny reads in this loop). This reader
+ * refills one bounded buffer per span of sequential index bytes; the
+ * entry-payload skip seeks inside the buffered window for free and drops
+ * the buffer only when a payload ends past it. A failed allocation
+ * degrades to unbuffered reads, never to a failed mount. Read counts keep
+ * PHYSFS_Io::read's contract, including short counts at end of file. */
+struct RGSS_indexReader
+{
+	static const size_t CAPACITY = 64 * 1024;
+
+	PHYSFS_Io *io;
+	unsigned char *buffer;
+	/* Archive offset of buffer[0]; with no buffer, the logical position. */
+	int64_t bufferStart;
+	/* Underlying position, tracked only while a buffer is held; it equals
+	 * the logical position at every loop top, because each iteration ends
+	 * with either a refill at end of file or a seek past the buffer. */
+	int64_t physical;
+	size_t bufferLen, bufferPos;
+
+	explicit RGSS_indexReader(PHYSFS_Io *archiveIo)
+	    : io(archiveIo), buffer(0), bufferStart(8), physical(8),
+	      bufferLen(0), bufferPos(0)
+	{
+		/* verifyHeader consumed exactly the 8 header bytes unbuffered, so
+		 * a file this archiver does not claim is left as it found it. */
+		buffer = static_cast<unsigned char*>(
+		    PHYSFS_getAllocator()->Malloc(CAPACITY));
+	}
+
+	~RGSS_indexReader()
+	{
+		if (buffer)
+			PHYSFS_getAllocator()->Free(buffer);
+	}
+
+	RGSS_indexReader(const RGSS_indexReader &) = delete;
+	RGSS_indexReader &operator=(const RGSS_indexReader &) = delete;
+
+	bool seek(int64_t offset)
+	{
+		if (buffer && offset >= bufferStart &&
+		    offset <= bufferStart + static_cast<int64_t>(bufferLen))
+		{
+			bufferPos = static_cast<size_t>(offset - bufferStart);
+			return true;
+		}
+		if (!io->seek(io, static_cast<PHYSFS_uint64>(offset)))
+			return false;
+		physical = offset;
+		bufferStart = offset;
+		bufferLen = bufferPos = 0;
+		return true;
+	}
+
+	int64_t tell() const
+	{
+		return bufferStart + static_cast<int64_t>(bufferPos);
+	}
+
+	int64_t readBytes(void *dest, size_t len)
+	{
+		if (!buffer)
+		{
+			int64_t count = io->read(io, dest, len);
+			if (count > 0)
+				bufferStart += count;
+			return count;
+		}
+
+		unsigned char *out = static_cast<unsigned char*>(dest);
+		size_t done = 0;
+		while (done < len)
+		{
+			if (bufferPos == bufferLen)
+			{
+				int64_t target = bufferStart + static_cast<int64_t>(bufferLen);
+				if (physical != target &&
+				    !io->seek(io, static_cast<PHYSFS_uint64>(target)))
+					break;
+				physical = target;
+				bufferStart = target;
+				PHYSFS_sint64 got = io->read(io, buffer, CAPACITY);
+				if (got <= 0)
+				{
+					if (done == 0 && got < 0)
+						return -1;
+					break;
+				}
+				bufferLen = static_cast<size_t>(got);
+				bufferPos = 0;
+			}
+			size_t take = bufferLen - bufferPos;
+			if (take > len - done)
+				take = len - done;
+			memcpy(out + done, buffer + bufferPos, take);
+			bufferPos += take;
+			done += take;
+		}
+		return static_cast<int64_t>(done);
+	}
+};
 
 #define RGSS_HEADER "RGSSAD"
 #define RGSS_MAGIC 0xDEADCAFE
@@ -148,94 +317,55 @@ RGSS_ioRead(PHYSFS_Io *self, void *buffer, PHYSFS_uint64 len)
 	RGSS_entryHandle *entry = static_cast<RGSS_entryHandle*>(self->opaque);
 
 	PHYSFS_Io *io = entry->io;
-
-	uint64_t toRead = std::min<uint64_t>(entry->data.size - entry->currentOffset, len);
 	uint64_t offs = entry->currentOffset;
+	uint64_t toRead = std::min<uint64_t>(entry->data.size - offs, len);
+	if (toRead == 0)
+		return 0;
 
-	io->seek(io, entry->data.offset + offs);
-
-	/* We divide up the bytes to be read in 3 categories:
-	 *
-	 * preAlign: If the current read address is not dword
-	 *   aligned, this is the number of bytes to read til
-	 *   we reach alignment again (therefore can only be
-	 *   3 or less).
-	 *
-	 * align: The number of aligned dwords we can read
-	 *   times 4 (= number of bytes).
-	 *
-	 * postAlign: The number of bytes to read after the
-	 *   last aligned dword. Always 3 or less.
-	 *
-	 * Treating the pre- and post aligned reads specially,
-	 * we can read all aligned dwords in one syscall directly
-	 * into the write buffer and then run the xor chain on
-	 * it afterwards. */
-
-	uint8_t preAlign = 4 - (offs % 4);
-
-	if (preAlign == 4)
-		preAlign = 0;
-	else
-		preAlign = std::min<uint64_t>(preAlign, len);
-
-	uint8_t postAlign = (len > preAlign) ? (offs + len) % 4 : 0;
-
-	uint64_t align = len - (preAlign + postAlign);
-
-	/* Byte buffer pointer */
-	uint8_t *bBufferP = static_cast<uint8_t*>(buffer);
-
-	if (preAlign > 0)
+	if (!io->seek(io, entry->data.offset + offs))
 	{
-		uint32_t dword;
-		io->read(io, &dword, preAlign);
+		PHYSFS_setErrorCode(PHYSFS_ERR_IO);
+		return -1;
+	}
 
-		/* Need to align the bytes with the
-		 * magic before xoring */
-		dword <<= 8 * (offs % 4);
-		dword ^= entry->currentMagic;
+	uint8_t *bytes = static_cast<uint8_t*>(buffer);
+	PHYSFS_sint64 count = io->read(io, bytes, toRead);
+	if (count < 0)
+	{
+		memset(bytes, 0, toRead);
+		PHYSFS_setErrorCode(PHYSFS_ERR_IO);
+		return -1;
+	}
+	if (static_cast<uint64_t>(count) < toRead)
+	{
+		memset(bytes + count, 0, toRead - count);
+		PHYSFS_setErrorCode(PHYSFS_ERR_CORRUPT);
+	}
 
-		/* Shift them back to normal */
-		dword >>= 8 * (offs % 4);
-		memcpy(bBufferP, &dword, preAlign);
-
-		bBufferP += preAlign;
-
-		/* Only advance the magic if we actually
-		 * reached the next alignment */
-		if ((offs+preAlign) % 4 == 0)
+	uint64_t remaining = count;
+	while (remaining && (offs & 3))
+	{
+		*bytes++ ^= entry->currentMagic >> (8 * (offs & 3));
+		--remaining;
+		if ((++offs & 3) == 0)
 			advanceMagic(entry->currentMagic);
 	}
 
-	if (align > 0)
-	{
-		/* Double word buffer pointer */
-		uint32_t *dwBufferP = reinterpret_cast<uint32_t*>(bBufferP);
-
-		/* Read aligned dwords in one go */
-		io->read(io, bBufferP, align);
-
-		/* Then xor them */
-		for (uint64_t i = 0; i < (align / 4); ++i)
-			dwBufferP[i] ^= advanceMagic(entry->currentMagic);
-
-		bBufferP += align;
-	}
-
-	if (postAlign > 0)
+	/* The caller's buffer may be unaligned, even at an aligned file offset. */
+	while (remaining >= 4)
 	{
 		uint32_t dword;
-		io->read(io, &dword, postAlign);
-
-		/* Bytes are already aligned with magic */
-		dword ^= entry->currentMagic;
-		memcpy(bBufferP, &dword, postAlign);
+		memcpy(&dword, bytes, 4);
+		dword ^= advanceMagic(entry->currentMagic);
+		memcpy(bytes, &dword, 4);
+		bytes += 4;
+		remaining -= 4;
 	}
+	for (unsigned i = 0; i < remaining; ++i)
+		bytes[i] ^= entry->currentMagic >> (8 * i);
 
-	entry->currentOffset += toRead;
-
-	return toRead;
+	entry->currentOffset += count;
+	return count;
 }
 
 static int
@@ -243,29 +373,27 @@ RGSS_ioSeek(PHYSFS_Io *self, PHYSFS_uint64 offset)
 {
 	RGSS_entryHandle *entry = static_cast<RGSS_entryHandle*>(self->opaque);
 
-	if (offset == entry->currentOffset)
-		return 1;
-
-	if (offset > entry->data.size-1)
+	/* Entry sizes are uint32_t on disk: this also bounds LCG_TABLE indices. */
+	if (offset > entry->data.size)
+	{
+		PHYSFS_setErrorCode(PHYSFS_ERR_IO);
 		return 0;
+	}
+	if (!entry->io->seek(entry->io, entry->data.offset + offset))
+	{
+		PHYSFS_setErrorCode(PHYSFS_ERR_IO);
+		return 0;
+	}
 
-	/* If rewinding, we need to rewind to begining */
 	if (offset < entry->currentOffset)
 	{
 		entry->currentOffset = 0;
 		entry->currentMagic = entry->data.startMagic;
 	}
 
-	/* For each overstepped alignment, advance magic */
-	uint64_t currentDword = entry->currentOffset / 4;
-	uint64_t targetDword  = offset / 4;
-	uint64_t dwordsSought = targetDword - currentDword;
-
-	advanceMagicN(entry->currentMagic, (uint32_t) dwordsSought);
-
+	uint64_t dwordsSought = offset / 4 - entry->currentOffset / 4;
+	advanceMagicN(entry->currentMagic, static_cast<uint32_t>(dwordsSought));
 	entry->currentOffset = offset;
-	entry->io->seek(entry->io, entry->data.offset + entry->currentOffset);
-
 	return 1;
 }
 
@@ -289,9 +417,30 @@ static PHYSFS_Io*
 RGSS_ioDuplicate(PHYSFS_Io *self)
 {
 	const RGSS_entryHandle *entry = static_cast<RGSS_entryHandle*>(self->opaque);
-	RGSS_entryHandle *entryDup = new RGSS_entryHandle(*entry);
+
+	/* Copying the handle would share `io` between the original and the
+	 * duplicate, and destroying either would free it under the other.
+	 * Take a stream of our own and carry the decrypt cursor across, which
+	 * is what leaves the duplicate reading where the original stands. */
+	RGSS_entryHandle *entryDup = new RGSS_entryHandle(entry->data, entry->io);
+
+	if (!entryDup->io)
+	{
+		delete entryDup;
+		PHYSFS_setErrorCode(PHYSFS_ERR_IO);
+		return 0;
+	}
+
+	entryDup->currentMagic = entry->currentMagic;
+	entryDup->currentOffset = entry->currentOffset;
 
 	PHYSFS_Io *dup = PHYSFS_ALLOC(PHYSFS_Io);
+	if (!dup)
+	{
+		delete entryDup;
+		PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+		return 0;
+	}
 	*dup = *self;
 	dup->opaque = entryDup;
 
@@ -359,6 +508,38 @@ processDirectories(RGSS_archiveData *data, BoostSet<std::string> &topLevel,
 }
 
 static bool
+validEntryRange(const RGSS_entryData &entry, int64_t minimum, int64_t archiveSize)
+{
+	return minimum >= 0 && entry.offset >= minimum && entry.offset <= archiveSize &&
+	       entry.size <= static_cast<uint64_t>(archiveSize - entry.offset);
+}
+
+static bool
+indexEntry(RGSS_archiveData *data, BoostSet<std::string> &topLevel,
+           const RGSS_entryData &entry, char *name, uint32_t nameLen)
+{
+	uint32_t directories = 0;
+	for (uint32_t i = 0; i < nameLen; ++i)
+		if (name[i] == '/')
+			++directories;
+
+	/* Charge even duplicate paths: bound table rows, map/set nodes and copied
+	 * strings independently, including the expansion of deeply nested names. */
+	uint32_t nodes = 2 + 2 * directories;
+	uint32_t bytes = (nameLen + 1) * (2 + directories);
+	if (data->entryCount == 16384 || data->indexNodes > 65536 - nodes ||
+	    data->pathBytes > 8 * 1024 * 1024 - bytes)
+		return false;
+
+	++data->entryCount;
+	data->indexNodes += nodes;
+	data->pathBytes += bytes;
+	data->entryHash.insert(name, entry);
+	processDirectories(data, topLevel, name, nameLen);
+	return true;
+}
+
+static bool
 verifyHeader(PHYSFS_Io *io, char version)
 {
 	char header[8];
@@ -376,7 +557,7 @@ verifyHeader(PHYSFS_Io *io, char version)
 }
 
 static void*
-RGSS_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
+RGSS_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
 {
 	if (forWrite)
 		return NULL;
@@ -387,6 +568,13 @@ RGSS_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
 	else
 		*claimed = 1;
 
+	int64_t archiveSize = io->length(io);
+	if (archiveSize < 8)
+	{
+		PHYSFS_setErrorCode(PHYSFS_ERR_CORRUPT);
+		return NULL;
+	}
+
 	RGSS_archiveData *data = new RGSS_archiveData;
 	data->archiveIo = io;
 
@@ -395,22 +583,40 @@ RGSS_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
 	/* Top level entry list */
 	BoostSet<std::string> &topLevel = data->dirHash[""];
 
+	RGSS_indexReader reader(io);
+
 	while (true)
 	{
-		/* Read filename length,
-         * if nothing was read, no files remain */
-		uint32_t nameLen;
-
-		if (!readUint32(io, nameLen))
+		int64_t tableOffset = reader.tell();
+		if (tableOffset == archiveSize)
 			break;
+		if (tableOffset < 8 || tableOffset > archiveSize)
+			goto error;
+
+		uint32_t nameLen;
+		if (!readUint32From(reader, nameLen))
+			goto error;
 
 		nameLen ^= advanceMagic(magic);
 
 		static char nameBuf[512];
+
+		/* nameLen is a decrypted field of the archive, i.e. any 32 bit
+		 * number at all once the file is corrupt. The terminator below
+		 * needs one byte of its own, so 512 is already one too many.
+		 * A bad archive has to fail the mount, not run off nameBuf. */
+		if (nameLen >= sizeof(nameBuf))
+			goto error;
+
 		for (uint32_t i = 0; i < nameLen; ++i)
 		{
 			char c;
-			io->read(io, &c, 1);
+
+			/* Stop on a truncated name rather than decrypt
+			 * whatever `c` happens to hold. */
+			if (reader.readBytes(&c, 1) != 1)
+				goto error;
+
 			nameBuf[i] = c ^ (advanceMagic(magic) & 0xFF);
 			if (nameBuf[i] == '\\')
 				nameBuf[i] = '/';
@@ -419,21 +625,29 @@ RGSS_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
 		nameBuf[nameLen] = '\0';
 
 		uint32_t entrySize;
-		readUint32(io, entrySize);
+
+		if (!readUint32From(reader, entrySize))
+			goto error;
+
 		entrySize ^= advanceMagic(magic);
 
 		RGSS_entryData entry;
-		entry.offset = io->tell(io);
+		entry.offset = reader.tell();
 		entry.size = entrySize;
 		entry.startMagic = magic;
 
-		data->entryHash.insert(nameBuf, entry);
-		processDirectories(data, topLevel, nameBuf, nameLen);
-
-		io->seek(io, entry.offset + entry.size);
+		if (!validEntryRange(entry, 8, archiveSize) ||
+		    !reader.seek(entry.offset + entry.size) ||
+		    !indexEntry(data, topLevel, entry, nameBuf, nameLen))
+			goto error;
 	}
 
+	registerArchive(data, name);
 	return data;
+error:
+	PHYSFS_setErrorCode(PHYSFS_ERR_CORRUPT);
+	delete data;
+	return NULL;
 }
 
 static PHYSFS_EnumerateCallbackResult
@@ -452,7 +666,13 @@ RGSS_enumerateFiles(void *opaque, const char *dirname,
 
 	BoostSet<std::string>::const_iterator iter;
 	for (iter = entries.cbegin(); iter != entries.cend(); ++iter)
-		cb(callbackdata, origdir, iter->c_str());
+	{
+		PHYSFS_EnumerateCallbackResult result = cb(callbackdata, origdir, iter->c_str());
+		if (result == PHYSFS_ENUM_ERROR)
+			PHYSFS_setErrorCode(PHYSFS_ERR_APP_CALLBACK);
+		if (result != PHYSFS_ENUM_OK)
+			return result;
+	}
 
 	return PHYSFS_ENUM_OK;
 }
@@ -468,7 +688,20 @@ RGSS_openRead(void *opaque, const char *filename)
 	RGSS_entryHandle *entry =
 	        new RGSS_entryHandle(data->entryHash[filename], data->archiveIo);
 
+	if (!entry->io)
+	{
+		delete entry;
+		PHYSFS_setErrorCode(PHYSFS_ERR_IO);
+		return 0;
+	}
+
 	PHYSFS_Io *io = PHYSFS_ALLOC(PHYSFS_Io);
+	if (!io)
+	{
+		delete entry;
+		PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+		return 0;
+	}
 
 	*io = RGSS_IoTemplate;
 	io->opaque = entry;
@@ -481,10 +714,9 @@ RGSS_stat(void *opaque, const char *filename, PHYSFS_Stat *stat)
 {
 	RGSS_archiveData *data = static_cast<RGSS_archiveData*>(opaque);
 
-	bool hasFile = data->entryHash.contains(filename);
-	bool hasDir  = data->dirHash.contains(filename);
+	const int type = RGSS_entryType(data, filename);
 
-	if (!hasFile && !hasDir)
+	if (type == RGSS_PATH_ABSENT)
 	{
 		PHYSFS_setErrorCode(PHYSFS_ERR_NOT_FOUND);
 		return 0;
@@ -495,7 +727,7 @@ RGSS_stat(void *opaque, const char *filename, PHYSFS_Stat *stat)
 	stat->accesstime = 0;
 	stat->readonly   = 1;
 
-	if (hasFile)
+	if (type == PHYSFS_FILETYPE_REGULAR)
 	{
 		const RGSS_entryData &entry = data->entryHash[filename];
 
@@ -515,7 +747,9 @@ static void
 RGSS_closeArchive(void *opaque)
 {
 	RGSS_archiveData *data = static_cast<RGSS_archiveData*>(opaque);
-
+	RGSS_archiveData **link = &mountedArchives;
+	while (*link && *link != data) link = &(*link)->next;
+	if (*link) *link = data->next;
 	delete data;
 }
 
@@ -585,7 +819,7 @@ readUint32AndXor(PHYSFS_Io *io, uint32_t &result, uint32_t key)
 }
 
 static void*
-RGSS3_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
+RGSS3_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
 {
 	if (forWrite)
 		return NULL;
@@ -596,10 +830,15 @@ RGSS3_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
 	else
 		*claimed = 1;
 
+	int64_t archiveSize = io->length(io);
 	uint32_t baseMagic;
 
-	if (!readUint32(io, baseMagic))
+	if (archiveSize < 16 || !readUint32(io, baseMagic))
+	{
+		PHYSFS_setErrorCode(PHYSFS_ERR_CORRUPT);
 		return NULL;
+	}
+	int64_t firstDataOffset = archiveSize;
 
 	baseMagic = (baseMagic * 9) + 3;
 
@@ -618,7 +857,12 @@ RGSS3_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
 
 		/* Zero offset means entry list has ended */
 		if (offset == 0)
+		{
+			int64_t tableEnd = io->tell(io);
+			if (tableEnd < 16 || tableEnd > firstDataOffset)
+				goto error;
 			break;
+		}
 
 		if (!readUint32AndXor(io, size, baseMagic))
 			goto error;
@@ -630,6 +874,14 @@ RGSS3_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
 			goto error;
 
 		char nameBuf[512];
+
+		/* Same bound as the version 1 path: nameLen comes out of the
+		 * file, and the terminator below claims the last byte. */
+		if (nameLen >= sizeof(nameBuf))
+		{
+			PHYSFS_setErrorCode(PHYSFS_ERR_CORRUPT);
+			goto error;
+		}
 
 		if (!IO_READ(io, nameBuf, nameLen))
 			goto error;
@@ -649,16 +901,21 @@ RGSS3_openArchive(PHYSFS_Io *io, const char *, int forWrite, int *claimed)
 		entry.size = size;
 		entry.startMagic = magic;
 
-		data->entryHash.insert(nameBuf, entry);
-		processDirectories(data, topLevel, nameBuf, nameLen);
+		if (!validEntryRange(entry, 12, archiveSize))
+			goto error;
+		firstDataOffset = std::min(firstDataOffset, entry.offset);
+		if (!indexEntry(data, topLevel, entry, nameBuf, nameLen))
+			goto error;
 
 		continue;
 
 	error:
+		PHYSFS_setErrorCode(PHYSFS_ERR_CORRUPT);
 		delete data;
 		return NULL;
 	}
 
+	registerArchive(data, name);
 	return data;
 }
 

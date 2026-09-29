@@ -28,4 +28,9 @@ extern const PHYSFS_Archiver RGSS1_Archiver;
 extern const PHYSFS_Archiver RGSS2_Archiver;
 extern const PHYSFS_Archiver RGSS3_Archiver;
 
+// Startup-only query: callers serialize mount/unmount with path-cache creation.
+// Uses the archiver's exact byte-name tables, with files winning implied dirs.
+enum { RGSS_UNKNOWN_ARCHIVE = -2, RGSS_PATH_ABSENT = -1 };
+int RGSS_pathType(const char *archive, const char *path);
+
 #endif // RGSSAD_H
