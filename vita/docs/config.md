@@ -538,7 +538,7 @@ These cached per-binding gates also apply to saved stick-to-button mappings;
 direction bindings, trigger axes, raw-axis queries and binding-file contents are
 unchanged. Settings capture still uses the movement gate described below.
 Y/Z cannot be held together on this default axis. Desktop defaults still use clicks.
-Host checks cover the mapping; handheld input-diagnostic acceptance remains pending.
+Device acceptance of the handheld mapping is still pending.
 
 Saved bindings replace the RGSS rows above; an old file keeps its old L3/R3 mapping.
 Back up and remove that file to adopt the new defaults. `bindingNames` only changes
@@ -550,7 +550,7 @@ binding editor with the desired controller mapping; do not enable the desktop
 settings window on Vita. Keep both path names nonempty. This overrides the common
 path described above only when config layers are enabled and the packaged
 `app0:/mkxp.json` does not pin `dataPathOrg`/`dataPathApp` at higher priority;
-the supplied diagnostic/deploy template pins both and must be adjusted when
+a root config that pins both must be adjusted when
 packaging a player intended to use per-game binding directories.
 
 ### Front touch as mouse

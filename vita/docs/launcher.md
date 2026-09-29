@@ -17,8 +17,7 @@ hard constraints rather than preferences:
 * **MRI cannot be torn down in process.** `ruby_cleanup()` does not give a
   process back a state where `ruby_setup()` can run again. So "quit to the game
   list" cannot be a return into a menu loop: it has to be a new process, and on
-  this device a new process means `sceAppMgrLoadExec` of the same eboot
-.
+  this device a new process means `sceAppMgrLoadExec` of the same eboot.
 * **The package is large.** Almost all of it is Ruby, the fonts and the shader cache. A
   second eboot would double a VPK in order to draw a list.
 
@@ -79,8 +78,8 @@ A path is only accepted if it is a device-absolute `<dev>:/…` path of at most
 (`vita/launcher/launch_args.c`). That is not decoration: the string crosses a
 process boundary and is then handed to `fopen` and `chdir`.
 
-A folder that names its own game launches with a second argument
-. Pocket Mirror Classic ships `Pocket Mirror.exe/.ini/.rgss3a`
+A folder that names its own game launches with a second argument.
+Pocket Mirror Classic ships `Pocket Mirror.exe/.ini/.rgss3a`
 and no `Game.ini`, so the scan finds no game there by the Game.ini rule.
 When a folder holds no Game.ini but exactly one `<name>.ini` plus a partner
 whose basename is the same (ASCII case-insensitive) and whose extension is
@@ -155,7 +154,7 @@ a crash belongs to the launcher, and a diagnostic run must not eat it.
 A fresh reopen consumes the root report and rotates it into `logs/last-error.prev.txt`; a later distinct boot has no repeated report.
 
 `last-error.txt` has exactly **one** producer: `vitaWriteLastError()` /
-`vitaWriteLastErrorTo()` in `src/vita_fatal.cpp` (`src/vita_fatal.cpp`). Everything that reports through it — the bindings' `showExc`, the
+`vitaWriteLastErrorTo()` in `src/vita_fatal.cpp`. Everything that reports through it — the bindings' `showExc`, the
 three sites in `src/main.cpp`, and `vita_boot_report_error()` — calls that
 writer; none of them spells the format out.
 

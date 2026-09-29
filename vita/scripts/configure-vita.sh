@@ -367,9 +367,9 @@ emit_pkgconfig_wrapper() {
     echo 'while [[ $libs == *" -pthread "* ]]; do libs=${libs//" -pthread "/" "}; done'
     echo 'while [[ $libs == *" -lpthread "* ]]; do libs=${libs//" -lpthread "/" "}; done'
     # The VIDEO_VITA_VGL sdl2.pc names the STRONG SceShaccCg/SceKernelDmacMgr
-    # stubs, whose imports demand those modules at process start; the proven
-    # smoke closure (build-vgl-smoke-vpk.sh) links the weak forms, so rewrite
-    # before the tokens reach the link line.
+    # stubs, whose imports demand those modules at process start; the closure
+    # proven on hardware links the weak forms, so rewrite them before the
+    # tokens reach the link line.
     echo 'while [[ $libs == *" -lSceShaccCg_stub "* ]]; do libs=${libs//" -lSceShaccCg_stub "/" -lSceShaccCg_stub_weak "}; done'
     echo 'while [[ $libs == *" -lSceKernelDmacMgr_stub "* ]]; do libs=${libs//" -lSceKernelDmacMgr_stub "/" -lSceKernelDmacMgr_stub_weak "}; done'
     echo 'libs=${libs# }'
@@ -684,8 +684,8 @@ fi
 #       With no --game and no pinned root config the player IS the launcher —
 #       the game list drawn with SDL2 alone, no Config, no audio, no Ruby — and
 #       picking a game is sceAppMgrLoadExec of this same eboot. A player whose
-#       root config names a gameFolder or a customScript (the product bubble,
-#       every diagnostic VPK) is unaffected and still exits to LiveArea.
+#       root config names a gameFolder or a customScript (a player packaged for one
+#       game) is unaffected and still exits to LiveArea.
 MESON_OPTS=(
   --cross-file "$CROSS_FILE"
   --cross-file "$STUB_CROSS"

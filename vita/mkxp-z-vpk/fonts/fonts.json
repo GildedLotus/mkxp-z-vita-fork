@@ -48,8 +48,8 @@
     },
     "mkxp-z": {
       "pin": "826929eeb3ebc4b887c011604919217a790770f4",
-      "tree": "build/mkxp-z (MKXPZ_SRC)",
-      "note": "staged from the engine checkout, never downloaded and never committed"
+      "tree": "assets/liberation.ttf",
+      "note": "staged from the engine tree, never downloaded and never committed"
     }
   },
   "files": [
