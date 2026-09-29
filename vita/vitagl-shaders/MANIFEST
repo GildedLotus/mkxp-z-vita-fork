@@ -1,0 +1,18 @@
+# Provenance of the shipped GXP set (vita/scripts/vitagl-shaders.py manifest): the compiler output was made by
+# the vitaGL build these inputs describe; `check` fails when this tree's inputs or the files differ.
+shader-cache-magic 2
+pin.vitagl 464876a79cdd00650bb0eb9629b85d81f9908fd8
+pin.vitashark df24065e65098b2d1ac533760109ad4367573f28
+pin.shacccgext fb0e9d338525b067f3679ab33571323336493cca
+build-knobs NO_SPLASHSCREEN=1 LOG_ERRORS=1 HAVE_SHADER_CACHE=1 HAVE_SHARK_LOG=1 SINGLE_THREADED_GC=1
+patch.vitagl-0001-oom-error-contract.patch 91f14f6e8b6ba526795f2e8d9a966d86b861c2c8d992ba267f03b6a2d3762bcc
+patch.vitagl-0002-link-without-compiler.patch 0c374e4a3ff4f0028dbf436f05107eafd5d9e56d07710c1b2036c52f65ac4dc0
+patch.vitagl-0003-gles2-enum-gaps.patch 81825517e05d11cb0d78666077a737d140cea6cf1b9ae04a080d3b6f6d01c364
+patch.vitagl-0004-shader-cache-dirs.patch 560d108c1a5c64a13423a8b13d3780a11cd2b5bf7583660b2bc9d348da1282e8
+patch.vitagl-0005-fallback-shader-cache.patch 1987582cef265111f787afcdc795466f95468f611cd82bfc711a1ec8c0eada29
+patch.vitagl-0006-rendertarget-exhaustion.patch 7a0e6a65e9d81e18697310ffc07d170b1be795f3fc586c4a234a93c84075ca06
+patch.vitagl-0007-review-hardening.patch c669fa11852423ccc5d85aea5d21ad95263f8641a58c421c64ea33e6d88332b1
+patch.vitagl-0008-titleid-buffer-size.patch 578f460862513f12f8e7791a61cc3084ca9d62862f34f5aca827de7fa7843eba
+patch.vitagl-0009-cache-write-layout.patch 15a0d472580b2c8e0437aa28c1947e7212df791347da9284e91b6eca6e81253e
+file.shacccgext/src/shacccg_ext_oop.cpp 9b3c84e6a84a67055d4fc3793db3f849177b939b15c79f89d5417b6e26e88876
+set-sha256 75f7bfc1fe19873678be31d16f2240547e79845e2a81644c926fee02107ef01c
