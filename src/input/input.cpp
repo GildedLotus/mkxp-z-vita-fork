@@ -21,6 +21,11 @@
 
 #include "input.h"
 #include "config.h"
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "vita_glue.h"
+#include <cstdio>
+#endif
 #include "sharedstate.h"
 #include "eventthread.h"
 #include "input/keybindings.h"
@@ -557,27 +562,51 @@ struct CtrlButtonBinding : public Binding
 
 struct CtrlAxisBinding : public Binding
 {
-    CtrlAxisBinding() {}
-    
+    /* Cache gates at binding apply, including rebinds. State belongs to each
+     * binding, never to the shared axis or a queried RGSS button. */
+    CtrlAxisBinding() : threshold(jAxisThreshold()) {}
+
     CtrlAxisBinding(uint8_t source, AxisDir dir, Input::ButtonCode target)
-    : Binding(target), source(source), dir(dir) {}
-    
+    : Binding(target), source(source), dir(dir),
+      threshold(jAxisThreshold()) {}
+
     bool sourceActive() const
     {
-        float val = EventThread::controllerState.axes[source];
-        
+        int val = EventThread::controllerState.axes[source];
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        /* Stick actions keep a conservative gate when movement is sensitive.
+         * Direction bindings and trigger axes retain their existing gate. */
+        if (source <= SDL_CONTROLLER_AXIS_RIGHTY && target != Input::None &&
+            target != Input::Down && target != Input::Left &&
+            target != Input::Right && target != Input::Up)
+        {
+            const int magnitude = dir == Negative ? -val : val;
+            actionActive = magnitude > (actionActive ? actionReleaseThreshold
+                                                     : actionThreshold);
+            return actionActive;
+        }
+#endif
+
+
         if (dir == Negative)
-            return val < -JAXIS_THRESHOLD;
+            return val < -threshold;
         else
-            return val > JAXIS_THRESHOLD;
+            return val > threshold;
     }
-    
+
     bool sourceRepeatable() const {
         return true;
     }
-    
+
     uint8_t source;
     AxisDir dir;
+    int16_t threshold;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* 9830 is the default 0.30 SDL gate; release at 75% of the press gate. */
+    int16_t actionThreshold = threshold < 9830 ? 9830 : threshold;
+    int16_t actionReleaseThreshold = actionThreshold - (actionThreshold >> 2);
+    mutable bool actionActive = false;
+#endif
 };
 
 /* Mouse button binding */
@@ -1085,7 +1114,7 @@ struct InputPrivate
         for (int i = 0; i < SDL_CONTROLLER_AXIS_MAX; i++)
             axisStateArray[i] = shState->eThread().controllerState.axes[i];
         
-        memcpy(rawButtonStates, shState->eThread().controllerState.buttons, SDL_CONTROLLER_BUTTON_MAX);
+        EventThread::copyRawControllerButtons(rawButtonStates);
         
         for (int i = 0; i < SDL_CONTROLLER_BUTTON_MAX; i++)
         {
@@ -1205,6 +1234,20 @@ void Input::recalcRepeat(unsigned int fps) {
 
 void Input::update()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    {
+        static bool entered = false;
+        if (!entered) {
+            entered = true;
+            char tb[160];
+            snprintf(tb, sizeof(tb),
+                     "input: Input::update entered ctrlB=%u kb=%u",
+                     (unsigned)p->ctrlBBindings.size(),
+                     (unsigned)p->kbBindings.size());
+            vita_glue_trace(tb);
+        }
+    }
+#endif
     shState->checkShutdown();
     p->checkBindingChange(shState->rtData());
     
@@ -1219,6 +1262,38 @@ void Input::update()
     // Update raw keys, controller buttons and axes
     p->updateRaw();
     p->updateControllerRaw();
+    
+#if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) && VITA_GLUE_FRAME_TRACE
+    {
+        static unsigned frame = 0;
+        static unsigned lastBits = 0;
+        static int lastABC = -1;
+        frame++;
+        const EventThread::ControllerState &cs =
+            shState->eThread().controllerState;
+        unsigned bits = 0;
+        for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX && b < 32; b++)
+            if (cs.buttons[b]) bits |= (1u << b);
+        int abc = (p->getState(Input::C).pressed ? 1 : 0)
+                | (p->getState(Input::B).pressed ? 2 : 0)
+                | (p->getState(Input::A).pressed ? 4 : 0);
+        bool change = (bits != lastBits) || (abc != lastABC);
+        if (change || (frame % 60) == 1) {
+            char tb[224];
+            snprintf(tb, sizeof(tb),
+                     "input: f=%u bits=0x%08x C=%d B=%d A=%d X=%d ctrlbind=%u",
+                     frame, bits,
+                     (int)p->getState(Input::C).pressed,
+                     (int)p->getState(Input::B).pressed,
+                     (int)p->getState(Input::A).pressed,
+                     (int)p->getState(Input::X).pressed,
+                     (unsigned)p->ctrlBBindings.size());
+            vita_glue_trace(tb);
+        }
+        lastBits = bits;
+        lastABC = abc;
+    }
+#endif
     
     // Record mouse positions
     p->mousePos[0] = shState->eThread().mouseState.x;

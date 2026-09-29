@@ -23,6 +23,7 @@
 
 #include <SDL_events.h>
 #include <SDL_messagebox.h>
+#include <SDL_system.h>
 #include <SDL_timer.h>
 #include <SDL_thread.h>
 #include <SDL_touch.h>
@@ -53,6 +54,11 @@
 #endif
 
 #include <string.h>
+#include <cstdio>
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "vita_glue.h"
+#endif
 
 typedef void (ALC_APIENTRY *LPALCDEVICEPAUSESOFT) (ALCdevice *device);
 typedef void (ALC_APIENTRY *LPALCDEVICERESUMESOFT) (ALCdevice *device);
@@ -89,6 +95,103 @@ EventThread::MouseState EventThread::mouseState;
 EventThread::TouchState EventThread::touchState;
 SDL_atomic_t EventThread::verticalScrollDistance;
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+SDL_atomic_t EventThread::rawSystemButtons;
+
+struct VitaTouchMouse
+{
+    bool active = false;
+    SDL_Point position = {0, 0};
+
+    void update(const SDL_Rect &screen) const
+    {
+        if (!active)
+            return;
+        EventThread::MouseState &state = EventThread::mouseState;
+        bool inside = SDL_PointInRect(&position, &screen);
+        /* A one-pixel negative offset can truncate to game coordinate zero.
+         * Use a whole screen outside, including when the game rect changes. */
+        state.x = inside ? position.x : screen.x - (screen.w > 0 ? screen.w : 960);
+        state.y = inside ? position.y : screen.y - (screen.h > 0 ? screen.h : 544);
+        state.inWindow = inside;
+        if (!inside)
+            state.buttons[SDL_BUTTON_LEFT] = false;
+    }
+
+    void handle(const SDL_Event &event, const SDL_Rect &screen)
+    {
+        active = true;
+        position.x = event.type == SDL_MOUSEMOTION ? event.motion.x : event.button.x;
+        position.y = event.type == SDL_MOUSEMOTION ? event.motion.y : event.button.y;
+        update(screen);
+        if (event.type != SDL_MOUSEMOTION)
+            EventThread::mouseState.buttons[SDL_BUTTON_LEFT] =
+                event.type == SDL_MOUSEBUTTONDOWN && EventThread::mouseState.inWindow;
+    }
+};
+
+struct VitaSystemChords
+{
+    enum Action { None = 0, ToggleFPS = 1, Settings = 2, Quit = 4 };
+    bool startDown = false, selectDown = false;
+    bool startConsumed = false, selectConsumed = false;
+    bool quitRequested = false;
+    Uint64 chordSince = 0;
+
+    unsigned sampleChord(Uint64 now)
+    {
+        if (!quitRequested && startDown && selectDown && now - chordSince >= 2000)
+        {
+            quitRequested = true;
+            startConsumed = selectConsumed = true;
+            return Quit;
+        }
+        return None;
+    }
+
+    unsigned button(int button, bool pressed, Uint64 now)
+    {
+        unsigned action = sampleChord(now);
+        bool &down = button == SDL_CONTROLLER_BUTTON_START ? startDown : selectDown;
+        bool &consumed = button == SDL_CONTROLLER_BUTTON_START ? startConsumed : selectConsumed;
+        if (pressed == down)
+            return action;
+        down = pressed;
+        if (pressed)
+            consumed = false;
+        else if (!consumed && !quitRequested)
+            action |= button == SDL_CONTROLLER_BUTTON_START ? Settings : ToggleFPS;
+
+        if (startDown && selectDown)
+        {
+            startConsumed = selectConsumed = true;
+            chordSince = now;
+        }
+        return action;
+    }
+};
+
+static unsigned vitaControllerButton(VitaSystemChords &chords, int button,
+                                     bool pressed, Uint64 now)
+{
+    if (button < 0 || button >= SDL_CONTROLLER_BUTTON_MAX)
+        return VitaSystemChords::None;
+    if (button != SDL_CONTROLLER_BUTTON_START && button != SDL_CONTROLLER_BUTTON_BACK)
+    {
+        EventThread::controllerState.buttons[button] = pressed;
+        return VitaSystemChords::None;
+    }
+
+    EventThread::controllerState.buttons[button] = false;
+    unsigned action = chords.button(button, pressed, now);
+    /* Keep pressex?/triggerex?/releaseex? raw; only RGSS bindings reserve these. */
+    SDL_AtomicSet(&EventThread::rawSystemButtons,
+                 (chords.startDown ? 1 << SDL_CONTROLLER_BUTTON_START : 0) |
+                 (chords.selectDown ? 1 << SDL_CONTROLLER_BUTTON_BACK : 0));
+    return action;
+}
+#endif
+
 /* User event codes */
 enum
 {
@@ -124,6 +227,9 @@ bool EventThread::allocUserEvents()
 
 EventThread::EventThread()
 : ctrl(0),
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+  joy(0),
+#endif
 fullscreen(false),
 showCursor(false)
 {
@@ -149,6 +255,20 @@ void EventThread::cursorTimer()
 	hideCursorTimerID = SDL_AddTimer(500, cursorTimerCallback, this);
 }
 
+/* SDL_FingerID is a signed 64-bit handle and touchState has MAX_FINGERS
+ * slots. Returns -1 for any id that cannot address one, so no caller can
+ * write outside the array — including an event that reaches a finger case
+ * through a fallthrough, where tfinger aliases an unrelated union member. */
+static int fingerIndex(const SDL_Event &event)
+{
+    const SDL_FingerID id = event.tfinger.fingerId;
+    
+    if (id < 0 || id >= MAX_FINGERS)
+        return -1;
+    
+    return (int) id;
+}
+
 void EventThread::process(RGSSThreadData &rtData)
 {
     SDL_Event event;
@@ -170,6 +290,10 @@ void EventThread::process(RGSSThreadData &rtData)
     
     if (displayingFPS || rtData.config.printFPS)
         fps.sendUpdates.set();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    if (displayingFPS)
+        fps.overlayVisible.set();
+#endif
 
     bool cursorInWindow = false;
     /* Will be updated eventually */
@@ -179,6 +303,69 @@ void EventThread::process(RGSSThreadData &rtData)
     bool windowFocused = true;
     
     bool terminate = false;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    VitaSystemChords systemChords;
+    VitaTouchMouse touchMouse;
+    /* Last samples taken on a scheduled iteration; the resume line reports
+     * the SDL one as ticks_before so a frozen stretch shows up as a large
+     * gap. On device the gap detector samples two clocks end to end: the
+     * RTC (wall time, expected to advance through standby) and the
+     * kernel-wide system clock (may not; whether it does is exactly what
+     * the gap line's paired values answer). SDL's clock is the only one on
+     * host, so there it stands in for both. */
+#if defined(__vita__)
+    Uint64 vitaRtcBefore = (Uint64)vita_glue_rtc_time_ms();
+    Uint64 vitaTicksBefore = (Uint64)vita_glue_kernel_time_ms();
+#ifdef MKXPZ_VITAGL_BACKEND
+    Uint64 vitaWallBefore = (Uint64)vita_glue_wall_time_ms();
+#endif
+#else
+    Uint64 vitaRtcBefore = SDL_GetTicks64();
+    Uint64 vitaTicksBefore = SDL_GetTicks64();
+#ifdef MKXPZ_VITAGL_BACKEND
+    Uint64 vitaWallBefore = SDL_GetTicks64();
+#endif
+#endif
+#ifdef MKXPZ_VITAGL_BACKEND
+    /* vitaGL build: gettimeofday is a third gap clock, the one
+     * wall clock a device sleep is known to advance (Time.now +275 s over a
+     * 185 s suspend while the process clock moved 90 s); the beat below is a
+     * diagnostic behind the system-event-trace marker. */
+    Uint64 beatProc = SDL_GetTicks64(), beatRtc = vitaRtcBefore,
+           beatWall = vitaWallBefore, beatKernel = vitaTicksBefore;
+    unsigned beatIters = 0;
+    auto beatDelta = [](Uint64 now, Uint64 then) -> unsigned long long
+    { return now > then ? (unsigned long long)(now - then) : 0ULL; };
+#endif
+    auto handleSystemActions = [&](unsigned actions)
+    {
+        if (actions & VitaSystemChords::ToggleFPS)
+        {
+            displayingFPS = !displayingFPS;
+            if (displayingFPS)
+            {
+                fps.overlayVisible.set();
+                fps.sendUpdates.set();
+            }
+            else
+            {
+                fps.overlayVisible.clear();
+                if (!rtData.config.printFPS)
+                    fps.sendUpdates.clear();
+            }
+        }
+        if ((actions & VitaSystemChords::Settings) && rtData.config.enableSettings)
+            requestSettingsMenu();
+        if (actions & VitaSystemChords::Quit)
+        {
+            vita_glue_trace("vita-input: Start+Select held; requesting clean shutdown");
+            requestTerminate();
+            /* main owns the ack wait, teardown, log flush and launcher hand-over.
+             * Exit even if the SDL quit event could not be queued. */
+            terminate = true;
+        }
+    };
+#endif
     
 #ifdef MKXPZ_BUILD_XCODE
     SDL_GameControllerAddMappingsFromFile(mkxp_fs::getPathForAsset("gamecontrollerdb", "txt").c_str());
@@ -189,9 +376,81 @@ void EventThread::process(RGSSThreadData &rtData)
 #endif
     
     SDL_JoystickUpdate();
+    
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* Vita: SDL 2.32.8 VITA_JoystickGetGamepadMapping always
+     * returns SDL_FALSE, and gamecontrollerdb.txt has no platform:Vita
+     * entry matching SDL_CreateJoystickGUIDForName("PSVita Controller").
+     * Result: SDL_IsGameController(0)==false, controller never opens,
+     * EventThread only handles CONTROLLER* → Input.press? stays false.
+     * Register a runtime mapping from the live GUID, then open. */
+    {
+        char tb[256];
+        int nj = SDL_NumJoysticks();
+        snprintf(tb, sizeof(tb),
+                 "input: NumJoysticks=%d IsGC0=%d", nj,
+                 nj > 0 ? (int)SDL_IsGameController(0) : -1);
+        vita_glue_trace(tb);
+        if (nj > 0) {
+            const char *jname = SDL_JoystickNameForIndex(0);
+            SDL_JoystickGUID guid = SDL_JoystickGetDeviceGUID(0);
+            char guidStr[33];
+            SDL_JoystickGetGUIDString(guid, guidStr, sizeof(guidStr));
+            snprintf(tb, sizeof(tb), "input: joy0 name='%s' guid=%s",
+                     jname ? jname : "(null)", guidStr);
+            vita_glue_trace(tb);
+            
+            /* ext_button_map (SDL_sysjoystick.c):
+             *  0 Triangle, 1 Circle, 2 Cross, 3 Square, 4 L1, 5 R1,
+             *  6 Down, 7 Left, 8 Up, 9 Right, 10 Select, 11 Start.
+             * defaultCtrlBindings: A=C, B=B, X=A(dash), Y=X. */
+            char map[512];
+            snprintf(map, sizeof(map),
+                     "%s,%s,"
+                     "a:b2,b:b1,x:b3,y:b0,"
+                     "back:b10,start:b11,"
+                     "leftshoulder:b4,rightshoulder:b5,"
+                     "dpup:b8,dpdown:b6,dpleft:b7,dpright:b9,"
+                     "leftx:a0,lefty:a1,rightx:a2,righty:a3,"
+                     "lefttrigger:a4,righttrigger:a5,"
+                     "platform:Vita",
+                     guidStr, jname ? jname : "PSVita Controller");
+            int addRc = SDL_GameControllerAddMapping(map);
+            snprintf(tb, sizeof(tb),
+                     "input: AddMapping rc=%d err='%s' IsGC0=%d",
+                     addRc, SDL_GetError(),
+                     SDL_IsGameController(0));
+            vita_glue_trace(tb);
+        }
+    }
+#endif
+    
     if (SDL_NumJoysticks() > 0 && SDL_IsGameController(0)) {
             ctrl = SDL_GameControllerOpen(0);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+            {
+                char tb[160];
+                snprintf(tb, sizeof(tb),
+                         "input: GameControllerOpen ctrl=%p name=%s",
+                         (void *)ctrl,
+                         ctrl ? SDL_GameControllerName(ctrl) : "(null)");
+                vita_glue_trace(tb);
+            }
+#endif
     }
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    else if (SDL_NumJoysticks() > 0) {
+        /* Fallback: open as raw joystick so JOYBUTTON events are generated.
+         * Mapping should make the controller path succeed; this is belt. */
+        joy = SDL_JoystickOpen(0);
+        char tb[160];
+        snprintf(tb, sizeof(tb),
+                 "input: fallback JoystickOpen joy=%p buttons=%d",
+                 (void *)joy,
+                 joy ? SDL_JoystickNumButtons(joy) : -1);
+        vita_glue_trace(tb);
+    }
+#endif
     
     char buffer[128];
     
@@ -221,11 +480,152 @@ void EventThread::process(RGSSThreadData &rtData)
     
     while (true)
     {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        /* Nothing announces suspend on Vita (no SDL_APP_* from this backend,
+         * no APP_SUSPEND callback for a non-system title), so the existing
+         * foreground handler is driven after the fact. ON_RESUME was never
+         * observed on device, so a gap over 2 s between
+         * scheduled iterations triggers the same repair. The gap is measured
+         * on two clocks: the RTC (wall time, which advances through standby)
+         * and the kernel-wide system clock, whose standby behavior is
+         * unknown -- a loop that waits at most 50 ms can only open such a
+         * gap by freezing, and the line logs both values so one device sleep
+         * answers which clock moved. The poll stays first so the
+         * marker-gated event-id trace still runs; the filter runs here,
+         * synchronously inside SDL_PushEvent, repairing the ALC device and
+         * the threads; the rest is the Vita repair. */
+#if defined(__vita__)
+        Uint64 vitaRtcNow = (Uint64)vita_glue_rtc_time_ms();
+        Uint64 vitaNow = (Uint64)vita_glue_kernel_time_ms();
+#ifdef MKXPZ_VITAGL_BACKEND
+        Uint64 vitaWallNow = (Uint64)vita_glue_wall_time_ms();
+#endif
+#else
+        Uint64 vitaRtcNow = SDL_GetTicks64();
+        Uint64 vitaNow = SDL_GetTicks64();
+#ifdef MKXPZ_VITAGL_BACKEND
+        Uint64 vitaWallNow = SDL_GetTicks64();
+#endif
+#endif
+        int vitaResume = vita_glue_poll_resume();
+        bool vitaNotified = false;
+        Uint64 vitaRtcGap = vitaRtcNow > vitaRtcBefore ?
+                            vitaRtcNow - vitaRtcBefore : 0;
+        Uint64 vitaGap = vitaNow > vitaTicksBefore ?
+                         vitaNow - vitaTicksBefore : 0;
+#ifdef MKXPZ_VITAGL_BACKEND
+        Uint64 vitaWallGap = beatDelta(vitaWallNow, vitaWallBefore);
+#endif
+        if ((vitaRtcBefore && vitaRtcGap > 2000) ||
+            (vitaTicksBefore && vitaGap > 2000)
+#ifdef MKXPZ_VITAGL_BACKEND
+            || (vitaWallBefore && vitaWallGap > 2000)
+#endif
+            )
+        {
+            /* First, so the lines below reach a live descriptor: files held
+             * open across the standby may be stale. */
+            vita_glue_resume_notify();
+            vitaNotified = true;
+            /* Zero before-sample: no scheduled iteration has run yet. */
+            char gb[96];
+            snprintf(gb, sizeof(gb),
+                     "vita-lifecycle: gap rtc_ms=%llu kernel_ms=%llu",
+                     (unsigned long long)vitaRtcGap,
+                     (unsigned long long)vitaGap);
+            vita_glue_trace(gb);
+#ifdef MKXPZ_VITAGL_BACKEND
+            snprintf(gb, sizeof(gb), "vita-lifecycle: gap wall_ms=%llu",
+                     (unsigned long long)vitaWallGap);
+            vita_glue_trace(gb);
+#endif
+            vitaResume = 1;
+        }
+        if (vitaResume)
+        {
+            if (!vitaNotified)
+                vita_glue_resume_notify();
+            Uint64 vitaTicksAfter = SDL_GetTicks64();
+            SDL_OnApplicationWillEnterForeground();
+            SDL_OnApplicationDidBecomeActive();
+            /* Buttons physically released during the sleep must not stay
+             * latched, and the limiter must not sprint off the frozen gap. */
+            resetInputStates();
+            /* A flag, not a call into Graphics: SharedState can be
+             * mid-destruction after the scripts end. */
+            rtData.rqFrameReset.set();
+            char tb[128];
+            snprintf(tb, sizeof(tb),
+                     "vita-lifecycle: resume (ticks_before=%llu ticks_after=%llu)",
+                     (unsigned long long)vitaTicksBefore,
+                     (unsigned long long)vitaTicksAfter);
+            vita_glue_trace(tb);
+        }
+#ifdef MKXPZ_VITAGL_BACKEND
+        ++beatIters;
+        if (vita_glue_lifecycle_trace_enabled() &&
+            beatDelta(SDL_GetTicks64(), beatProc) >= 5000)
+        {
+            /* Deltas since the previous beat: the one after a wake shows
+             * which clocks crossed the sleep and that the loop iterated. */
+            char bb[192];
+            snprintf(bb, sizeof(bb),
+                     "vita-lifecycle: beat iters=%u proc_ms=%llu rtc_ms=%llu "
+                     "wall_ms=%llu kernel_ms=%llu rtc=%llu wall=%llu",
+                     beatIters, beatDelta(SDL_GetTicks64(), beatProc),
+                     beatDelta(vitaRtcNow, beatRtc),
+                     beatDelta(vitaWallNow, beatWall),
+                     beatDelta(vitaNow, beatKernel),
+                     (unsigned long long)vitaRtcNow,
+                     (unsigned long long)vitaWallNow);
+            vita_glue_trace(bb);
+            beatIters = 0;
+            beatProc = SDL_GetTicks64();
+            beatRtc = vitaRtcNow;
+            beatWall = vitaWallNow;
+            beatKernel = vitaNow;
+        }
+#endif
+#if defined(__vita__)
+        vitaRtcBefore = (Uint64)vita_glue_rtc_time_ms();
+        vitaTicksBefore = (Uint64)vita_glue_kernel_time_ms();
+#ifdef MKXPZ_VITAGL_BACKEND
+        vitaWallBefore = (Uint64)vita_glue_wall_time_ms();
+#endif
+#else
+        vitaRtcBefore = vitaTicksBefore = SDL_GetTicks64();
+#ifdef MKXPZ_VITAGL_BACKEND
+        vitaWallBefore = vitaRtcBefore;
+#endif
+#endif
+        if (SDL_AtomicGet(&terminateRequested))
+            break;
+        VitaSettingsInput snapshot;
+        memcpy(snapshot.keys, keyStates, sizeof(snapshot.keys));
+        copyRawControllerButtons(snapshot.buttons);
+        memcpy(snapshot.axes, controllerState.axes, sizeof(snapshot.axes));
+        settingsMenu.publish(snapshot);
+        handleSystemActions(systemChords.sampleChord(SDL_GetTicks64()));
+        if (terminate)
+            break;
+        /* A quiet queue must not strand the hold when RGSS has stopped. */
+        SDL_ClearError();
+        if (!SDL_WaitEventTimeout(&event, 50))
+        {
+            if (*SDL_GetError())
+            {
+                Debug() << "EventThread: Event error";
+                break;
+            }
+            continue;
+        }
+#else
         if (!SDL_WaitEvent(&event))
         {
             Debug() << "EventThread: Event error";
             break;
         }
+#endif
 #ifndef MKXPZ_BUILD_XCODE
         if (sMenu && sMenu->onEvent(event))
         {
@@ -248,7 +648,16 @@ void EventThread::process(RGSSThreadData &rtData)
             case SDL_MOUSEBUTTONUP :
             case SDL_MOUSEMOTION :
                 if (event.button.which == SDL_TOUCH_MOUSEID)
+                {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                    if (rtData.config.vitaTouchMouse)
+                        touchMouse.handle(event, gameScreen);
+#endif
                     continue;
+                }
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                touchMouse.active = false;
+#endif
                 break;
                 
             case SDL_FINGERDOWN :
@@ -258,6 +667,63 @@ void EventThread::process(RGSSThreadData &rtData)
                     continue;
                 break;
         }
+        
+#if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) && VITA_GLUE_FRAME_TRACE
+        {
+            static int evLogCount = 0;
+            bool interesting =
+                event.type == SDL_CONTROLLERBUTTONDOWN ||
+                event.type == SDL_CONTROLLERBUTTONUP ||
+                event.type == SDL_CONTROLLERAXISMOTION ||
+                event.type == SDL_CONTROLLERDEVICEADDED ||
+                event.type == SDL_CONTROLLERDEVICEREMOVED ||
+                event.type == SDL_JOYBUTTONDOWN ||
+                event.type == SDL_JOYBUTTONUP ||
+                event.type == SDL_JOYAXISMOTION ||
+                event.type == SDL_JOYDEVICEADDED ||
+                event.type == SDL_JOYDEVICEREMOVED ||
+                event.type == SDL_KEYDOWN ||
+                event.type == SDL_KEYUP;
+            if (interesting || evLogCount < 32) {
+                char tb[192];
+                if (event.type == SDL_CONTROLLERBUTTONDOWN ||
+                    event.type == SDL_CONTROLLERBUTTONUP)
+                    snprintf(tb, sizeof(tb),
+                             "input: EV type=%u cbutton=%d which=%d state=%d",
+                             event.type, event.cbutton.button,
+                             event.cbutton.which, event.cbutton.state);
+                else if (event.type == SDL_JOYBUTTONDOWN ||
+                         event.type == SDL_JOYBUTTONUP)
+                    snprintf(tb, sizeof(tb),
+                             "input: EV type=%u jbutton=%d which=%d state=%d",
+                             event.type, event.jbutton.button,
+                             event.jbutton.which, event.jbutton.state);
+                else if (event.type == SDL_CONTROLLERAXISMOTION)
+                    snprintf(tb, sizeof(tb),
+                             "input: EV caxis=%d val=%d",
+                             event.caxis.axis, event.caxis.value);
+                else if (event.type == SDL_JOYAXISMOTION)
+                    snprintf(tb, sizeof(tb),
+                             "input: EV jaxis=%d val=%d",
+                             event.jaxis.axis, event.jaxis.value);
+                else if (event.type == SDL_CONTROLLERDEVICEADDED ||
+                         event.type == SDL_CONTROLLERDEVICEREMOVED)
+                    snprintf(tb, sizeof(tb),
+                             "input: EV cdevice type=%u which=%d",
+                             event.type, event.cdevice.which);
+                else if (event.type == SDL_JOYDEVICEADDED ||
+                         event.type == SDL_JOYDEVICEREMOVED)
+                    snprintf(tb, sizeof(tb),
+                             "input: EV jdevice type=%u which=%d",
+                             event.type, event.jdevice.which);
+                else
+                    snprintf(tb, sizeof(tb),
+                             "input: EV type=%u", event.type);
+                vita_glue_trace(tb);
+                evLogCount++;
+            }
+        }
+#endif
         
         /* Now process the rest */
         switch (event.type)
@@ -275,6 +741,9 @@ void EventThread::process(RGSSThreadData &rtData)
                         windowSizeMsg.post(Vec2i(winW, winH));
                         drawableSizeMsg.post(Vec2i(drwW, drwH));
                         resetInputStates();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                        systemChords = VitaSystemChords();
+#endif
                         break;
                         
                     case SDL_WINDOWEVENT_ENTER :
@@ -306,6 +775,9 @@ void EventThread::process(RGSSThreadData &rtData)
                         windowFocused = false;
                         updateCursorState(cursorInWindow && windowFocused && !sMenu, gameScreen);
                         resetInputStates();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                        systemChords = VitaSystemChords();
+#endif
                         
                         break;
                 }
@@ -349,7 +821,9 @@ void EventThread::process(RGSSThreadData &rtData)
                         break;
                     }
 
-#ifndef MKXPZ_BUILD_XCODE
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                    settingsMenu.request(false);
+#elif !defined(MKXPZ_BUILD_XCODE)
                     if (!sMenu)
                     {
                         sMenu = new SettingsMenu(rtData);
@@ -364,6 +838,9 @@ void EventThread::process(RGSSThreadData &rtData)
                 
                 if (event.key.keysym.scancode == SDL_SCANCODE_F2)
                 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                    handleSystemActions(VitaSystemChords::ToggleFPS);
+#else
                     if (!displayingFPS)
                     {
                         
@@ -389,6 +866,7 @@ void EventThread::process(RGSSThreadData &rtData)
                         
                         SDL_SetWindowTitle(win, rtData.config.windowTitle.c_str());
                     }
+#endif
                     
                     break;
                 }
@@ -425,11 +903,18 @@ void EventThread::process(RGSSThreadData &rtData)
                 break;
                 
             case SDL_CONTROLLERBUTTONDOWN:
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+            case SDL_CONTROLLERBUTTONUP:
+                if (ctrl && event.cbutton.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(ctrl)))
+                    handleSystemActions(vitaControllerButton(systemChords, event.cbutton.button,
+                                        event.type == SDL_CONTROLLERBUTTONDOWN, SDL_GetTicks64()));
+#else
                 controllerState.buttons[event.cbutton.button] = true;
                 break;
                 
             case SDL_CONTROLLERBUTTONUP:
                 controllerState.buttons[event.cbutton.button] = false;
+#endif
                 break;
                 
             case SDL_CONTROLLERAXISMOTION:
@@ -441,12 +926,82 @@ void EventThread::process(RGSSThreadData &rtData)
                     break;
                 
                 ctrl = SDL_GameControllerOpen(0);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                {
+                    char tb[128];
+                    snprintf(tb, sizeof(tb),
+                             "input: CONTROLLERDEVICEADDED open=%p", (void *)ctrl);
+                    vita_glue_trace(tb);
+                }
+#endif
                 break;
                 
             case SDL_CONTROLLERDEVICEREMOVED:
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                if (!ctrl || event.cdevice.which != SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(ctrl)))
+                    break;
+                systemChords = VitaSystemChords();
+#endif
                 resetInputStates();
                 ctrl = 0;
                 break;
+                
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+            /* Raw-joystick fallback: translate Vita pad indices into the
+             * controllerState slots defaultCtrlBindings poll. See
+             * ext_button_map in SDL 2.32.8 SDL_sysjoystick.c. */
+            case SDL_JOYBUTTONDOWN:
+            case SDL_JOYBUTTONUP:
+            {
+                /* SDL emits raw and mapped events for the same pad. */
+                if (ctrl || !joy || event.jbutton.which != SDL_JoystickInstanceID(joy))
+                    break;
+                static const int joyToCtrl[] = {
+                    SDL_CONTROLLER_BUTTON_Y,              /* 0 Triangle */
+                    SDL_CONTROLLER_BUTTON_B,              /* 1 Circle   */
+                    SDL_CONTROLLER_BUTTON_A,              /* 2 Cross    */
+                    SDL_CONTROLLER_BUTTON_X,              /* 3 Square   */
+                    SDL_CONTROLLER_BUTTON_LEFTSHOULDER,   /* 4 L1       */
+                    SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,  /* 5 R1       */
+                    SDL_CONTROLLER_BUTTON_DPAD_DOWN,      /* 6          */
+                    SDL_CONTROLLER_BUTTON_DPAD_LEFT,      /* 7          */
+                    SDL_CONTROLLER_BUTTON_DPAD_UP,        /* 8          */
+                    SDL_CONTROLLER_BUTTON_DPAD_RIGHT,     /* 9          */
+                    SDL_CONTROLLER_BUTTON_BACK,           /* 10 Select  */
+                    SDL_CONTROLLER_BUTTON_START           /* 11 Start   */
+                };
+                int jb = event.jbutton.button;
+                if (jb >= 0 && jb < (int)(sizeof(joyToCtrl)/sizeof(joyToCtrl[0]))) {
+                    handleSystemActions(vitaControllerButton(systemChords, joyToCtrl[jb],
+                                        event.type == SDL_JOYBUTTONDOWN, SDL_GetTicks64()));
+                }
+                break;
+            }
+                
+            case SDL_JOYAXISMOTION:
+                if (ctrl || !joy || event.jaxis.which != SDL_JoystickInstanceID(joy))
+                    break;
+                /* Vita axes: 0=LX 1=LY 2=RX 3=RY 4=LT 5=RT */
+                if (event.jaxis.axis == 0)
+                    controllerState.axes[SDL_CONTROLLER_AXIS_LEFTX] = event.jaxis.value;
+                else if (event.jaxis.axis == 1)
+                    controllerState.axes[SDL_CONTROLLER_AXIS_LEFTY] = event.jaxis.value;
+                else if (event.jaxis.axis == 2)
+                    controllerState.axes[SDL_CONTROLLER_AXIS_RIGHTX] = event.jaxis.value;
+                else if (event.jaxis.axis == 3)
+                    controllerState.axes[SDL_CONTROLLER_AXIS_RIGHTY] = event.jaxis.value;
+                break;
+
+            case SDL_JOYDEVICEREMOVED:
+                if (joy && event.jdevice.which == SDL_JoystickInstanceID(joy))
+                {
+                    systemChords = VitaSystemChords();
+                    resetInputStates();
+                    SDL_JoystickClose(joy);
+                    joy = 0;
+                }
+                break;
+#endif
                 
             case SDL_MOUSEBUTTONDOWN :
                 mouseState.buttons[event.button.button] = true;
@@ -466,19 +1021,28 @@ void EventThread::process(RGSSThreadData &rtData)
             case SDL_MOUSEWHEEL :
                 /* Only consider vertical scrolling for now */
                 SDL_AtomicAdd(&verticalScrollDistance, event.wheel.y);
+                break;
                 
             case SDL_FINGERDOWN :
-                i = event.tfinger.fingerId;
+                i = fingerIndex(event);
+                if (i < 0)
+                    break;
+                /* A new touch reports its position too */
                 touchState.fingers[i].down = true;
+                /* fall through */
                 
             case SDL_FINGERMOTION :
-                i = event.tfinger.fingerId;
+                i = fingerIndex(event);
+                if (i < 0)
+                    break;
                 touchState.fingers[i].x = event.tfinger.x * winW;
                 touchState.fingers[i].y = event.tfinger.y * winH;
                 break;
                 
             case SDL_FINGERUP :
-                i = event.tfinger.fingerId;
+                i = fingerIndex(event);
+                if (i < 0)
+                    break;
                 memset(&touchState.fingers[i], 0, sizeof(touchState.fingers[0]));
                 break;
                 
@@ -559,7 +1123,9 @@ void EventThread::process(RGSSThreadData &rtData)
                         break;
                         
                     case REQUEST_SETTINGS :
-#ifndef MKXPZ_BUILD_XCODE
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                        requestSettingsMenu();
+#elif !defined(MKXPZ_BUILD_XCODE)
                         if (!sMenu)
                         {
                             sMenu = new SettingsMenu(rtData);
@@ -600,6 +1166,9 @@ void EventThread::process(RGSSThreadData &rtData)
                         gameScreen.y = event.user.code;
                         gameScreen.w = reinterpret_cast<intptr_t>(event.user.data1);
                         gameScreen.h = reinterpret_cast<intptr_t>(event.user.data2);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                        touchMouse.update(gameScreen);
+#endif
                         updateCursorState(cursorInWindow, gameScreen);
                         
                         break;
@@ -615,6 +1184,13 @@ void EventThread::process(RGSSThreadData &rtData)
     
     if (SDL_GameControllerGetAttached(ctrl))
         SDL_GameControllerClose(ctrl);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    if (joy)
+    {
+        SDL_JoystickClose(joy);
+        joy = 0;
+    }
+#endif
     
 #ifndef MKXPZ_BUILD_XCODE
     delete sMenu;
@@ -688,6 +1264,9 @@ void EventThread::resetInputStates()
 {
     memset(&keyStates, 0, sizeof(keyStates));
     memset(&controllerState, 0, sizeof(controllerState));
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    SDL_AtomicSet(&rawSystemButtons, 0);
+#endif
     memset(&mouseState.buttons, 0, sizeof(mouseState.buttons));
     memset(&touchState, 0, sizeof(touchState));
 }
@@ -713,6 +1292,10 @@ void EventThread::updateCursorState(bool inWindow,
 
 void EventThread::requestTerminate()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* The bounded wait observes this even if SDL drops the wakeup. */
+    SDL_AtomicSet(&terminateRequested, 1);
+#endif
     SDL_Event event;
     event.type = SDL_QUIT;
     SDL_PushEvent(&event);
@@ -783,9 +1366,13 @@ void EventThread::requestTextInputMode(bool mode)
 
 void EventThread::requestSettingsMenu()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    settingsMenu.request();
+#else
     SDL_Event event;
     event.type = usrIdStart + REQUEST_SETTINGS;
     SDL_PushEvent(&event);
+#endif
 }
 
 void EventThread::showMessageBox(const char *body, int flags)
@@ -799,7 +1386,7 @@ void EventThread::showMessageBox(const char *body, int flags)
     
     SDL_Event event;
     event.user.code = flags;
-    event.user.data1 = strdup(body);
+    event.user.data1 = SDL_strdup(body);
     event.type = usrIdStart + REQUEST_MESSAGEBOX;
     SDL_PushEvent(&event);
     
@@ -831,18 +1418,69 @@ SDL_GameController *EventThread::controller() const
     return ctrl;
 }
 
+void EventThread::copyRawControllerButtons(uint8_t *buttons)
+{
+    memcpy(buttons, controllerState.buttons, SDL_CONTROLLER_BUTTON_MAX);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    const int systemButtons = SDL_AtomicGet(&rawSystemButtons);
+    buttons[SDL_CONTROLLER_BUTTON_START] = (systemButtons & (1 << SDL_CONTROLLER_BUTTON_START)) != 0;
+    buttons[SDL_CONTROLLER_BUTTON_BACK] = (systemButtons & (1 << SDL_CONTROLLER_BUTTON_BACK)) != 0;
+#endif
+}
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+void EventThread::updateFPSOverlay()
+{
+    Graphics &graphics = shState->graphics();
+    const bool visible = fps.overlayVisible;
+    graphics.overlaySetVisible(visible);
+    if (!visible)
+        return;
+
+    const Uint64 now = SDL_GetTicks64();
+    if (fps.overlaySampled && now - fps.overlayUpdatedAt < 250)
+        return;
+    fps.overlaySampled = true;
+    fps.overlayUpdatedAt = now;
+
+    const double rate = graphics.averageFrameRate();
+    char line[64];
+    if (std::isfinite(rate) && rate > 0 && std::isfinite(1000.0 / rate))
+        snprintf(line, sizeof(line), "FPS %.0f  frame %.1f ms", rate, 1000.0 / rate);
+    else
+        snprintf(line, sizeof(line), "FPS 0  frame -- ms");
+    /* Line 0 belongs to FPS; profile lines can be appended independently. */
+    const char *lines[] = {line};
+    graphics.overlaySetLines(lines, 1);
+}
+#endif
+
 void EventThread::notifyFrame()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    updateFPSOverlay();
+#endif
 #ifdef MKXPZ_BUILD_XCODE
     uint32_t frames = round(shState->graphics().averageFrameRate());
     updateTouchBarFPSDisplay(frames);
 #endif
     if (!fps.sendUpdates)
         return;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    const Uint64 now = SDL_GetTicks64();
+    if (fps.eventSent && now - fps.eventSentAt < 250)
+        return;
+    fps.eventSent = true;
+    fps.eventSentAt = now;
+#endif
     
     SDL_Event event;
 #ifdef MKXPZ_BUILD_XCODE
     event.user.code = frames;
+#elif defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    const double frames = std::round(shState->graphics().averageFrameRate());
+    event.user.code = std::isfinite(frames) && frames > 0 && frames <= SDL_MAX_SINT32
+                         ? static_cast<Sint32>(frames) : 0;
 #else
     event.user.code = round(shState->graphics().averageFrameRate());
 #endif

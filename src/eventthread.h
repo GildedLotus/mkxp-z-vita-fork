@@ -27,6 +27,7 @@
 #include <SDL_mutex.h>
 #include <SDL_atomic.h>
 #include <SDL_gamecontroller.h>
+#include <SDL_joystick.h>
 
 #include <string>
 
@@ -36,6 +37,9 @@
 #include "etc-internal.h"
 #include "sdl-util.h"
 #include "keybindings.h"
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "settings_input.h"
+#endif
 
 struct RGSSThreadData;
 typedef struct MKXPZ_ALCDEVICE ALCdevice;
@@ -73,6 +77,10 @@ public:
 
 	static uint8_t keyStates[SDL_NUM_SCANCODES];
     static ControllerState controllerState;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    static SDL_atomic_t rawSystemButtons;
+#endif
+    static void copyRawControllerButtons(uint8_t *buttons);
 	static MouseState mouseState;
 	static TouchState touchState;
     static SDL_atomic_t verticalScrollDistance;
@@ -100,8 +108,14 @@ public:
     void requestTextInputMode(bool mode);
     
     void requestSettingsMenu();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    VitaSettingsHandoff settingsMenu;
+#endif
 
 	void requestTerminate();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    SDL_atomic_t terminateRequested = {0};
+#endif
 
 	bool getFullscreen() const;
 	bool getShowCursor() const;
@@ -113,6 +127,10 @@ public:
 
 	/* RGSS thread calls this once per frame */
 	void notifyFrame();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* Render thread only; prepare the reserved HUD for the next presentation. */
+    void updateFPSOverlay();
+#endif
 
 	/* Called on game screen (size / offset) changes */
 	void notifyGameScreenChange(const SDL_Rect &screen);
@@ -130,6 +148,9 @@ private:
 	bool showCursor;
     
     SDL_GameController *ctrl;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    SDL_Joystick *joy;
+#endif
     
 	AtomicFlag msgBoxDone;
     
@@ -138,6 +159,11 @@ private:
 	struct
 	{
 		AtomicFlag sendUpdates;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        AtomicFlag overlayVisible;
+        Uint64 overlayUpdatedAt = 0, eventSentAt = 0;
+        bool overlaySampled = false, eventSent = false;
+#endif
 	} fps;
 };
 
@@ -246,6 +272,11 @@ struct RGSSThreadData
     
     // Set when window is being adjusted (resize, reposition)
     AtomicFlag rqWindowAdjust;
+
+	/* Set by the event thread after a resume or clock gap; the RGSS thread's
+	 * frame limiter clears its debt at the next frame. This outlives
+	 * SharedState, which the RGSS thread may be destroying meanwhile. */
+	AtomicFlag rqFrameReset;
 
 	EventThread *ethread;
 	UnidirMessage<Vec2i> windowSizeMsg;

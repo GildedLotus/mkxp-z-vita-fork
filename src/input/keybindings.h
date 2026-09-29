@@ -90,7 +90,72 @@ struct SourceDesc
 	}
 };
 
-#define JAXIS_THRESHOLD 0x4000
+/* Analog-stick gate, in SDL's int16 axis units.
+ *
+ * JAXIS_THRESHOLD_DEFAULT is stock mkxp-z's constant: half of the int16 axis
+ * range. On the Vita that is NOT half of the stick's physical travel. SDL
+ * 2.32.8's Vita joystick driver maps the pad's 0..255 byte to int16 through a
+ * cubic Bezier whose first two control points are both (0,0)
+ * (build/sdl2-src/src/joystick/vita/SDL_sysjoystick.c:79-124), so the low
+ * half of the curve eases in and runs well under the straight line the
+ * comment there claims ("use a linear curve"). Recomputed from that source,
+ * the first raw byte whose mapped value clears 0x4000 is 192, i.e.
+ * (192-128)/127 = 50.4 percent of travel -- which leaves both axes above the
+ * gate only inside a ~30 degree window, so a diagonal on the left stick is
+ * nearly unreachable and 8-way movement does not work.
+ *
+ * Config::controllerDeadzone (src/config.cpp, Vita only) names that fraction
+ * and is resolved exactly once, at config-read time, into the value
+ * jAxisThreshold() returns. BOTH places that gate on an axis read it through
+ * the JAXIS_THRESHOLD spelling below -- CtrlAxisBinding::sourceActive() in
+ * src/input/input.cpp (which caches it per binding, see there) and the
+ * binding capture in src/settingsmenu.cpp -- so a binding captured in the
+ * settings menu is captured at exactly the threshold the runtime applies.
+ *
+ * Off-device nothing calls setJAxisThreshold() and the value stays
+ * JAXIS_THRESHOLD_DEFAULT: stock behaviour, bit for bit.
+ */
+#define JAXIS_THRESHOLD_DEFAULT 0x4000
+
+/* Range Config::read clamps controllerDeadzone to. 0 would leave every axis
+ * permanently active; 1.0 is unreachable, because the Bezier only returns
+ * SDL_JOYSTICK_AXIS_MAX at full deflection and the test is strict. */
+#define JAXIS_DEADZONE_MIN 0.05
+#define JAXIS_DEADZONE_MAX 0.95
+
+/* The one resolved threshold for the process. Constant-initialised, so it
+ * costs no guard variable and already reads correctly before Config::read
+ * runs (the RGSS thread builds its bindings after that, but the settings
+ * menu does not have to care about the order). */
+inline int16_t &jAxisThresholdRef()
+{
+	static int16_t resolved = JAXIS_THRESHOLD_DEFAULT;
+	return resolved;
+}
+
+inline int16_t jAxisThreshold()
+{
+	return jAxisThresholdRef();
+}
+
+inline void setJAxisThreshold(double deadzone)
+{
+	/* Config::read clamps before calling; clamp again so no other caller can
+	 * park the gate outside the usable band. Multiply only -- resolving this
+	 * must never need a divide (Cortex-A9 has no hardware integer divide),
+	 * and it runs once either way. */
+	if (deadzone < JAXIS_DEADZONE_MIN)
+		deadzone = JAXIS_DEADZONE_MIN;
+	if (deadzone > JAXIS_DEADZONE_MAX)
+		deadzone = JAXIS_DEADZONE_MAX;
+
+	jAxisThresholdRef() =
+		(int16_t)(deadzone * (double)SDL_JOYSTICK_AXIS_MAX + 0.5);
+}
+
+/* Every existing comparison keeps this spelling and now reads the resolved
+ * value. Deadzone 0.5 resolves to exactly JAXIS_THRESHOLD_DEFAULT. */
+#define JAXIS_THRESHOLD (jAxisThreshold())
 
 struct BindingDesc
 {

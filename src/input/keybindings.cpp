@@ -23,6 +23,7 @@
 
 #include "config.h"
 #include "util.h"
+#include "vita_publish.h"
 
 #include <stdio.h>
 
@@ -108,8 +109,10 @@ static const CtrlBindingData defaultCtrlBindings[] =
 	{ SDL_CONTROLLER_BUTTON_B, Input::B  },
 	{ SDL_CONTROLLER_BUTTON_A, Input::C },
 	{ SDL_CONTROLLER_BUTTON_Y, Input::X  },
+#if !(defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC))
 	{ SDL_CONTROLLER_BUTTON_LEFTSTICK, Input::Y  },
 	{ SDL_CONTROLLER_BUTTON_RIGHTSTICK, Input::Z },
+#endif
 	{ SDL_CONTROLLER_BUTTON_LEFTSHOULDER, Input::L  },
 	{ SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, Input::R  },
     
@@ -157,157 +160,184 @@ BDescVec genDefaultBindings(const Config &conf)
 	addAxisBinding(d, SDL_CONTROLLER_AXIS_LEFTY, Negative, Input::Up   );
 	addAxisBinding(d, SDL_CONTROLLER_AXIS_LEFTY, Positive, Input::Down );
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* The handheld has no stick clicks. Keep movement and system buttons free. */
+	addAxisBinding(d, SDL_CONTROLLER_AXIS_RIGHTX, Negative, Input::Y);
+	addAxisBinding(d, SDL_CONTROLLER_AXIS_RIGHTX, Positive, Input::Z);
+#endif
+
 	return d;
 }
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include <unistd.h>
+#include <stdexcept>
+#include <string.h>
+#endif
+
+#include <errno.h>
 
 #define FORMAT_VER 3
 
 struct Header
 {
-	uint32_t formVer;
-	uint32_t rgssVer;
-	uint32_t count;
+    uint32_t formVer;
+    uint32_t rgssVer;
+    uint32_t count;
 };
 
 static void buildPath(const std::string &dir, uint32_t rgssVersion,
                       char *out, size_t outSize)
 {
-	snprintf(out, outSize, "%skeybindings.mkxp%u", dir.c_str(), rgssVersion);
+    snprintf(out, outSize, "%skeybindings.mkxp%u", dir.c_str(), rgssVersion);
 }
 
-static bool writeBindings(const BDescVec &d, const std::string &dir,
-                          uint32_t rgssVersion)
+static bool verifyDesc(const BindingDesc &desc)
 {
-	if (dir.empty())
-		return false;
+    const Input::ButtonCode codes[] = {
+        Input::None, Input::Down, Input::Left, Input::Right, Input::Up,
+        Input::A, Input::B, Input::C, Input::X, Input::Y, Input::Z,
+        Input::L, Input::R, Input::Shift, Input::Ctrl, Input::Alt,
+        Input::F5, Input::F6, Input::F7, Input::F8, Input::F9
+    };
+    bool target = false;
+    for (auto code : codes) if (desc.target == code) target = true;
+    if (!target) return false;
+    const SourceDesc &src = desc.src;
+    switch (src.type) {
+    case Invalid: return true;
+    case Key: return src.d.scan >= 0 && src.d.scan < SDL_NUM_SCANCODES;
+    case CButton: return src.d.cb >= 0 && src.d.cb < SDL_CONTROLLER_BUTTON_MAX;
+    case CAxis:
+        return src.d.ca.axis >= 0 && src.d.ca.axis < SDL_CONTROLLER_AXIS_MAX &&
+               (src.d.ca.dir == Negative || src.d.ca.dir == Positive);
+    default: return false;
+    }
+}
 
-	char path[1024];
-	buildPath(dir, rgssVersion, path, sizeof(path));
+static bool readBindingFile(BDescVec &out, const std::string &path, uint32_t version,
+                            bool *ioFailure = nullptr)
+{
+    if (ioFailure) *ioFailure = false;
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) {
+        if (ioFailure) *ioFailure = errno != ENOENT;
+        return false;
+    }
+    Header hd{};
+    bool ok = fread(&hd, sizeof(hd), 1, f) == 1 &&
+              hd.rgssVer == version && hd.count <= 1024;
+    if (hd.formVer != FORMAT_VER) ok = false;
+    BDescVec candidate;
+    try {
+        if (ok) {
+            candidate.resize(hd.count);
+            ok = !hd.count || fread(candidate.data(), sizeof(BindingDesc), hd.count, f) == hd.count;
+            for (const auto &d : candidate) if (!verifyDesc(d)) ok = false;
+            if (fgetc(f) != EOF || ferror(f)) ok = false;
+        }
+    } catch (...) { fclose(f); throw; }
+    bool ioError = ferror(f) != 0;
+    if (fclose(f) != 0) ioError = true;
+    if (ioFailure) *ioFailure = ioError;
+    if (ioError) ok = false;
+    if (ok) out.swap(candidate);
+    return ok;
+}
 
-	FILE *f = fopen(path, "wb");
+static bool bindingFileMatches(const BDescVec &expected, const std::string &path, uint32_t version)
+{
+    BDescVec actual;
+    if (!readBindingFile(actual, path, version) || actual.size() != expected.size()) return false;
+    for (size_t i = 0; i < expected.size(); ++i)
+        if (actual[i].target != expected[i].target || actual[i].src != expected[i].src) return false;
+    return true;
+}
 
-	if (!f)
-		return false;
-
-	Header hd;
-	hd.formVer = FORMAT_VER;
-	hd.rgssVer = rgssVersion;
-	hd.count = d.size();
-
-	if (fwrite(&hd, sizeof(hd), 1, f) < 1)
-	{
-		fclose(f);
-		return false;
-	}
-
-	if (fwrite(&d[0], sizeof(d[0]), hd.count, f) < hd.count)
-	{
-		fclose(f);
-		return false;
-	}
-
-	fclose(f);
-	return true;
+static bool writeBindings(const BDescVec &d, const std::string &dir, uint32_t rgssVersion)
+{
+    if (dir.empty() || dir.size() > 960 || d.size() > 1024) return false;
+    for (const auto &desc : d) {
+        if (!verifyDesc(desc)) return false;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        if (desc.src.type == CButton && (desc.src.d.cb == SDL_CONTROLLER_BUTTON_START ||
+                                        desc.src.d.cb == SDL_CONTROLLER_BUTTON_BACK)) return false;
+#endif
+    }
+    char path[1024];
+    buildPath(dir, rgssVersion, path, sizeof(path));
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    char temp[sizeof(path) + 8], backup[sizeof(path) + 8], corrupt[sizeof(path) + 9];
+    if (vita_publish_tmp_path(temp, sizeof(temp), path) != 0 ||
+        vita_publish_bak_path(backup, sizeof(backup), path) != 0)
+        return false;
+    FILE *f = fopen(temp, "wb");
+#else
+    FILE *f = fopen(path, "wb");
+#endif
+    if (!f) return false;
+    Header hd{FORMAT_VER, rgssVersion, static_cast<uint32_t>(d.size())};
+    bool ok = fwrite(&hd, sizeof(hd), 1, f) == 1;
+    if (ok && hd.count) ok = fwrite(d.data(), sizeof(BindingDesc), hd.count, f) == hd.count;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    // fflush + fsync + fclose, each checked; the stream is closed either way.
+    if (vita_publish_finalize(f) != 0) ok = false;
+    if (!ok || !bindingFileMatches(d, temp, rgssVersion)) return false;
+    BDescVec old;
+    bool readError = false;
+    bool validOld = readBindingFile(old, path, rgssVersion, &readError);
+    if (readError) return false;
+    if (validOld) {
+        // Publication policy lives in vita_publish: the
+        // valid previous generation moves aside to .bak before .tmp publishes.
+        if (vita_publish_commit(temp, path, backup) != 0) return false;
+        return bindingFileMatches(d, path, rgssVersion);
+    }
+    // Do not rotate an invalid current file over a recoverable backup.
+    FILE *bad = fopen(path, "rb");
+    if (bad) {
+        if (fclose(bad) != 0 ||
+            snprintf(corrupt, sizeof(corrupt), "%s.corrupt", path) >= (int)sizeof(corrupt))
+            return false;
+        if (rename(path, corrupt) != 0)
+            return false;
+    } else if (errno != ENOENT) return false;
+    if (rename(temp, path) != 0) return false;
+    return bindingFileMatches(d, path, rgssVersion);
+#else
+    if (fflush(f) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
+    return ok;
+#endif
 }
 
 void storeBindings(const BDescVec &d, const Config &conf)
 {
-    writeBindings(d, conf.customDataPath, conf.rgssVersion);
+    if (writeBindings(d, conf.customDataPath, conf.rgssVersion)) return;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    // No path is an explicitly disabled store (e.g. a diagnostic customScript).
+    if (!conf.customDataPath.empty()) throw std::runtime_error("Cannot persist controller bindings");
+#endif
+    fprintf(stderr, "Cannot persist controller bindings: no writable binding file\n");
 }
 
-#define READ(ptr, size, n, f) if (fread(ptr, size, n, f) < n) return false
-
-static bool verifyDesc(const BindingDesc &desc)
+static bool readBindings(BDescVec &out, const std::string &dir, uint32_t rgssVersion)
 {
-	const Input::ButtonCode codes[] =
-	{
-	    Input::None,
-	    Input::Down, Input::Left, Input::Right, Input::Up,
-	    Input::A, Input::B, Input::C,
-	    Input::X, Input::Y, Input::Z,
-	    Input::L, Input::R,
-	    Input::Shift, Input::Ctrl, Input::Alt,
-	    Input::F5, Input::F6, Input::F7, Input::F8, Input::F9
-	};
-
-	elementsN(codes);
-	size_t i;
-
-	for (i = 0; i < codesN; ++i)
-		if (desc.target == codes[i])
-			break;
-
-	if (i == codesN)
-		return false;
-
-	const SourceDesc &src = desc.src;
-
-	switch (src.type)
-	{
-	case Invalid:
-		return true;
-	case Key:
-		return src.d.scan < SDL_NUM_SCANCODES;
-            
-    case CButton:
-        return true;
-
-	case CAxis:
-		return src.d.ca.dir == Negative || src.d.ca.dir == Positive;
-	default:
-		return false;
-	}
-}
-
-static bool readBindings(BDescVec &out, const std::string &dir,
-                         uint32_t rgssVersion)
-{
-	if (dir.empty())
-		return false;
-
-	char path[1024];
-	buildPath(dir, rgssVersion, path, sizeof(path));
-
-	FILE *f = fopen(path, "rb");
-
-	if (!f)
-		return false;
-
-	Header hd;
-	if (fread(&hd, sizeof(hd), 1, f) < 1)
-	{
-		fclose(f);
-		return false;
-	}
-
-	if (hd.formVer != FORMAT_VER)
-		return false;
-	if (hd.rgssVer != rgssVersion)
-		return false;
-	/* Arbitrary max value */
-	if (hd.count > 1024)
-		return false;
-
-	out.resize(hd.count);
-	if (fread(&out[0], sizeof(out[0]), hd.count, f) < hd.count)
-	{
-		fclose(f);
-		return false;
-	}
-
-	for (size_t i = 0; i < hd.count; ++i)
-		if (!verifyDesc(out[i]))
-			return false;
-
-	return true;
+    if (dir.empty() || dir.size() > 960) return false;
+    char path[1024];
+    buildPath(dir, rgssVersion, path, sizeof(path));
+    if (readBindingFile(out, path, rgssVersion)) return true;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    // Recovery never consumes the backup, including when a later write fails.
+    return readBindingFile(out, std::string(path) + ".bak", rgssVersion);
+#else
+    return false;
+#endif
 }
 
 BDescVec loadBindings(const Config &conf)
 {
-	BDescVec d;
-
-	if (readBindings(d, conf.customDataPath, conf.rgssVersion))
-		return d;
-
-	return genDefaultBindings(conf);
+    BDescVec d;
+    if (readBindings(d, conf.customDataPath, conf.rgssVersion)) return d;
+    return genDefaultBindings(conf);
 }
