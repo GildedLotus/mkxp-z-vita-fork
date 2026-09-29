@@ -1,0 +1,176 @@
+{
+  "_comment": [
+    "app0:/fonts/fonts.json — the provenance record for every font this VPK",
+    "ships. Tracked; the fonts themselves are not.",
+    "",
+    "vita/scripts/fetch-fonts.sh installs the files listed here into build/fonts/ and",
+    "verifies each one against the sha256 below, so a stale or tampered font is a",
+    "failed fetch rather than a surprise on the device. The pinned upstream",
+    "archive and its own sha256 are recorded in that script, not here: one",
+    "digest, one place. vita/scripts/package-vpk.sh packs the entries with",
+    "packaged=true, and refuses to build a VPK whose fonts do not between them",
+    "cover requiredCodepoints.",
+    "",
+    "requiredCodepoints is the launcher contract, not a nicety: the launcher",
+    "picks the face it draws game titles with by probing glyphs (HIRAGANA A,",
+    "KATAKANA A, CJK ONE), because Shift_JIS titles are common and the face is",
+    "chosen by coverage rather than by name. Liberation Sans has none of the",
+    "three, so a package carrying Liberation alone is not shippable.",
+    "",
+    "documents are the upstream licence and README files, kept beside the fonts",
+    "in build/fonts/ and not packed here. The release VPK carries the font",
+    "licence texts under app0:/licenses/ (VL-Gothic.txt, OFL-1.1-Liberation.txt;",
+    "THIRD-PARTY.md at the repository root maps each font to its text)."
+  ],
+  "schemaVersion": 1,
+  "requiredCodepoints": ["U+3042", "U+30A2", "U+4E00"],
+  "licenses": {
+    "vlgothic": {
+      "name": "VL Gothic Font Family license",
+      "kind": "3-clause BSD style, redistribution permitted in binary form",
+      "derivedFrom": "M+ FONTS, Sazanami Gothic (/efont/, Wada Laboratory), Project Vine originals",
+      "text": ["LICENSE", "LICENSE.en", "LICENSE_E.mplus", "LICENSE_J.mplus", "README.sazanami"]
+    },
+    "ofl-1.1": {
+      "name": "SIL Open Font License 1.1",
+      "kind": "OFL 1.1, redistribution permitted, reserved font name",
+      "derivedFrom": "Arimo (Steve Matteson, Ascender Corporation), Liberation 2.x by Red Hat",
+      "url": "https://scripts.sil.org/OFL",
+      "text": []
+    }
+  },
+  "sources": {
+    "archive": {
+      "release": "VLGothic-20230918",
+      "project": "https://vlgothic.dicey.org/",
+      "mirror": "https://github.com/daisukesuzuki/VLGothic",
+      "note": "URL and sha256 of the tarball are pinned in vita/scripts/fetch-fonts.sh"
+    },
+    "mkxp-z": {
+      "pin": "826929eeb3ebc4b887c011604919217a790770f4",
+      "tree": "build/mkxp-z (MKXPZ_SRC)",
+      "note": "staged from the engine checkout, never downloaded and never committed"
+    }
+  },
+  "files": [
+    {
+      "name": "VL-Gothic-Regular.ttf",
+      "sha256": "b8a961fe95a69f0c566c2c7ddd4a6dd48bbf8dc3fa79479b2be31ee16e25f9bf",
+      "bytes": 4088708,
+      "family": "VL Gothic",
+      "version": "Version 2.2306",
+      "role": "Japanese fallback, fixed pitch for CJK",
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/VL-Gothic-Regular.ttf",
+      "packaged": true
+    },
+    {
+      "name": "VL-PGothic-Regular.ttf",
+      "sha256": "b8346471f82384b0f436c932059a8ac48f9deb8844ebd56c650fc1499b1f7cb2",
+      "bytes": 4149144,
+      "family": "VL PGothic",
+      "version": "Version 2.2306",
+      "role": "Japanese fallback, proportional",
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/VL-PGothic-Regular.ttf",
+      "packaged": true
+    },
+    {
+      "name": "LiberationSans-Regular.ttf",
+      "sha256": "e5b0af421ea2bfbc1ac8d251d647268087ae82786234c57f757d1f0b90fa8b49",
+      "bytes": 350200,
+      "family": "Liberation Sans",
+      "version": "Version 2.00.1",
+      "role": "Latin fallback, metric-compatible with Arial",
+      "license": "ofl-1.1",
+      "from": "mkxp-z",
+      "member": "assets/liberation.ttf",
+      "packaged": true
+    }
+  ],
+  "documents": [
+    {
+      "name": "Changelog",
+      "sha256": "49ba378209ad3121584cbb5b4b2997a097be1e316c6f7cfb7cd25750d54179b9",
+      "bytes": 35572,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/Changelog",
+      "packaged": false
+    },
+    {
+      "name": "LICENSE",
+      "sha256": "1968e3252beb8a08e8c793c34811a3afb37c7aafeddea87316661498ca4f0a02",
+      "bytes": 2886,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/LICENSE",
+      "packaged": false
+    },
+    {
+      "name": "LICENSE.en",
+      "sha256": "6c75bd88d1f49a1f320df280222ad71af0d8290bfbb2ddcbd43034a4792621f2",
+      "bytes": 2647,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/LICENSE.en",
+      "packaged": false
+    },
+    {
+      "name": "LICENSE_E.mplus",
+      "sha256": "627446730facc8227f815de9751838ad0433d6870ff45f3d3024b25c3838b826",
+      "bytes": 375,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/LICENSE_E.mplus",
+      "packaged": false
+    },
+    {
+      "name": "LICENSE_J.mplus",
+      "sha256": "dd010309f51c2306e7dfc208d3f9830ed49b71f358dcc6adecd1af398af9feee",
+      "bytes": 424,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/LICENSE_J.mplus",
+      "packaged": false
+    },
+    {
+      "name": "README",
+      "sha256": "90ca65c8352f3ba45fd6453a2ff936fb855781557e84bc8a6f2ac33ac1a8b2f1",
+      "bytes": 3111,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/README",
+      "packaged": false
+    },
+    {
+      "name": "README.sazanami",
+      "sha256": "a74b381afb202e5db3d481dab992243e62bdb70a16d3987d2480f25ad463fd3c",
+      "bytes": 7374,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/README.sazanami",
+      "packaged": false
+    },
+    {
+      "name": "README_E.mplus",
+      "sha256": "b59bc9eabd82dad38f3c879be7d9a75f7cac55f4c53d18d104a0386f163bece5",
+      "bytes": 2087,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/README_E.mplus",
+      "packaged": false
+    },
+    {
+      "name": "README_J.mplus",
+      "sha256": "eefc6d160c048ac174c596e6f0ac3eb5d0eb527bafc1a07b49197853262b13d8",
+      "bytes": 2632,
+      "license": "vlgothic",
+      "from": "archive",
+      "member": "VLGothic/README_J.mplus",
+      "packaged": false
+    }
+  ]
+}
