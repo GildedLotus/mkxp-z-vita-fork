@@ -29,7 +29,8 @@
 #include <string>
 
 struct SDL_RWops;
-struct _TTF_Font;
+struct TTF_Font;
+typedef TTF_Font _TTF_Font; /* match SDL_ttf's `typedef struct TTF_Font TTF_Font` */
 struct Config;
 
 struct SharedFontStatePrivate;
@@ -44,7 +45,8 @@ public:
 	 * (when "Fonts/" is scanned for available assets).
 	 * 'ops' is an opened handle to a possible font file,
 	 * 'filename' is the corresponding path */
-	void initFontSetCB(SDL_RWops &ops,
+	/* False leaves failed opens or incomplete SFNT reads eligible for retry. */
+	bool initFontSetCB(SDL_RWops &ops,
 	                   const std::string &filename);
 
 	_TTF_Font *getFont(std::string family,

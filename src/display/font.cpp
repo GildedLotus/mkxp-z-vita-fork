@@ -31,6 +31,10 @@
 
 #include "debugwriter.h"
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "vita_glue.h"
+#endif
+
 #include <string>
 #include <utility>
 #include <algorithm>
@@ -134,12 +138,34 @@ struct SharedFontStatePrivate
 	 * font filenames located in "Fonts/" */
 	BoostHash<std::string, FontSet> sets;
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* Requested families getFont has already reported. Font
+	 * objects ask for their face on every draw, so the resolution line is
+	 * printed the first time a family is asked for and never again; without
+	 * that it would be one line per text draw. Keyed by the request, not by
+	 * the answer, so two names landing on one face are both visible. */
+	BoostSet<std::string> loggedFamilies;
+#endif
+
 	/* Pool of font size to ppem values */
 	BoostHash<FontSizeKey, int> size_to_ppem;
 
 	/* Pool of already opened fonts; once opened, they are reused
 	 * and never closed until the termination of the program */
 	BoostHash<FontPPEMKey, std::array<TTF_Font*, 2>> ppem_to_font;
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* Heap blocks the pooled fonts above read their glyphs out of
+	 * SDL_RWFromConstMem does not own the memory it wraps and
+	 * TTF_CloseFont's freesrc frees only the RWops, so a block has to outlive
+	 * its font -- and a pooled font is never closed before the program ends,
+	 * so that means living exactly as long as this struct. Ownership moves
+	 * here only once the font is in the pool; ~SharedFontState releases them
+	 * after the last TTF_CloseFont. */
+	std::vector<void*> fontBuffers;
+	// Non-owning exact-path index; bytes remain owned by fontBuffers.
+	std::vector<std::pair<std::string, std::pair<void *, int>>> fontBytesByPath;
+#endif
     
     /* Internal default font family that is used anytime an
      * empty/invalid family is requested */
@@ -149,6 +175,95 @@ struct SharedFontStatePrivate
 	bool fontKerning;
 	int fontHinting;
 };
+
+/* How far a chain of `fontSub` entries is followed before giving up. Bounded
+ * so a cycle ("a>b" together with "b>a") terminates. */
+#define FONT_SUB_MAX_HOPS 4
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* The three faces vita/mkxp-z-vpk/fonts ships, spelled the way
+ * initFontSetCB registers them: the lower-cased FACE family name, never a
+ * file name. Nothing here assumes they are present -- every use is guarded,
+ * because app0:/fonts is assembled at package time and a card copy may hold
+ * any subset. */
+#define VITA_FONT_LATIN    "liberation sans"
+#define VITA_FONT_JP_FIXED "vl gothic"
+#define VITA_FONT_JP_PROP  "vl pgothic"
+
+/* True when `name` carries any byte outside ASCII.
+ *
+ * Family names reach us as bytes and are lower-cased byte-wise, so this is
+ * the whole test for "this name is not a Latin one": a Shift_JIS or UTF-8
+ * Japanese family name always has a byte >= 0x80 and a Windows Latin family
+ * name never does. */
+static bool vitaNonAsciiFamily(const std::string &name)
+{
+	for (size_t i = 0; i < name.size(); ++i)
+		if ((unsigned char)name[i] >= 0x80)
+			return true;
+
+	return false;
+}
+#endif
+
+/* Resolve `family` -- which must already be lower-cased -- to a family that
+ * some physical font file was registered under, or to "" when there is none.
+ *
+ * A registered family always wins. Substitutions are consulted only for a
+ * family nothing was registered under, and a substitution whose target is
+ * itself unregistered is passed over rather than obeyed; "" tells the caller
+ * to fall back to the built-in font, exactly as an unknown family did before.
+ *
+ * Neither map may grow here. BoostHash::operator[] is std::map's, so a miss
+ * would insert an empty value and leave a phantom family behind that a later
+ * `contains()` would then believe; every operator[] below is short-circuited
+ * behind its own contains(). */
+static std::string resolveFamily(SharedFontStatePrivate *p, std::string family)
+{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	const std::string requested = family;
+#endif
+
+	for (int hop = 0; hop <= FONT_SUB_MAX_HOPS; ++hop)
+	{
+		if (p->sets.contains(family) && !p->sets[family]->empty())
+			return family;
+
+		if (!p->subs.contains(family))
+			break;
+
+		family = p->subs[family];
+	}
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* Last resort for a Japanese face nobody has heard of.
+	 *
+	 * The substitution table below covers the families Windows ships, but
+	 * RPG Maker projects name whatever font their author had installed, and
+	 * a name that is not ASCII is a name whose glyphs the Latin-only
+	 * built-in font certainly does not have -- it would draw the whole
+	 * string as tofu. VL Gothic is a wrong face but a readable one, and
+	 * readable beats correct-and-blank.
+	 *
+	 * Only after the chain above has failed: a family that IS registered,
+	 * or that substitutes onto one, has already returned. */
+	{
+		const std::string jp(VITA_FONT_JP_FIXED);
+
+		if (vitaNonAsciiFamily(requested) &&
+		    p->sets.contains(jp) && !p->sets[jp]->empty())
+			return jp;
+	}
+#endif
+
+	return std::string();
+}
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* Defined in fontres-telemetry.h, included with the font buffering code below. */
+static void fontResInstall(void);
+static void fontResShutdown(void);
+#endif
 
 SharedFontState::SharedFontState(const Config &conf)
 {
@@ -169,6 +284,107 @@ SharedFontState::SharedFontState(const Config &conf)
 		p->subs.insert(from, to);
 	}
 	
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* Built-in fallbacks for the Windows families this device cannot have
+	 *
+	 *
+	 * RPG Maker projects name the fonts their author had installed, and
+	 * those are Microsoft's -- none of which may be redistributed. What the
+	 * VPK can ship is a metric-compatible Latin face and a Japanese one, so
+	 * every such name is pointed at whichever of the two is closer.
+	 *
+	 * This table lives here rather than in mkxp.json because it is a
+	 * property of what the package ships, not of any one game: a deployed
+	 * game.json can neither be expected to carry twenty entries nor to stay
+	 * in step when the bundled set changes.
+	 *
+	 * BOTH sides must be lower-case. `sets` is keyed by the lower-cased face
+	 * name (initFontSetCB) and every lookup lower-cases its request, so a
+	 * mapping spelled with capitals -- on either side -- can never match;
+	 * that is true of the `fontSub` entries parsed above as well.
+	 *
+	 * A config entry wins. fontSub is read before this runs and an existing
+	 * key is left alone, so a game or the device profile can still redirect
+	 * any of these names. */
+	{
+		static const struct { const char *from; const char *to; } bundledSubs[] =
+		{
+			/* Latin: Liberation Sans is metric-compatible with Arial, and
+			 * it is the only Latin face in the package, so the serif and
+			 * monospace families land on it too -- the wrong shape, but the
+			 * right glyphs. */
+			{ "arial",                 VITA_FONT_LATIN    },
+			{ "helvetica",             VITA_FONT_LATIN    },
+			{ "verdana",               VITA_FONT_LATIN    },
+			{ "tahoma",                VITA_FONT_LATIN    },
+			{ "trebuchet ms",          VITA_FONT_LATIN    },
+			{ "segoe ui",              VITA_FONT_LATIN    },
+			{ "calibri",               VITA_FONT_LATIN    },
+			{ "microsoft sans serif",  VITA_FONT_LATIN    },
+			{ "ms sans serif",         VITA_FONT_LATIN    },
+			{ "lucida sans unicode",   VITA_FONT_LATIN    },
+			{ "comic sans ms",         VITA_FONT_LATIN    },
+			{ "times new roman",       VITA_FONT_LATIN    },
+			{ "georgia",               VITA_FONT_LATIN    },
+			{ "garamond",              VITA_FONT_LATIN    },
+			{ "book antiqua",          VITA_FONT_LATIN    },
+			{ "palatino linotype",     VITA_FONT_LATIN    },
+			{ "courier new",           VITA_FONT_LATIN    },
+			{ "courier",               VITA_FONT_LATIN    },
+			{ "consolas",              VITA_FONT_LATIN    },
+			{ "lucida console",        VITA_FONT_LATIN    },
+
+			/* Japanese, fixed pitch. Each family appears twice: once under
+			 * its ASCII name and once under the Japanese one the font
+			 * itself carries, because a project saves whichever spelling
+			 * the editor showed. UmePlus Gothic is mkxp-z's own RGSS2
+			 * default (Font::initDefaults). */
+			{ "ms gothic",             VITA_FONT_JP_FIXED },
+			/* "ＭＳ ゴシック" */
+			{ "\xEF\xBC\xAD\xEF\xBC\xB3\x20\xE3\x82\xB4\xE3\x82\xB7\xE3\x83\x83\xE3\x82\xAF",
+			                           VITA_FONT_JP_FIXED },
+			{ "ms mincho",             VITA_FONT_JP_FIXED },
+			/* "ＭＳ 明朝" */
+			{ "\xEF\xBC\xAD\xEF\xBC\xB3\x20\xE6\x98\x8E\xE6\x9C\x9D",
+			                           VITA_FONT_JP_FIXED },
+			{ "umeplus gothic",        VITA_FONT_JP_FIXED },
+
+			/* Japanese, proportional. VL PGothic is the proportional cut of
+			 * the same design, so these keep their spacing. */
+			{ "ms pgothic",            VITA_FONT_JP_PROP  },
+			/* "ＭＳ Ｐゴシック" */
+			{ "\xEF\xBC\xAD\xEF\xBC\xB3\x20\xEF\xBC\xB0\xE3\x82\xB4\xE3\x82\xB7\xE3\x83\x83\xE3\x82\xAF",
+			                           VITA_FONT_JP_PROP  },
+			{ "ms ui gothic",          VITA_FONT_JP_PROP  },
+			{ "ms pmincho",            VITA_FONT_JP_PROP  },
+			/* "ＭＳ Ｐ明朝" */
+			{ "\xEF\xBC\xAD\xEF\xBC\xB3\x20\xEF\xBC\xB0\xE6\x98\x8E\xE6\x9C\x9D",
+			                           VITA_FONT_JP_PROP  },
+			{ "meiryo",                VITA_FONT_JP_PROP  },
+			/* "メイリオ" */
+			{ "\xE3\x83\xA1\xE3\x82\xA4\xE3\x83\xAA\xE3\x82\xAA",
+			                           VITA_FONT_JP_PROP  },
+			{ "meiryo ui",             VITA_FONT_JP_PROP  },
+			{ "yu gothic",             VITA_FONT_JP_PROP  },
+			/* "游ゴシック" */
+			{ "\xE6\xB8\xB8\xE3\x82\xB4\xE3\x82\xB7\xE3\x83\x83\xE3\x82\xAF",
+			                           VITA_FONT_JP_PROP  },
+			{ "umeplus p gothic",      VITA_FONT_JP_PROP  },
+
+			/* Second hop for everything above it: a package or a card that
+			 * carries only VL-Gothic-Regular.ttf still answers a
+			 * proportional request. With both files installed "vl pgothic"
+			 * is a registered family, so resolveFamily returns it and this
+			 * entry is never consulted. */
+			{ VITA_FONT_JP_PROP,       VITA_FONT_JP_FIXED },
+		};
+
+		for (size_t i = 0; i < sizeof(bundledSubs) / sizeof(bundledSubs[0]); ++i)
+			if (!p->subs.contains(bundledSubs[i].from))
+				p->subs.insert(bundledSubs[i].from, bundledSubs[i].to);
+	}
+#endif
+
 	p->fontScale = conf.fontScale;
 	if (p->fontScale < 0.1f)
 	{
@@ -176,6 +392,9 @@ SharedFontState::SharedFontState(const Config &conf)
 	}
 	p->fontKerning = conf.fontKerning;
 	p->fontHinting = conf.fontHinting;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	fontResInstall();
+#endif
 }
 
 SharedFontState::~SharedFontState()
@@ -188,34 +407,50 @@ SharedFontState::~SharedFontState()
 				TTF_CloseFont(iter->second[i]);
 	}
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* Every pooled font is closed by now, so nothing reads these any more.
+	 * TTF_CloseFont's freesrc released the SDL_RWFromConstMem wrappers, never
+	 * the blocks behind them; this is where those go. */
+	for (size_t i = 0; i < p->fontBuffers.size(); ++i)
+		SDL_free(p->fontBuffers[i]);
+#endif
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	fontResShutdown();
+#endif
+
 	delete p;
 }
 
 static std::string decodeSfntName(const FT_SfntName &aname)
 {
-	std::string str = std::string((const char *)aname.string, (size_t)aname.string_len);
-	if ((aname.platform_id == TT_PLATFORM_MICROSOFT && aname.encoding_id == TT_MS_ID_UNICODE_CS) || aname.platform_id == TT_PLATFORM_APPLE_UNICODE)
-		try
-		{
-			str = Encoding::convertString(str, "UTF-16BE");
-		} catch (Exception)
-		{}
-	else if (aname.platform_id == TT_PLATFORM_MICROSOFT && aname.encoding_id == TT_MS_ID_UCS_4)
-		try
-		{
-			str = Encoding::convertString(str, "UTF-32BE");
-		} catch (Exception)
-		{}
-	return str;
+	if (!aname.string || !aname.string_len)
+		return {};
+	std::string str((const char *)aname.string, aname.string_len);
+	// All Microsoft name records use UTF-16BE, including legacy encoding IDs.
+	if (aname.platform_id == TT_PLATFORM_APPLE_UNICODE ||
+	    aname.platform_id == TT_PLATFORM_MICROSOFT)
+		return Encoding::decodeUTF16BE(str);
+	if (aname.platform_id == TT_PLATFORM_MACINTOSH && aname.encoding_id == TT_MAC_ID_ROMAN)
+		return Encoding::decodeMacRoman(str);
+	if (aname.platform_id == TT_PLATFORM_MACINTOSH && aname.encoding_id == TT_MAC_ID_JAPANESE) {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		return Encoding::decodeShiftJIS(str);
+#else
+		try { return Encoding::convertString(str, "SHIFT_JIS"); }
+		catch (const Exception &) { return {}; }
+#endif
+	}
+	return {};
 }
 
-void SharedFontState::initFontSetCB(SDL_RWops &ops,
+bool SharedFontState::initFontSetCB(SDL_RWops &ops,
                                     const std::string &filename)
 {
 	TTF_Font *font = TTF_OpenFontRW(&ops, 0, 0);
 
 	if (!font)
-		return;
+		return false;
 
 	std::string family = TTF_FontFaceFamilyName(font);
 	std::string style = TTF_FontFaceStyleName(font);
@@ -230,27 +465,41 @@ void SharedFontState::initFontSetCB(SDL_RWops &ops,
 	else if (style != "Regular" && set.other.empty())
 		set.other = filename;
 
+	bool complete = true;
 	FT_Face face = TTF_FONT_TO_FT_FACE(font);
 
 	if (FT_IS_SFNT(face))
 	{
-		std::unordered_map<uint32_t, std::pair<std::string, std::string>> name_map;
+		std::unordered_map<uint64_t, std::pair<std::string, std::string>> name_map;
 
 		for (unsigned int i = 0, name_count = FT_Get_Sfnt_Name_Count(face); i < name_count; ++i)
 		{
 			FT_SfntName aname;
 			if (FT_Get_Sfnt_Name(face, i, &aname))
+			{
+				complete = false;
 				continue;
-			uint32_t key = aname.platform_id;
-			key <<= 16;
-			key |= aname.language_id;
+			}
+			if (aname.name_id != TT_NAME_ID_FONT_FAMILY && aname.name_id != TT_NAME_ID_FONT_SUBFAMILY)
+				continue;
+			/* FreeType can report success with an empty name after an I/O failure. */
+			if (!aname.string || !aname.string_len)
+			{
+				complete = false;
+				continue;
+			}
+			std::string decoded = decodeSfntName(aname);
+			if (decoded.empty())
+				continue;
+			uint64_t key = ((uint64_t)aname.platform_id << 32) |
+			               ((uint64_t)aname.encoding_id << 16) | aname.language_id;
 			switch (aname.name_id)
 			{
 				case TT_NAME_ID_FONT_FAMILY:
-					name_map[key].first = decodeSfntName(aname);
+					name_map[key].first = decoded;
 					break;
 				case TT_NAME_ID_FONT_SUBFAMILY:
-					name_map[key].second = decodeSfntName(aname);
+					name_map[key].second = decoded;
 					break;
 			}
 		}
@@ -277,6 +526,7 @@ void SharedFontState::initFontSetCB(SDL_RWops &ops,
 	}
 
 	TTF_CloseFont(font);
+	return complete;
 }
 
 // https://github.com/wine-mirror/wine/blob/dc34fef45d491516fa8eaee45b2ae40faa7b0bfe/dlls/win32u/freetype.c
@@ -534,6 +784,104 @@ static int calc_ppem_for_height(Font_Container *font, int height)
 }
 /* /wine */
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+
+/* Largest font this build reads into memory in one piece. The biggest font
+ * any RTP ships is VL Gothic at about 5 MiB, and Blank Dream's own
+ * cinecaption2.28.ttf is 1.7 MiB, so 8 MiB covers the corpus with room to
+ * spare while still bounding the extra resident copy per open font. Left
+ * overridable for host-compilable builds.
+ * SDL_RWFromConstMem takes an int length, hence the upper bound. */
+#ifndef MKXPZ_VITA_FONT_SLURP_MAX
+#define MKXPZ_VITA_FONT_SLURP_MAX (8 * 1024 * 1024)
+#endif
+#include "fontres-telemetry.h"
+#ifndef MKXPZ_VITA_FONT_REUSE
+#define MKXPZ_VITA_FONT_REUSE 1
+#endif
+
+
+/* Swap a live PhysFS font stream for one the face can read without touching
+ * ux0: again.
+ *
+ * FreeType reads a font lazily for the whole life of the face: hmtx, loca and
+ * glyf are three separate seek-and-read pairs per first-time glyph, and down
+ * on the device each pair is an sceIoLseek plus an sceIoRead. Buffering the
+ * stream is no answer -- the three tables sit tens to hundreds of kilobytes
+ * apart, so any buffer smaller than the file just thrashes -- so the file is
+ * read once, here, into one block.
+ *
+ * On success the returned RWops reads from *bufOut, `ops` has been closed,
+ * and the caller owns *bufOut until the font opened from it reaches the pool.
+ * On any refusal -- no length, over the cap, out of memory, a short read, no
+ * RWops -- *bufOut stays 0 and `ops` comes back open and rewound, so the
+ * caller streams exactly as it did before. */
+static SDL_RWops *vitaSlurpFont(SDL_RWops *ops, const char *name, void **bufOut)
+{
+	static_assert(MKXPZ_VITA_FONT_SLURP_MAX > 0 &&
+	              MKXPZ_VITA_FONT_SLURP_MAX <= 0x7fffffff,
+	              "MKXPZ_VITA_FONT_SLURP_MAX must fit SDL_RWFromConstMem's int");
+
+	*bufOut = 0;
+
+	const Sint64 size = SDL_RWsize(ops);
+	size_t got = 0;
+
+	if (size > 0 && size <= MKXPZ_VITA_FONT_SLURP_MAX)
+	{
+		void *buf = SDL_malloc((size_t)size);
+
+		if (buf)
+		{
+			while (got < (size_t)size)
+			{
+				const size_t n = SDL_RWread(ops, (Uint8*)buf + got, 1,
+				                            (size_t)size - got);
+
+				if (n == 0)
+					break;
+
+				got += n;
+			}
+
+			if (got == (size_t)size)
+			{
+				if (g_fontRes.active) {
+					g_fontRes.cur.slurp_reason = 0;
+					g_fontRes.cur.slurp_bytes = (unsigned long)size;
+				}
+				SDL_RWops *mem = SDL_RWFromConstMem(buf, (int)size);
+
+				if (mem)
+				{
+					SDL_RWclose(ops);
+					*bufOut = buf;
+
+					return mem;
+				}
+			}
+
+			SDL_free(buf);
+		}
+	}
+
+	/* Streaming after all. Whatever was consumed has to be handed back:
+	 * TTF_OpenFontRW reads the face from wherever the stream now stands. */
+	if (got != 0)
+		SDL_RWseek(ops, 0, RW_SEEK_SET);
+	if (g_fontRes.active) {
+		g_fontRes.cur.slurp_reason = 1;
+		g_fontRes.cur.slurp_bytes = (unsigned long)size;
+	}
+
+	Debug() << "font streamed '" + std::string(name ? name : "") + "' ("
+	           + std::to_string((long long)size) + ")";
+
+	return ops;
+}
+
+#endif
+
 _TTF_Font *SharedFontState::getFont(std::string family,
                                     int size, float hiresMult, int outline_size)
 {
@@ -543,18 +891,37 @@ _TTF_Font *SharedFontState::getFont(std::string family,
 	if (family.empty())
 		family = p->defaultFamily;
 
-	/* Check for substitutions */
-	if (p->subs.contains(family))
-		family = p->subs[family];
+	/* Find out which font asset actually answers this request: the family
+	 * itself when it exists, else the first existing substitution target,
+	 * else "" -- the built-in font. */
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	const std::string requested = family;
+#endif
+	family = resolveFamily(p, family);
 
-	/* Find out if the font asset exists */
-	const FontSet &req = p->sets[family];
-
-	if (req->empty())
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* One line per requested family, the first time it is asked for
+	 * Which face a game actually got is otherwise invisible:
+	 * the registry is built from whatever happened to be mounted, the
+	 * request is rewritten by the table, and nothing downstream says which
+	 * file was opened. `requested` is the lower-cased name after the empty
+	 * -> default_font_family step, i.e. the key resolution ran on.
+	 *
+	 * The subscript is safe: a non-empty answer from resolveFamily is
+	 * always a family already in `sets`. The built-in face is named
+	 * outright because this port pins -Dcjk_fallback_font=false, so
+	 * BUNDLED_FONT is liberation and nothing else. */
+	if (!p->loggedFamilies.contains(requested))
 	{
-		/* Doesn't exist; use built-in font */
-		family = "";
+		p->loggedFamilies.insert(requested);
+
+		if (family.empty())
+			Debug() << "font: '" + requested + "' -> built-in Liberation Sans";
+		else
+			Debug() << "font: '" + requested + "' -> '" + family + "' ("
+			           + p->sets[family]->c_str() + ")";
 	}
+#endif
 
 	FontSizeKey key(family, size);
 
@@ -582,6 +949,17 @@ _TTF_Font *SharedFontState::getFont(std::string family,
 	/* Not in pool; open new handle */
 	SDL_RWops *ops;
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	frBegin(family.c_str(), size, outline_size);
+	g_fontRes.cur.copies = (unsigned)p->fontBuffers.size();
+#endif
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* Bytes behind `ops` when it is a memory stream. Owned here until the
+	 * font reaches the pool below, and freed here if it never does. */
+	void *slurped = 0;
+	int slurpedSize = 0;
+#endif
+
 	if (family.empty())
 	{
 		/* Built-in font */
@@ -590,21 +968,61 @@ _TTF_Font *SharedFontState::getFont(std::string family,
 	else
 	{
 		/* Use 'other' path as alternative in case
-		 * we have no 'regular' styled font asset */
+		 * we have no 'regular' styled font asset.
+		 * resolveFamily() only returns a non-empty name for a family that
+		 * is already in the map, so this operator[] cannot grow it. */
+		const FontSet &req = p->sets[family];
 		const char *path = req->c_str();
 
-		ops = SDL_AllocRW();
-		try{
-			shState->fileSystem().openReadRaw(*ops, path, true);
-		} catch (const Exception &e) {
-			SDL_FreeRW(ops);
+		bool cached = false;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		if (MKXPZ_VITA_FONT_REUSE)
+			for (const auto &entry : p->fontBytesByPath)
+				if (entry.first == path) {
+					ops = SDL_RWFromConstMem(entry.second.first, entry.second.second);
+					cached = true;
+					break;
+				}
+#endif
+		if (!cached) ops = SDL_AllocRW();
+		if (!ops)
+		{
 			p->size_to_ppem.remove(key);
-			throw e;
+			throw Exception(Exception::SDLError, "%s", SDL_GetError());
+		}
+		if (!cached) {
+			try{
+				shState->fileSystem().openReadRaw(*ops, path, true);
+			} catch (const Exception &e) {
+				SDL_FreeRW(ops);
+				p->size_to_ppem.remove(key);
+				throw e;
+			}
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+			/* The bundled font above is already memory-backed; this is the only
+			 * branch that hands FreeType a device stream. */
+			ops = vitaSlurpFont(ops, path, &slurped);
+			if (slurped) slurpedSize = (int)SDL_RWsize(ops);
+			if (g_fontRes.active) {
+				g_fontRes.cur.copy_bytes = slurped ? g_fontRes.cur.slurp_bytes : 0;
+				if (slurped)
+					g_fontRes.cur.copies = (unsigned)p->fontBuffers.size() + 1;
+			}
+#endif
 		}
 	}
 
 	/* Try to compute the size the same way Windows does. */
 	font = TTF_OpenFontRW(ops, 1, 0);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	if (g_fontRes.active) {
+		frHeap(&g_fontRes.cur.h1);
+		g_fontRes.cur.stage = FR_TTF;
+		if (!font)
+			frAttribute(slurped, slurped ? (size_t)g_fontRes.cur.slurp_bytes : 0);
+	}
+#endif
 
 	if (font)
 	{
@@ -648,15 +1066,40 @@ _TTF_Font *SharedFontState::getFont(std::string family,
 			/* RGSS doesn't use font hinting */
 			TTF_SetFontHinting(font, p->fontHinting);
 		}
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		if (g_fontRes.active) frHeap(&g_fontRes.cur.h2);
+#endif
 	}
 	
 	if (!font)
 	{
 		p->size_to_ppem.remove(key);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		/* No pool entry ever took these over, and freesrc released the RWops
+		 * that wrapped them, not the block itself. */
+		SDL_free(slurped);
+		frFinish(FR_REFUSED, 0, 0);
+#endif
 		throw Exception(Exception::SDLError, "%s", SDL_GetError());
 	}
 	
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	if (g_fontRes.active) frHeap(&g_fontRes.cur.h3);
+#endif
 	auto &group = p->ppem_to_font[FontPPEMKey(family, std::max<int>(ppem * hiresMult, 1))];
+	/* An uncached requested size can resolve to an already pooled ppem.
+	 * Existing Font wrappers still own references to that slot's font. */
+	TTF_Font *pooled = group[outline_size != 0];
+	if (pooled)
+	{
+		TTF_CloseFont(font);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		SDL_free(slurped);
+#endif
+		if (outline_size && TTF_GetFontOutline(pooled) != outline_size)
+			TTF_SetFontOutline(pooled, outline_size);
+		return pooled;
+	}
 	if(outline_size == 0)
 	{
 		group[0] = font;
@@ -665,6 +1108,20 @@ _TTF_Font *SharedFontState::getFont(std::string family,
 			TTF_SetFontOutline(font, outline_size);
 		group[1] = font;
 	}
+	
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* The font is pooled now, so its bytes belong to the pool. (This grows a
+	 * vector next to the map the line above just grew; both are out of memory
+	 * together or neither is.) */
+	if (slurped) {
+		p->fontBuffers.push_back(slurped);
+		const std::string &path = *p->sets[family].operator->();
+		if (MKXPZ_VITA_FONT_REUSE && p->fontBytesByPath.size() < 64 && path.size() < 512) {
+			try { p->fontBytesByPath.push_back({path, {slurped, slurpedSize}}); }
+			catch (const std::bad_alloc &) {} // Optional index; the pool still owns the bytes.
+		}
+	}
+#endif
 	
 	if (!p->fontKerning)
 		TTF_SetFontKerning(font, 0);
@@ -677,13 +1134,7 @@ bool SharedFontState::fontPresent(std::string family) const
 	std::transform(family.begin(), family.end(), family.begin(),
 		[](unsigned char c){ return std::tolower(c); });
 
-	/* Check for substitutions */
-	if (p->subs.contains(family))
-		family = p->subs[family];
-
-	const FontSet &set = p->sets[family];
-
-	return !set->empty();
+	return !resolveFamily(p, family).empty();
 }
 
 _TTF_Font *SharedFontState::openBundled(int size)
@@ -694,7 +1145,13 @@ _TTF_Font *SharedFontState::openBundled(int size)
 }
 
 void SharedFontState::setDefaultFontFamily(const std::string &family) {
+    /* Every lookup lower-cases its request and the registry is keyed
+     * lower-cased, so a mixed-case default stored verbatim could never match
+     * an installed family. */
     p->defaultFamily = family;
+    std::transform(p->defaultFamily.begin(), p->defaultFamily.end(),
+                   p->defaultFamily.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
 }
 
 static bool pickExistingFontName(const std::vector<std::string> &names,
@@ -969,6 +1426,9 @@ void Font::initDefaultDynAttribs()
 
 void Font::initDefaults(const SharedFontState &sfs)
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	vita_glue_trace("trace: Font::initDefaults enter");
+#endif
 	std::vector<std::string> &names = FontPrivate::initialDefaultNames;
 
 	switch (rgssVer)
@@ -991,10 +1451,16 @@ void Font::initDefaults(const SharedFontState &sfs)
 		FontPrivate::defaultSize = 24;
 	}
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	vita_glue_trace("trace: Font::initDefaults setDefaultName");
+#endif
 	setDefaultName(names, sfs);
 
 	FontPrivate::defaultOutline = (rgssVer >= 3 ? true : false);
 	FontPrivate::defaultShadow  = (rgssVer == 2 ? true : false);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	vita_glue_trace("trace: Font::initDefaults leave");
+#endif
 }
 
 _TTF_Font *Font::getSdlFont(int outline_size)
