@@ -19,6 +19,8 @@
  ** along with mkxp.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "bootprofile.h"
+
 #include "audio/audio.h"
 #include "filesystem/filesystem.h"
 #include "display/graphics.h"
@@ -40,14 +42,42 @@
 #include "sharedstate.h"
 #include "eventthread.h"
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "vita_glue.h"
+#include "vita_fatal.h"
+/* GPUBudget::logCounts for System.vita_telemetry.
+ * src/meson.build puts display/gl on the global include path and this header
+ * is declarations only, so it costs this TU no code. */
+#include "display/gl/gl-util.h"
+#include <SDL_mutex.h>
+#include <stdio.h>
+#endif
+
 #include <vector>
 #include "util/rapidcsv.h"
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* The on-screen panel, and the text core that formats what goes in it
+ * There is no OS message box on this platform, so
+ * between them these two are what "the player is told" means here.
+ *
+ * Their own block rather than the glue block above, so that the three
+ * lines of that one stay an unbroken run of context: every later patch
+ * that adds a Vita include anchors on them. */
+#include "display/erroroverlay.h"
+#include "textpanel.h"
+#endif
 
 extern "C" {
 #include <ruby.h>
 
 #if RAPI_FULL >= 190
 #include <ruby/encoding.h>
+#endif
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* rb_tracepoint_new / RUBY_INTERNAL_EVENT_GC_END_SWEEP. */
+#include <ruby/debug.h>
 #endif
 }
 
@@ -69,6 +99,16 @@ extern const char module_rpg2[];
 extern const char module_rpg3[];
 
 static VALUE topSelf;
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* Free memory on GC. This runs INSIDE the
+ * collector, at the end of its sweep phase, so it does exactly one thing:
+ * forward. Allocating a Ruby object, calling rb_funcall or raising here
+ * would re-enter the GC it is being called from. Everything else -- the
+ * counting, the once-per-second rate limit, the kernel query and the
+ * formatting -- lives in vita_glue.c, where it is host-compilable. */
+static void vitaGcEndSweep(VALUE, void *) { vita_glue_gc_event(); }
+#endif
 
 static void mriBindingExecute();
 static void mriBindingTerminate();
@@ -133,6 +173,13 @@ RB_METHOD(mkxpPowerState);
 RB_METHOD(mkxpSettingsMenu);
 RB_METHOD(mkxpCpuCount);
 RB_METHOD(mkxpSystemMemory);
+#if defined(MKXPZ_HOST_PORT_LOGIC) && !defined(__vita__)
+RB_METHOD(mkxpVitaTelemetry); RB_METHOD(mkxpVitaHeap);
+#elif defined(__vita__)
+RB_METHOD(mkxpVitaTelemetry);
+RB_METHOD(mkxpVitaHeap);
+RB_METHOD(mkxpVitaKernelObjectHeadroom);
+#endif
 RB_METHOD(mkxpReloadPathCache);
 RB_METHOD(mkxpAddPath);
 RB_METHOD(mkxpRemovePath);
@@ -246,6 +293,15 @@ static void mriBindingInit() {
     _rb_define_module_function(mod, "power_state", mkxpPowerState);
     _rb_define_module_function(mod, "nproc", mkxpCpuCount);
     _rb_define_module_function(mod, "memory", mkxpSystemMemory);
+#if defined(MKXPZ_HOST_PORT_LOGIC) && !defined(__vita__)
+    _rb_define_module_function(mod, "vita_telemetry", mkxpVitaTelemetry); _rb_define_module_function(mod, "vita_heap", mkxpVitaHeap);
+#elif defined(__vita__)
+    // The semaphore census measures device kernel headroom only.
+    _rb_define_module_function(mod, "vita_telemetry", mkxpVitaTelemetry);
+    _rb_define_module_function(mod, "vita_heap", mkxpVitaHeap);
+    _rb_define_module_function(mod, "vita_kernel_object_headroom",
+                               mkxpVitaKernelObjectHeadroom);
+#endif
     _rb_define_module_function(mod, "reload_cache", mkxpReloadPathCache);
     _rb_define_module_function(mod, "mount", mkxpAddPath);
     _rb_define_module_function(mod, "unmount", mkxpRemovePath);
@@ -286,11 +342,19 @@ static void mriBindingInit() {
     
     // Automatically load zlib if it's present -- the correct way this time
     int state;
+#if RAPI_FULL > 187
+    VALUE previousError = rb_errinfo();
+#endif
     rb_eval_string_protect("require('zlib') if !Kernel.const_defined?(:Zlib)", &state);
     if (state) {
         Debug() << "Could not load Zlib. If this is important, make sure Ruby was built with static extensions, or that"
         << ((MKXPZ_PLATFORM == MKXPZ_PLATFORM_MACOS) ? "zlib.bundle" : "zlib.so")
         << "is present and reachable by Ruby's loadpath.";
+#if RAPI_FULL > 187
+        /* This optional dependency error was handled. Do not leave it in
+         * $! and make runRMXPScripts abort before evaluating game scripts. */
+        rb_set_errinfo(previousError);
+#endif
     }
     
     // Set $stdout and its ilk accordingly on Windows
@@ -302,7 +366,24 @@ static void mriBindingInit() {
 }
 
 static void showMsg(const std::string &msg) {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* Every print / p / msgbox body and every engine message funnels through
+     * here. SDL's Vita backend has no ShowMessageBox implementation, so the
+     * stock call below shows nothing, logs nothing and leaks three 2 MiB
+     * PHYCONT blocks plus three GXM sync objects on the way out.
+     * The stock XP/VX Main script reports a missing file through print, so on
+     * a device that call is how the most common vanilla failure disappears.
+     *
+     * So: log it, then show it. The log is first and
+     * unconditional because it is the half that survives a panel that cannot
+     * be drawn -- and the half a bug report can be pasted from. The panel
+     * blocks until a pad button is pressed, which is what `print` means in
+     * RGSS: the stock desktop message box is modal too. */
+    vitaLogMessage("msgbox: ", msg.c_str());
+    vitaShowPanel("Message", msg, false);
+#else
     shState->eThread().showMessageBox(msg.c_str());
+#endif
 }
 
 static void printP(int argc, VALUE *argv, const char *convMethod,
@@ -351,17 +432,27 @@ RB_METHOD(mkxpDelta) {
     return rb_float_new(shState->runTime());
 }
 
-RB_METHOD(mkxpDataDirectory) {
+RB_METHOD_GUARD(mkxpDataDirectory) {
     RB_UNUSED_PARAM;
     
     const std::string &path = shState->config().customDataPath;
     const char *s = path.empty() ? "." : path.c_str();
     
-    std::string s_nml = shState->fileSystem().normalize(s, 1, 1);
-    VALUE ret = rb_utf8_str_new_cstr(s_nml.c_str());
-    
+    /* Same shape as mkxpDesensitize: a raise while s_nml is alive would
+     * skip its destructor. */
+    VALUE ret;
+    int state = 0;
+    {
+        const std::string s_nml = shState->fileSystem().normalize(s, 1, 1);
+        ret = rb_protect([](VALUE arg) -> VALUE {
+            return rb_utf8_str_new_cstr(reinterpret_cast<const std::string *>(arg)->c_str());
+        }, reinterpret_cast<VALUE>(&s_nml), &state);
+    }
+    if (state)
+        rb_jump_tag(state);
     return ret;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD(mkxpSetTitle) {
     RB_UNUSED_PARAM;
@@ -382,16 +473,26 @@ RB_METHOD(mkxpGetTitle) {
     return rb_utf8_str_new_cstr(SDL_GetWindowTitle(shState->sdlWindow()));
 }
 
-RB_METHOD(mkxpDesensitize) {
+RB_METHOD_GUARD(mkxpDesensitize) {
     RB_UNUSED_PARAM;
     
     VALUE filename;
     rb_scan_args(argc, argv, "1", &filename);
     SafeStringValue(filename);
     
-    return rb_utf8_str_new_cstr(
-                                shState->fileSystem().desensitize(RSTRING_PTR(filename)));
-}
+    VALUE result;
+    int state = 0;
+    {
+        const std::string path = shState->fileSystem().desensitize(RSTRING_PTR(filename));
+        result = rb_protect([](VALUE arg) -> VALUE {
+            const auto *path = reinterpret_cast<const std::string *>(arg);
+            return rb_utf8_str_new(path->data(), path->size());
+        }, reinterpret_cast<VALUE>(&path), &state);
+    }
+    if (state)
+        rb_jump_tag(state);
+    return result;
+} RB_METHOD_GUARD_END
 
 RB_METHOD(mkxpPuts) {
     RB_UNUSED_PARAM;
@@ -543,6 +644,114 @@ RB_METHOD(mkxpSystemMemory) {
     return INT2NUM(SDL_GetSystemRAM());
 }
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* ---- diagnostic telemetry ----------------------------
+ *
+ * Three numbers a native-value stress run needs per phase and the log could
+ * not otherwise produce. All three are guarded methods: on ARM
+ * EABI a C++ exception reaching a Ruby C frame runs std::terminate() instead
+ * of unwinding, and Debug()'s std::stringstream can throw std::bad_alloc
+ * None of them takes the graphics lock, and none allocates a
+ * heap block that a Ruby raise could orphan.
+ */
+
+/* System.vita_telemetry(tag) -- the engine's own
+ *   vita-gpu: textures= vbos= surfaces= cpu_bitmap_bytes= deferred_pending= scene=<tag>
+ * line, plus the vita-heap: sample that pairs with it, WITHOUT a scene
+ * change. GPUBudget::logSceneChange() is reachable only from Graphics::freeze,
+ * and a real game dies about 3 s after its second freeze, so
+ * before this a diagnostic that wanted the counters per phase had to confound
+ * its own result with that bug. Still a no-op unless
+ * ux0:/data/mkxp-z/gpu-telemetry.enabled exists: logCounts() returns early. */
+RB_METHOD_GUARD(mkxpVitaTelemetry) {
+    RB_UNUSED_PARAM;
+
+    const char *tag;
+    rb_get_args(argc, argv, "z", &tag RB_ARG_END);
+
+    GPUBudget::logCounts(tag);
+
+    return Qnil;
+}
+RB_METHOD_GUARD_END
+
+/* System.vita_heap(tag) -- vita_glue_log_heap()'s
+ *   vita-heap: tag= arena= used= free= keepcost= limit= headroom= bytes
+ * line on demand and ungated, so a phase-by-phase occupancy trace does not
+ * need the GPU telemetry marker. The measurement is the glue
+ * function; this only binds it. mallinfo() walks every free bin, so this
+ * belongs at phase granularity and never in a frame path. */
+RB_METHOD_GUARD(mkxpVitaHeap) {
+    RB_UNUSED_PARAM;
+
+    const char *tag;
+    rb_get_args(argc, argv, "z", &tag RB_ARG_END);
+
+    vita_glue_log_heap(tag);
+
+    return Qnil;
+}
+RB_METHOD_GUARD_END
+#endif
+#ifdef __vita__
+/* System.vita_kernel_object_headroom takes semaphores until one is refused,
+ * giving every one back. No API counts a process's kernel objects, and this is
+ * the number the sigslot change was about: before it, every sigslot::signal cost a
+ * kernel semaphore even unconnected, so a database of 2340 Tables/Tones cost
+ * 2340 of them. It turns "no kernel object per value" from an assertion into a
+ * number.
+ *
+ * SDL_CreateSemaphore, not SDL_CreateMutex, and the choice is forced:
+ * SDL's Vita SDL_CreateMutex (src/thread/vita/SDL_sysmutex.c, SDL 2.32.8)
+ * calls SDL_SetError when sceKernelCreateLwMutex fails but still RETURNS the
+ * allocated SDL_mutex, so a create-until-NULL loop over it detects heap
+ * exhaustion only and never kernel-object exhaustion. SDL_CreateSemaphore
+ * (SDL_syssem.c) frees its struct and returns NULL when sceKernelCreateSema
+ * fails, which is the signal this needs -- and a kernel semaphore is the exact
+ * object a Vita pthread mutex consumes, so it is also the right unit.
+ *
+ * CEILING bounds the probe; the array is automatic, so there is no heap block
+ * and no destructor for a Ruby raise to orphan. Every semaphore is released
+ * before anything is logged, so nothing is still held if Debug() throws.
+ * A return of CEILING means the probe hit its own limit and the true headroom
+ * is at least that much.
+ *
+ * It briefly drives the pool to empty by design, which is why this is a
+ * diagnostic entry point and not something a game script may call. */
+RB_METHOD_GUARD(mkxpVitaKernelObjectHeadroom) {
+    RB_UNUSED_PARAM;
+
+    /* An order of magnitude above the roughly 32 firmware sync objects
+     * and 2 KiB of the rgss thread's 8 MiB stack
+     * High enough that a healthy run is obviously healthy, low
+     * enough that the probe cannot itself be what exhausts the heap. */
+    static const int CEILING = 512;
+    SDL_sem *held[CEILING];
+    int count = 0;
+    char line[128];
+
+    while (count < CEILING) {
+        SDL_sem *sem = SDL_CreateSemaphore(1);
+
+        if (!sem)
+            break;
+
+        held[count++] = sem;
+    }
+
+    for (int i = 0; i < count; ++i)
+        SDL_DestroySemaphore(held[i]);
+
+    snprintf(line, sizeof(line),
+             "vita-kernel-objects: sema_headroom=%d%s", count,
+             count == CEILING ? " (probe ceiling)" : "");
+    Debug() << line;
+
+    return INT2NUM(count);
+}
+RB_METHOD_GUARD_END
+#endif
+
 RB_METHOD_GUARD(mkxpReloadPathCache) {
     RB_UNUSED_PARAM;
     
@@ -600,7 +809,7 @@ RB_METHOD(mkxpFileExists) {
     return Qfalse;
 }
 
-RB_METHOD(mkxpSetDefaultFontFamily) {
+RB_METHOD_GUARD(mkxpSetDefaultFontFamily) {
     RB_UNUSED_PARAM;
     
     VALUE familyV;
@@ -612,35 +821,60 @@ RB_METHOD(mkxpSetDefaultFontFamily) {
     
     return Qnil;
 }
+RB_METHOD_GUARD_END
+
+#if RAPI_FULL >= 190
+static VALUE mkxpUTF8String(VALUE str) {
+    // Untagged legacy byte strings still use detection; explicit Ruby tags win.
+    if (rb_enc_get_index(str) == rb_ascii8bit_encindex() &&
+        !rb_enc_str_asciionly_p(str)) {
+        char charset[64];
+        {
+            std::string bytes(RSTRING_PTR(str), RSTRING_LEN(str));
+            std::string detected = Encoding::getCharset(bytes);
+            if (detected.size() >= sizeof(charset))
+                throw Exception(Exception::MKXPError, "Encoding name too long");
+            memcpy(charset, detected.c_str(), detected.size() + 1);
+        }
+        // No C++ owners may survive a Ruby call that can raise.
+        int encoding = rb_enc_find_index(charset);
+        if (encoding < 0)
+            rb_raise(rb_eArgError, "Unknown string encoding: %s", charset);
+        str = rb_str_dup(str);
+        rb_enc_associate_index(str, encoding);
+    }
+    return rb_str_encode(str, rb_enc_from_encoding(rb_utf8_encoding()), 0, Qnil);
+}
+#endif
 
 RB_METHOD_GUARD(mkxpStringToUTF8) {
     RB_UNUSED_PARAM;
-    
+
     rb_check_argc(argc, 0);
-    
+#if RAPI_FULL >= 190
+    return mkxpUTF8String(self);
+#else
     std::string ret(RSTRING_PTR(self), RSTRING_LEN(self));
     ret = Encoding::convertString(ret);
-    
     return rb_utf8_str_new(ret.c_str(), ret.length());
+#endif
 }
 RB_METHOD_GUARD_END
 
 RB_METHOD_GUARD(mkxpStringToUTF8Bang) {
     RB_UNUSED_PARAM;
-    
+
     rb_check_argc(argc, 0);
-    
+#if RAPI_FULL >= 190
+    rb_check_frozen(self);
+    return rb_str_replace(self, mkxpUTF8String(self));
+#else
     std::string ret(RSTRING_PTR(self), RSTRING_LEN(self));
     ret = Encoding::convertString(ret);
-    
     rb_str_resize(self, ret.length());
     memcpy(RSTRING_PTR(self), ret.c_str(), RSTRING_LEN(self));
-    
-#if RAPI_FULL >= 190
-    rb_funcall(self, rb_intern("force_encoding"), 1, rb_enc_from_encoding(rb_utf8_encoding()));
-#endif
-    
     return self;
+#endif
 }
 RB_METHOD_GUARD_END
 
@@ -722,47 +956,59 @@ RB_METHOD_GUARD(mkxpParseCSV) {
 }
 RB_METHOD_GUARD_END
 
+/* config.cpp. The header does not declare it; CFG[] has to use this reader
+ * rather than parse the file again. A corrupt file becomes an empty object. */
+json5pp::value readConfFile(const char *path);
+
 json5pp::value loadUserSettings() {
-    json5pp::value ret;
-    VALUE cpath = rb_utf8_str_new_cstr(shState->config().userConfPath.c_str());
-    
-    if (rb_funcall(rb_cFile, rb_intern("exists?"), 1, cpath) == Qtrue) {
-        VALUE f = rb_funcall(rb_cFile, rb_intern("open"), 2, cpath, rb_str_new("r", 1));
-        VALUE data = rb_funcall(f, rb_intern("read"), 0);
-        rb_funcall(f, rb_intern("close"), 0);
-        ret = json5pp::parse5(RSTRING_PTR(data));
-    }
-    
-    if (!ret.is_object())
-        ret = json5pp::object({});
-    
-    return ret;
+    return readConfFile(shState->config().userConfPath.c_str());
 }
 
 void saveUserSettings(json5pp::value &settings) {
     VALUE cpath = rb_utf8_str_new_cstr(shState->config().userConfPath.c_str());
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    VALUE bytes;
+    int state = 0;
+    {
+        std::string text = settings.stringify5(json5pp::rule::space_indent<>());
+        bytes = rb_protect([](VALUE arg) -> VALUE {
+            const std::string *text = reinterpret_cast<const std::string *>(arg);
+            return rb_utf8_str_new(text->data(), text->size());
+        }, reinterpret_cast<VALUE>(&text), &state);
+    }
+    // Ruby longjmp cannot skip the C++ string destructor.
+    if (state)
+        rb_jump_tag(state);
+    rb_funcall(rb_const_get(rb_cObject, rb_intern("VitaSettingsFile")),
+               rb_intern("write_bytes"), 2, cpath, bytes);
+#else
     VALUE f = rb_funcall(rb_cFile, rb_intern("open"), 2, cpath, rb_str_new("w", 1));
     rb_funcall(f, rb_intern("write"), 1, rb_utf8_str_new_cstr(settings.stringify5(json5pp::rule::space_indent<>()).c_str()));
     rb_funcall(f, rb_intern("close"), 0);
+#endif
 }
 
-RB_METHOD(mkxpGetJSONSetting) {
+RB_METHOD_GUARD(mkxpGetJSONSetting) {
     RB_UNUSED_PARAM;
-    
+
     VALUE sname;
     rb_scan_args(argc, argv, "1", &sname);
     SafeStringValue(sname);
-    
-    auto settings = loadUserSettings();
-    auto &s = settings.as_object();
-    
-    if (s[RSTRING_PTR(sname)].is_null()) {
-        return json2rb(shState->config().raw.as_object()[RSTRING_PTR(sname)]);
-    }
-    
-    return json2rb(s[RSTRING_PTR(sname)]);
-    
+    const char *key = RSTRING_PTR(sname);
+
+    json5pp::value settings = loadUserSettings();
+    const json5pp::value::object_type &user = settings.as_object();
+    json5pp::value::object_type::const_iterator it = user.find(key);
+    if (it != user.end() && !it->second.is_null())
+        return json2rb(it->second);
+
+    const json5pp::value::object_type &raw = shState->config().raw.as_object();
+    json5pp::value::object_type::const_iterator rit = raw.find(key);
+    if (rit == raw.end())
+        return Qnil;
+    return json2rb(rit->second);
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD_GUARD(mkxpSetJSONSetting) {
     RB_UNUSED_PARAM;
@@ -945,7 +1191,38 @@ bool evalScript(VALUE string, const char *filename)
 
 #define SCRIPT_SECTION_FMT (rgssVer >= 3 ? "{%04ld}" : "Section%03ld")
 
+/* A script-pack row is [id, name, compressed bytes]. Anything else used to
+ * be skipped here and then dereferenced during eval. */
+static bool scriptPackEntry(VALUE script, VALUE *name, VALUE *payload)
+{
+    if (!RB_TYPE_P(script, RUBY_T_ARRAY) || RARRAY_LEN(script) < 3)
+        return false;
+    *name = rb_ary_entry(script, 1);
+    *payload = rb_ary_entry(script, 2);
+    return RB_TYPE_P(*name, RUBY_T_STRING) && RB_TYPE_P(*payload, RUBY_T_STRING);
+}
+
+/* The visible filename is exactly the bytes written. snprintf's return is
+ * the length it wanted, which used to walk off a 512-byte stack buffer. */
+static bool scriptVisibleName(bool useNames, long index, VALUE name, std::string *out)
+{
+    char prefix[32];
+    int n = useNames
+        ? snprintf(prefix, sizeof(prefix), "%03ld:", index)
+        : snprintf(prefix, sizeof(prefix), SCRIPT_SECTION_FMT, index);
+    if (n < 0 || n >= (int)sizeof(prefix))
+        return false;
+    out->assign(prefix, n);
+    if (useNames)
+        out->append(RSTRING_PTR(name), RSTRING_LEN(name));
+    return true;
+}
+
 static void runRMXPScripts(BacktraceData &btData) {
+    BootProfile::Scope bootScripts(BootProfile::Scripts);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    vita_glue_trace("trace: runRMXPScripts BEGIN");
+#endif
     const Config &conf = shState->rtData().config;
     const std::string &scriptPack = conf.game.scripts;
     
@@ -984,48 +1261,53 @@ static void runRMXPScripts(BacktraceData &btData) {
     
     for (long i = 0; i < scriptCount; ++i) {
         VALUE script = rb_ary_entry(scriptArray, i);
-        
-        if (!RB_TYPE_P(script, RUBY_T_ARRAY))
-            continue;
-        
-        VALUE scriptName = rb_ary_entry(script, 1);
-        VALUE scriptString = rb_ary_entry(script, 2);
-        
+        VALUE scriptName = Qnil;
+        VALUE scriptString = Qnil;
+
+        if (!scriptPackEntry(script, &scriptName, &scriptString)) {
+            showMsg("Failed to read script data");
+            return;
+        }
+
         int result = Z_OK;
         unsigned long bufferLen;
-        
+
         while (true) {
             unsigned char *bufferPtr = reinterpret_cast<unsigned char *>(
                                                                          const_cast<char *>(decodeBuffer.c_str()));
             const unsigned char *sourcePtr =
             reinterpret_cast<const unsigned char *>(RSTRING_PTR(scriptString));
-            
+
             bufferLen = decodeBuffer.length();
-            
+
             result = uncompress(bufferPtr, &bufferLen, sourcePtr,
                                 RSTRING_LEN(scriptString));
-            
+
             bufferPtr[bufferLen] = '\0';
-            
+
             if (result != Z_BUF_ERROR)
                 break;
-            
+
             decodeBuffer.resize(decodeBuffer.size() * 2);
         }
-        
+
         if (result != Z_OK) {
             static char buffer[256];
             snprintf(buffer, sizeof(buffer), "Error decoding script %ld: '%s'", i,
                      RSTRING_PTR(scriptName));
-            
+
             showMsg(buffer);
-            
-            break;
+
+            return;
         }
-        
+
         rb_ary_store(script, 3, rb_utf8_str_new_cstr(decodeBuffer.c_str()));
     }
     
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    vita_glue_trace("trace: script pack decoded; preload BEGIN");
+#endif
+    bootScripts.finish();
     /* Execute preloaded scripts */
     for (std::vector<std::string>::const_iterator i = conf.preloadScripts.begin();
          i != conf.preloadScripts.end(); ++i)
@@ -1045,22 +1327,30 @@ static void runRMXPScripts(BacktraceData &btData) {
                 break;
             
             VALUE script = rb_ary_entry(scriptArray, i);
-            VALUE scriptDecoded = rb_ary_entry(script, 3);
+            VALUE scriptNameV = Qnil;
+            VALUE scriptDecoded = Qnil;
+            if (!RB_TYPE_P(script, RUBY_T_ARRAY)) {
+                showMsg("Failed to read script data");
+                return;
+            }
+            scriptNameV = rb_ary_entry(script, 1);
+            scriptDecoded = rb_ary_entry(script, 3);
+            if (!RB_TYPE_P(scriptNameV, RUBY_T_STRING) ||
+                !RB_TYPE_P(scriptDecoded, RUBY_T_STRING)) {
+                showMsg("Failed to read script data");
+                return;
+            }
             VALUE string =
             newStringUTF8(RSTRING_PTR(scriptDecoded), RSTRING_LEN(scriptDecoded));
-            
-            VALUE fname;
-            const char *scriptName = RSTRING_PTR(rb_ary_entry(script, 1));
-            char buf[512];
-            int len;
-            
-            if (conf.useScriptNames)
-                len = snprintf(buf, sizeof(buf), "%03ld:%s", i, scriptName);
-            else
-                len = snprintf(buf, sizeof(buf), SCRIPT_SECTION_FMT, i);
-            
-            fname = newStringUTF8(buf, len);
-            btData.scriptNames.insert(buf, scriptName);
+
+            std::string visible;
+            if (!scriptVisibleName(conf.useScriptNames, i, scriptNameV, &visible)) {
+                showMsg("Failed to read script data");
+                return;
+            }
+            VALUE fname = newStringUTF8(visible.data(), (long)visible.size());
+            btData.scriptNames.insert(visible,
+                std::string(RSTRING_PTR(scriptNameV), RSTRING_LEN(scriptNameV)));
             
             
             // if the script name starts with |s|, only execute
@@ -1103,10 +1393,87 @@ static void runRMXPScripts(BacktraceData &btData) {
     }
 }
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* At most this many backtrace entries reach the panel and last-error.txt. A
+ * runaway recursion produces thousands and the reader wants the top of the
+ * stack; textpanel::formatScriptError counts the rest rather than dropping
+ * them silently, and the log above already has every one. */
+static const size_t kVitaPanelBacktrace = 32;
+
+/* A Ruby value as well-formed, bounded UTF-8, or "" for anything that is not
+ * a String. RSTRING_LEN is the only length that counts: a Ruby String may
+ * hold NUL bytes, and a game's exception message may be Shift_JIS. Nothing
+ * downstream of this reads a raw Ruby pointer. */
+static std::string vitaPanelText(VALUE value)
+{
+    if (!RB_TYPE_P(value, RUBY_T_STRING))
+        return std::string();
+
+    return textpanel::sanitizeUtf8(RSTRING_PTR(value),
+                                   (size_t)RSTRING_LEN(value));
+}
+
+/* "Section001:42: in `foo'" -> ("Section001", "42"), then through the
+ * script-name table so the reader sees the name the game gave the script
+ * rather than the one Ruby invented.
+ *
+ * Same two colons the stock parser below finds, read rather than overwritten:
+ * stock walks back from the end writing NUL terminators into the Ruby
+ * string's own bytes, which is fine on a desktop and is a mutation of a live
+ * object on the frame where this process is dying. An absent or malformed
+ * location leaves both fields empty, and formatScriptError prints just the
+ * class name -- better than stock's "Script '?' line ?". */
+static void vitaPanelLocation(VALUE bt0, const BacktraceData &btData,
+                              std::string &nameOut, std::string &lineOut)
+{
+    nameOut.clear();
+    lineOut.clear();
+
+    if (!RB_TYPE_P(bt0, RUBY_T_STRING))
+        return;
+
+    const char *s = RSTRING_PTR(bt0);
+    const long n = RSTRING_LEN(bt0);
+    if (!s || n <= 0)
+        return;
+
+    long last = -1, prev = -1;
+    for (long i = n - 1; i >= 0; --i) {
+        if (s[i] != ':')
+            continue;
+        if (last < 0) {
+            last = i;
+            continue;
+        }
+        prev = i;
+        break;
+    }
+
+    if (last < 0)
+        nameOut.assign(s, (size_t)n);            /* no colon: all name */
+    else if (prev < 0)
+        nameOut.assign(s, (size_t)last);         /* one colon: no line number */
+    else {
+        nameOut.assign(s, (size_t)prev);
+        lineOut.assign(s + prev + 1, (size_t)(last - prev - 1));
+    }
+
+    nameOut = btData.scriptNames.value(nameOut, nameOut);
+    nameOut = textpanel::sanitizeUtf8(nameOut.data(), nameOut.size());
+    lineOut = textpanel::sanitizeUtf8(lineOut.data(), lineOut.size());
+}
+#endif
+
 static void showExc(VALUE exc, const BacktraceData &btData) {
     VALUE bt = rb_funcall2(exc, rb_intern("backtrace"), 0, NULL);
     VALUE msg = rb_funcall2(exc, rb_intern("message"), 0, NULL);
-    VALUE bt0 = rb_ary_entry(bt, 0);
+    /* A backtrace is not guaranteed: Exception#backtrace is nil until the
+     * exception has been raised, and `raise exc, msg, []` leaves it an empty
+     * array. Stock reads entry 0 either way and dereferences it below, which
+     * on a Vita is a silent process kill with nothing in the log -- the exact
+     * failure this reporting path exists to prevent. */
+    const long btlen = RB_TYPE_P(bt, RUBY_T_ARRAY) ? RARRAY_LEN(bt) : 0;
+    VALUE bt0 = btlen > 0 ? rb_ary_entry(bt, 0) : Qnil;
     VALUE name = rb_class_path(rb_obj_class(exc));
     
     VALUE ds = rb_sprintf("%" PRIsVALUE ": %" PRIsVALUE " (%" PRIsVALUE ")",
@@ -1117,7 +1484,7 @@ static void showExc(VALUE exc, const BacktraceData &btData) {
     RSTRING_PTR(bt0), RSTRING_PTR(exc), RSTRING_PTR(name));
 #endif
     /* omit "useless" last entry (from ruby:1:in `eval') */
-    for (long i = 1, btlen = RARRAY_LEN(bt) - 1; i < btlen; ++i)
+    for (long i = 1, btend = btlen - 1; i < btend; ++i)
         rb_str_catf(ds, "\n\tfrom %" PRIsVALUE,
 #if RAPI_MAJOR >= 2
                     rb_ary_entry(bt, i));
@@ -1125,9 +1492,46 @@ static void showExc(VALUE exc, const BacktraceData &btData) {
     RSTRING_PTR(rb_ary_entry(bt, i)));
 #endif
     Debug() << StringValueCStr(ds);
-    
-    char *s = RSTRING_PTR(bt0);
-    
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* The device path ends here, before the location parsing below touches a
+     * single raw pointer. Everything the report needs is extracted nil-safely
+     * into one structure, formatted once, and used three times: the log, the
+     * breadcrumb file the launcher reads on the next boot to say why the game
+     * ended, and the panel the player is looking at right now. One text, so what a bug report quotes and what the screen
+     * showed cannot disagree. */
+    {
+        textpanel::ScriptError error;
+
+        error.className = vitaPanelText(name);
+        error.message = vitaPanelText(msg);
+        vitaPanelLocation(bt0, btData, error.scriptName, error.line);
+
+        /* Same window stock's own loop uses: entry 0 is the location already
+         * in the heading, and the last entry is `from ruby:1:in 'eval'`. */
+        for (long i = 1, btend = btlen - 1;
+             i < btend && error.backtrace.size() < kVitaPanelBacktrace; ++i) {
+            std::string entry = vitaPanelText(rb_ary_entry(bt, i));
+            if (!entry.empty())
+                error.backtrace.push_back(entry);
+        }
+
+        const std::string text =
+            textpanel::formatScriptError(error, kVitaPanelBacktrace);
+        const std::string title = textpanel::formatOneLine(error);
+
+        vitaWriteLastError(VITA_FATAL_KIND_SCRIPT, title.c_str(), text.c_str());
+        vitaLogMessage("script-error: ", text.c_str());
+        vitaShowPanel("Script error", text, true);
+        return;
+    }
+#endif
+
+    /* Mutable, because the parser below writes its terminators in place -- and
+     * a well-formed placeholder, so an absent backtrace costs the reader the
+     * script name and line and nothing else. */
+    char noLocation[] = "?:?: ";
+    char *s = NIL_P(bt0) ? noLocation : RSTRING_PTR(bt0);
+
     char line[16];
     std::string file(512, '\0');
     
@@ -1172,6 +1576,7 @@ static void showExc(VALUE exc, const BacktraceData &btData) {
 }
 
 static void mriBindingExecute() {
+    BootProfile::Scope bootRuby(BootProfile::Ruby);
     Config &conf = shState->rtData().config;
     
 #if RAPI_MAJOR >= 2
@@ -1181,9 +1586,15 @@ static void mriBindingExecute() {
     int argc = 0;
     char **argv = 0;
     ruby_sysinit(&argc, &argv);
-    
+
     RUBY_INIT_STACK;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    vita_glue_trace("trace: calling ruby_init (mriBindingExecute)");
+#endif
     ruby_init();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    vita_glue_trace("trace: ruby_init returned");
+#endif
     
     std::vector<const char*> rubyArgsC{"mkxp-z"};
     rubyArgsC.push_back("-e ");
@@ -1252,6 +1663,7 @@ static void mriBindingExecute() {
 #endif
 #endif
     
+    bootRuby.finish();
     topSelf = rgssVer == 1 ? Qnil : rb_eval_string("self");
     
     VALUE rbArgv = rb_get_argv();
@@ -1263,6 +1675,10 @@ static void mriBindingExecute() {
     
     VALUE lpaths = rb_gv_get(":");
     rb_ary_clear(lpaths);
+#ifdef __vita__
+    /* Pure-Ruby wrappers accompanying the statically linked extensions. */
+    rb_ary_push(lpaths, rb_utf8_str_new_cstr("app0:/ruby"));
+#endif
     
 #if defined(MKXPZ_BUILD_XCODE) && RAPI_MAJOR >= 2
     std::string resPath = mkxp_fs::getResourcePath();
@@ -1289,7 +1705,27 @@ static void mriBindingExecute() {
     shState->setBindingData(&rbData);
     BacktraceData btData;
     
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* The interpreter is up and the load paths are set; nothing below this
+     * point runs before the first collection. Absent the marker there is no
+     * tracepoint object and no hook at all, so a normal run pays nothing --
+     * not even a disabled call per GC. The tracepoint is a Ruby object with
+     * no other reference, so it is pinned for the life of the process
+     * rather than left for the collector it is watching to free. */
+    if (vita_glue_gc_memory_enabled()) {
+        VALUE tp = rb_tracepoint_new(0, RUBY_INTERNAL_EVENT_GC_END_SWEEP,
+                                     vitaGcEndSweep, 0);
+        rb_gc_register_mark_object(tp);
+        rb_tracepoint_enable(tp);
+        vita_glue_trace("trace: GC free-memory tracepoint enabled");
+    }
+
+    vita_glue_trace("trace: mriBindingInit BEGIN");
+#endif
     mriBindingInit();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    vita_glue_trace("trace: mriBindingInit END");
+#endif
     
     std::string &customScript = conf.customScript;
     if (!customScript.empty())
