@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/schellingb/TinySoundFont",
+  "commit": "853a0a171759f1ddba0de1442133a75912bbeffa",
+  "license": "tsf.h: MIT; tml.h: Zlib; LICENSE is extracted from both verified headers, no third download",
+  "files": {
+    "tsf.h": "70d55963c98f60ebb81518eaa1f25d46888d5180eb5f5289fd6b74ffc177d197",
+    "tml.h": "93257db259e0efb2ea2037d7157841bec8cb4a2d7986286e43c8090705326546"
+  }
+}

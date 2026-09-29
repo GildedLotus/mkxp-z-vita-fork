@@ -1,0 +1,7 @@
+[
+  {"name": "vitagl", "repo": "https://github.com/Rinnegatamante/vitaGL", "commit": "464876a79cdd00650bb0eb9629b85d81f9908fd8", "licence": "LGPL-3.0"},
+  {"name": "vitashark", "repo": "https://github.com/Rinnegatamante/vitaShaRK", "commit": "df24065e65098b2d1ac533760109ad4367573f28", "licence": "LGPL-3.0"},
+  {"name": "shacccgext", "repo": "https://github.com/bythos14/SceShaccCgExt", "commit": "fb0e9d338525b067f3679ab33571323336493cca", "licence": "GPL-3.0"},
+  {"name": "mathneon", "repo": "https://github.com/Rinnegatamante/math-neon", "commit": "0faab814782c071ff4015527f1ca955ab1ccc470", "licence": "MIT"},
+  {"name": "taihen", "repo": "https://github.com/yifanlu/taiHen", "commit": "309b3800bcb8ebbd5e4f5e5e920af3da3590b829", "licence": "MIT"}
+]
