@@ -41,6 +41,12 @@ struct GlobalIBO
 	GlobalIBO()
 	{
 		ibo = IBO::gen();
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* Reserve before any draw: live growth waits on the buffer's last use.
+		 * Keep the strict ensureSize limit; IBO wrappers account the object
+		 * and all 131064 storage bytes in GPUBudget. */
+		ensureSize((INDEX_T_MAX - 1) / 6);
+#endif
 	}
 
 	~GlobalIBO()
