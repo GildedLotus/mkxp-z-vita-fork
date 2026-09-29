@@ -28,6 +28,14 @@ static int SDL_RWopsCloseNoop(SDL_RWops *ops) {
 	return 0;
 }
 
+/* How many further Sound_Decode calls one fillBuffer will make to complete a
+ * short read (see joinShortRead). Ogg Vorbis needs exactly one. The bound is
+ * here so that a source handing over a few bytes at a time cannot turn a
+ * single buffer fill into thousands of decoder calls; reaching it costs
+ * nothing but a partly filled AL buffer, and the rest follows on the next
+ * call. */
+#define SDLSOUND_JOIN_TRIES 16
+
 struct SDLSoundSource : ALDataSource
 {
 	Sound_Sample *sample;
@@ -39,13 +47,22 @@ struct SDLSoundSource : ALDataSource
 	ALenum alFormat;
 	ALsizei alFreq;
 
+	/* Scratch for joining short reads into one buffer, allocated the first
+	 * time SDL_sound actually raises EAGAIN. A game whose BGM, BGS and ME are
+	 * all WAV never pays for it: the WAV decoder knows how many bytes are
+	 * left and ends on EOF instead. */
+	uint8_t *joinBuf;
+	uint32_t joinSize;
+
 	SDLSoundSource(SDL_RWops &ops,
 	               const char *extension,
 	               uint32_t maxBufSize,
 	               bool looped)
 	    : srcOps(ops),
 	      unclosableOps(ops),
-	      looped(looped)
+	      looped(looped),
+	      joinBuf(0),
+	      joinSize(0)
 	{
 		/* A copy of srcOps with a no-op close function,
 		 * so we can reuse the ops if we need to change the format. */
@@ -102,26 +119,94 @@ struct SDLSoundSource : ALDataSource
 	{
 		Sound_FreeSample(sample);
 		SDL_RWclose(&srcOps);
+		SDL_free(joinBuf);
+	}
+
+	/* SDL_sound raises SOUND_SAMPLEFLAG_EAGAIN whenever a read came up short
+	 * of a full buffer. That is neither an error nor the end of the stream:
+	 * it means "that is all there was this time, ask again". Ogg Vorbis has
+	 * no way of knowing how much is left, so stb_vorbis flags every short
+	 * read, which in practice is the final buffer of every Ogg stream
+	 *
+	 *
+	 * Sound_Decode always decodes to the front of sample->buffer, so asking
+	 * again overwrites what it has just handed over. Copy the short result
+	 * out first and append what the following decodes deliver, so one AL
+	 * buffer still carries one bufferful of audio and the EOF that ends the
+	 * stream arrives in the same call as the samples that precede it.
+	 *
+	 * Returns the total byte count and points 'data' at those bytes. */
+	uint32_t joinShortRead(uint32_t decoded, const void **data)
+	{
+		/* Sound_Decode never returns more than the buffer size the sample
+		 * was created with: SDL_sound sizes the conversion buffer from the
+		 * same number (SDL_sound.c, init_sample). */
+		const uint32_t capacity = sample->buffer_size;
+
+		if (decoded == 0 || decoded >= capacity)
+			return decoded;
+
+		if (joinSize < capacity)
+		{
+			SDL_free(joinBuf);
+			joinBuf = (uint8_t*) SDL_malloc(capacity);
+			joinSize = joinBuf ? capacity : 0;
+		}
+
+		/* Out of memory: those bytes are real audio either way, so queue
+		 * them on their own rather than drop them. */
+		if (!joinBuf)
+			return decoded;
+
+		SDL_memcpy(joinBuf, sample->buffer, decoded);
+		*data = joinBuf;
+
+		for (int tries = 0; tries < SDLSOUND_JOIN_TRIES; ++tries)
+		{
+			if (decoded >= capacity)
+				break;
+
+			if (!(sample->flags & SOUND_SAMPLEFLAG_EAGAIN))
+				break;
+
+			/* Sound_Decode refuses to run again after either of these, and
+			 * both are for the caller to answer. */
+			if (sample->flags & (SOUND_SAMPLEFLAG_EOF | SOUND_SAMPLEFLAG_ERROR))
+				break;
+
+			uint32_t more = Sound_Decode(sample);
+
+			if (more > capacity - decoded)
+				more = capacity - decoded;
+
+			if (more == 0)
+				break;
+
+			SDL_memcpy(joinBuf + decoded, sample->buffer, more);
+			decoded += more;
+		}
+
+		return decoded;
 	}
 
 	Status fillBuffer(AL::Buffer::ID alBuffer)
 	{
 		uint32_t decoded = Sound_Decode(sample);
+		const void *data = sample->buffer;
 
 		if (sample->flags & SOUND_SAMPLEFLAG_EAGAIN)
-		{
-			/* Try to decode one more time on EAGAIN */
-			decoded = Sound_Decode(sample);
-
-			/* Give up */
-			if (sample->flags & SOUND_SAMPLEFLAG_EAGAIN)
-				return ALDataSource::Error;
-		}
+			decoded = joinShortRead(decoded, &data);
 
 		if (sample->flags & SOUND_SAMPLEFLAG_ERROR)
 			return ALDataSource::Error;
 
-		AL::Buffer::uploadData(alBuffer, alFormat, sample->buffer, decoded, alFreq);
+		/* Still nothing after the retries, and the stream has not ended:
+		 * the source is stuck. Give up, as stock mkxp-z did, rather than
+		 * queue empty buffers forever. */
+		if (decoded == 0 && (sample->flags & SOUND_SAMPLEFLAG_EAGAIN))
+			return ALDataSource::Error;
+
+		AL::Buffer::uploadData(alBuffer, alFormat, data, decoded, alFreq);
 
 		if (sample->flags & SOUND_SAMPLEFLAG_EOF)
 		{

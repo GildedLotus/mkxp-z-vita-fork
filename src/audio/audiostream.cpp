@@ -73,6 +73,28 @@ AudioStream::~AudioStream()
 	SDL_DestroyMutex(streamMut);
 }
 
+/* Scoped ownership of the stream lock. play() opens decoders and copies
+ * filenames while holding it, and those allocate: the old error path
+ * unlocked only for the engine's Exception, so a std::bad_alloc from the
+ * open escaped with the mutex held and every later lockStream() on this
+ * track -- ME watcher, fade threads, a fade's join at shutdown -- blocked
+ * forever. */
+struct StreamLockGuard
+{
+	AudioStream &stream;
+
+	StreamLockGuard(AudioStream &stream)
+	    : stream(stream)
+	{
+		stream.lockStream();
+	}
+
+	~StreamLockGuard()
+	{
+		stream.unlockStream();
+	}
+};
+
 void AudioStream::play(const std::string &filename,
                        int volume,
                        int pitch,
@@ -80,7 +102,7 @@ void AudioStream::play(const std::string &filename,
 {
 	finiFadeOutInt();
 
-	lockStream();
+	StreamLockGuard guard(*this);
 
 	float _volume = clamp<int>(volume, 0, 100) / 100.0f;
 	float _pitch  = clamp<int>(pitch, 50, 150) / 100.0f;
@@ -94,7 +116,6 @@ void AudioStream::play(const std::string &filename,
 	&&  _pitch   == current.pitch
 	&&  (sState == ALStream::Playing || sState == ALStream::Paused))
 	{
-		unlockStream();
 		return;
 	}
 
@@ -106,7 +127,6 @@ void AudioStream::play(const std::string &filename,
 	{
 		setVolume(Base, _volume);
 		current.volume = _volume;
-		unlockStream();
 		return;
 	}
 
@@ -115,17 +135,9 @@ void AudioStream::play(const std::string &filename,
 
 	if (diffFile || sState == ALStream::Closed)
 	{
-		try
-		{
-			/* This will throw on errors while
-			 * opening the data source */
-			stream.open(filename);
-		}
-		catch (const Exception &e)
-		{
-			unlockStream();
-			throw e;
-		}
+		/* This will throw on errors while
+		 * opening the data source */
+		stream.open(filename);
 	} else {
 		switch (sState)
 		{
@@ -152,8 +164,6 @@ void AudioStream::play(const std::string &filename,
 		stream.play(offset);
 	else
 		noResumeStop = false;
-
-	unlockStream();
 }
 
 void AudioStream::stop()

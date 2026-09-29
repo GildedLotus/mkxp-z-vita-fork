@@ -25,6 +25,8 @@
 #include "al-util.h"
 #include "sdl-util.h"
 
+#include <atomic>
+#include <set>
 #include <string>
 #include <SDL_rwops.h>
 
@@ -60,6 +62,7 @@ struct ALStream
 	 * (it just hasn't started yet) */
 	AtomicFlag streamInited;
 	AtomicFlag sourceExhausted;
+	AtomicFlag threadFinished;
 
 	AtomicFlag threadTermReq;
 
@@ -71,8 +74,31 @@ struct ALStream
 	AL::Source::ID alSrc;
 	AL::Buffer::ID alBuf[STREAM_BUFS];
 
-	uint64_t procFrames;
-	AL::Buffer::ID lastBuf;
+	/* Frames the device has already finished with: the fixed part of the
+	 * offset queryOffset() reports, and the only member of this class two
+	 * threads touch without a lock between them.
+	 *
+	 * stopStream() and startStream() write it with the stream thread joined
+	 * or not yet created, and every caller of those holds AudioStream's
+	 * stream lock, which is also what queryOffset() is read under. The
+	 * stream thread is the gap: streamData() adds each retired buffer's
+	 * frame count and resets the counter at a loop point, and it takes no
+	 * lock at all.
+	 *
+	 * Atomic so that what the reader gets is a value that was really
+	 * stored. This is a 32 bit ARM: a plain uint64_t is two instructions
+	 * either way, so an unsynchronised read can splice the low half of one
+	 * value onto the high half of another, and at 22050 Hz a torn high word
+	 * is an offset wrong by tens of thousands of seconds. Relaxed
+	 * throughout -- nothing is published through this counter except the
+	 * counter itself. */
+	std::atomic<uint64_t> procFrames;
+	/* Per alBuf slot: that buffer ends at the loop point, so its retirement
+	 * resets procFrames. One slot per buffer, not one "last" buffer: a loop
+	 * shorter than a buffer makes every queued buffer a wrap buffer, and a
+	 * single mark was overwritten before the marked buffer retired
+	 * Stream thread only, and reset before it starts. */
+	bool wrapMark[STREAM_BUFS];
 
 	struct
 	{
@@ -102,12 +128,22 @@ struct ALStream
 	double queryOffset();
 	bool queryNativePitch();
 
+	/* Forget which files have already reported a decode failure, so the
+	 * next attempt at each of them is reported once more. Audio::reset()
+	 * calls this: Audio.__reset__ starts the game's audio over. */
+	static void forgetDecodeFailures();
+
 private:
+	/* Filenames openSource() has already complained about. See the
+	 * definition in alstream.cpp for why it is one record for all
+	 * streams and why it needs no lock. */
+	static std::set<std::string> reportedDecodeFailures;
+
 	void closeSource();
 	void openSource(const std::string &filename);
 
 	void stopStream();
-	void startStream(double offset);
+	bool startStream(double offset);
 	void pauseStream();
 	void resumeStream();
 

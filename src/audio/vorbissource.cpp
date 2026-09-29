@@ -50,6 +50,24 @@ static ov_callbacks OvCallbacks =
     vfTell
 };
 
+static bool parseLoopValue(const char *text, int length, uint32_t &value)
+{
+	if (length <= 0)
+		return false;
+	uint32_t parsed = 0;
+	for (int i = 0; i < length; ++i)
+	{
+		if (text[i] < '0' || text[i] > '9')
+			return false;
+		uint32_t digit = text[i] - '0';
+		if (parsed > (UINT32_MAX - digit) / 10)
+			return false;
+		parsed = parsed * 10 + digit;
+	}
+	value = parsed;
+	return true;
+}
+
 
 struct VorbisSource : ALDataSource
 {
@@ -117,32 +135,31 @@ struct VorbisSource : ALDataSource
 			return;
 
 		/* Try to extract loop info */
+		bool haveStart = false, haveLength = false, validTags = true;
 		for (int i = 0; i < vf.vc->comments; ++i)
 		{
-			char *comment = vf.vc->user_comments[i];
-			char *sep = strstr(comment, "=");
-
-			/* No '=' found */
-			if (!sep)
-				continue;
-
-			/* Empty value */
-			if (!*(sep+1))
-				continue;
-
-			*sep = '\0';
-
-			if (!strcmp(comment, "LOOPSTART"))
-				loop.start = strtol(sep+1, 0, 10);
-
-			if (!strcmp(comment, "LOOPLENGTH"))
-				loop.length = strtol(sep+1, 0, 10);
-
-			*sep = '=';
+			const char *comment = vf.vc->user_comments[i];
+			int length = vf.vc->comment_lengths[i];
+			if (length >= 10 && !memcmp(comment, "LOOPSTART=", 10))
+			{
+				if (haveStart || !parseLoopValue(comment + 10, length - 10, loop.start))
+					validTags = false;
+				haveStart = true;
+			}
+			if (length >= 11 && !memcmp(comment, "LOOPLENGTH=", 11))
+			{
+				if (haveLength || !parseLoopValue(comment + 11, length - 11, loop.length))
+					validTags = false;
+				haveLength = true;
+			}
 		}
 
-		loop.end = loop.start + loop.length;
-		loop.valid = (loop.start && loop.length);
+		ogg_int64_t total = ov_pcm_total(&vf, -1);
+		loop.valid = validTags && haveStart && haveLength && loop.length > 0 &&
+		             total > 0 && loop.start < total && loop.length <= total - loop.start &&
+		             loop.length <= UINT32_MAX - loop.start;
+		if (loop.valid)
+			loop.end = loop.start + loop.length;
 	}
 
 	~VorbisSource()
@@ -166,12 +183,15 @@ struct VorbisSource : ALDataSource
 
 		currentFrame = lround(seconds * info.rate);
 
-		if (loop.valid && currentFrame > loop.end)
+		if (loop.valid && currentFrame >= loop.end)
 			currentFrame = loop.start;
 
 		/* If seeking fails, just seek back to start */
 		if (ov_pcm_seek(&vf, currentFrame) != 0)
+		{
 			ov_raw_seek(&vf, 0);
+			currentFrame = 0;
+		}
 	}
 
 	Status fillBuffer(AL::Buffer::ID alBuffer)
@@ -188,12 +208,12 @@ struct VorbisSource : ALDataSource
 
 		if (loop.valid)
 		{
-			int tilLoopEnd = loop.end * info.frameSize;
-
-			canRead = std::min(availBuf, tilLoopEnd);
+			uint32_t frames = std::min<uint32_t>(availBuf / info.frameSize,
+			                                      loop.end - currentFrame);
+			canRead = frames * info.frameSize;
 		}
 
-		while (canRead > 16)
+		while (canRead > 0)
 		{
 			long res = ov_read(&vf, static_cast<char*>(bufPtr),
 			                   canRead, 0, sizeof(int16_t), 1, 0);
@@ -243,11 +263,6 @@ struct VorbisSource : ALDataSource
 
 			if (loop.valid && currentFrame >= loop.end)
 			{
-				/* Determine how many frames we're
-				 * over the loop end */
-				int discardFrames = currentFrame - loop.end;
-				bufUsed -= discardFrames * info.channels;
-
 				retStatus = ALDataSource::WrapAround;
 
 				/* Seek to loop start */

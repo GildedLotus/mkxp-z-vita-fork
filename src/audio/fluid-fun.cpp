@@ -14,18 +14,34 @@
 #define FLUID_LIB "libfluidsynth.3.dylib"
 #elif __WIN32__
 #define FLUID_LIB "fluidsynth.dll"
+#elif defined(__vita__) || defined(__psp2__)
+/* No fluidsynth on Vita; load fails, MIDI silent. */
+#define FLUID_LIB "libfluidsynth.so.3"
 #else
 #error "platform not recognized"
 #endif
 
+#ifdef MKXPZ_TSF
+#include "tsf-vita.h"
+#endif
+
 struct FluidFunctions fluid;
-#ifndef SHARED_FLUID
+#if !defined(SHARED_FLUID) && !defined(MKXPZ_TSF) && !(defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) && !defined(__psp2__)
 static void *so;
 #endif
 
 void initFluidFunctions()
 {
-#ifdef SHARED_FLUID
+#if defined(MKXPZ_TSF)
+#define FLUID_FUN(name, type) fluid.name = midi_##name;
+#define FLUID_FUN2(name, type, real_name) fluid.name = midi_##name;
+#elif (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) || defined(__psp2__)
+	Debug() << "MIDI disabled: TinySoundFont headers were absent at build time";
+	memset(&fluid, 0, sizeof(fluid));
+	return;
+#define FLUID_FUN(name, type)
+#define FLUID_FUN2(name, type, real_name)
+#elif defined(SHARED_FLUID)
 
 #define FLUID_FUN(name, type) \
 	fluid.name = fluid_##name;
@@ -55,7 +71,7 @@ FLUID_FUNCS2
 
 	return;
 
-#ifndef SHARED_FLUID
+#if !defined(SHARED_FLUID) && !defined(MKXPZ_TSF) && !(defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) && !defined(__psp2__)
 fail:
 	Debug() << "Failed to load " FLUID_LIB ". Midi playback is disabled.";
 

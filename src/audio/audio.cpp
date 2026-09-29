@@ -103,6 +103,29 @@ struct AudioPrivate
 
 	void meWatchFun()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		/* Above Ruby, before the loop starts, and for the same reason as
+		 * ALStream::streamData: this
+		 * thread is created from the rgss thread and SDL gives it the
+		 * creator's priority, so it would otherwise tick at exactly the
+		 * Ruby interpreter's.
+		 *
+		 * The ME watch is not a mixer, but it is on the audible path: it
+		 * is what pauses the BGM when an ME starts and fades it back in
+		 * when the ME ends, on an AUDIO_SLEEP tick. Starved by a
+		 * script-heavy frame it does not underrun, it stalls the
+		 * transition -- the BGM keeps playing under the ME, or stays
+		 * silent after it. It also drives passSecondarySync, so leaving it
+		 * at Ruby's priority makes it late exactly when Ruby is busy.
+		 *
+		 * The two fade threads (src/audio/audiostream.cpp) are
+		 * deliberately NOT raised: they sleep, step one float, and sleep
+		 * again, nothing downstream starves waiting for them, and adding
+		 * two more high-priority wakeups per fade only adds jitter for the
+		 * threads that do matter. */
+		SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+#endif
+
 		const float fadeOutStep = 1.f / (200  / AUDIO_SLEEP);
 		const float fadeInStep  = 1.f / (1000 / AUDIO_SLEEP);
 
@@ -122,9 +145,15 @@ struct AudioPrivate
 				if (me.stream.queryState() == ALStream::Playing)
 				{
 					/* ME playing detected. -> FadeOutBGM */
-                    for (auto track : bgmTracks)
-                        track->extPaused = true;
-                    
+					for (auto track : bgmTracks)
+					{
+						/* extPaused is stream state: only written
+						 * under the track lock (audiostream.h) */
+						track->lockStream();
+						track->extPaused = true;
+						track->unlockStream();
+					}
+
 					meWatch.state = BgmFadingOut;
 				}
 
@@ -141,6 +170,12 @@ struct AudioPrivate
 				{
 					/* ME has ended while fading OUT BGM. -> FadeInBGM */
 					me.unlockStream();
+					for (auto track : bgmTracks)
+					{
+						track->lockStream();
+						track->extPaused = false;
+						track->unlockStream();
+					}
 					meWatch.state = BgmFadingIn;
 
 					break;
@@ -166,8 +201,17 @@ struct AudioPrivate
                         // and if the last one was ended this round, this branch should exit
                         std::vector<AudioStream*> playingTracks;
                         for (auto t : bgmTracks)
-                            if (t->stream.queryState() == ALStream::Playing)
+                        {
+                            /* queryState() can stop/join the stream worker,
+                             * so it needs this track's lock (audiostream.h) */
+                            t->lockStream();
+                            const bool stillPlaying =
+                                (t->stream.queryState() == ALStream::Playing);
+                            t->unlockStream();
+
+                            if (stillPlaying)
                                 playingTracks.push_back(t);
+                        }
                         
                         
                         if (playingTracks.size() <= 0 && !shouldBreak) shouldBreak = true;
@@ -407,14 +451,36 @@ void Audio::setupMidi()
 	shState->midiState().initIfNeeded(shState->config());
 }
 
+/* 'stream' may not be read without the stream lock (audiostream.h: "Any
+ * access to this classes 'stream' member, whether state query or
+ * modification, must be protected by a 'lock'/'unlock' pair"). A script can
+ * ask for the position at any time, while the MeWatch and the fade threads
+ * are driving the same stream: ALStream::stop() resets procFrames and joins
+ * the stream thread, ALStream::play() sets it from the new offset, and both
+ * run under this lock. Reading procFrames and 'source' beside them returned
+ * whatever the other thread was halfway through writing -- and procFrames is
+ * 64 bit, which no 32 bit ARM loads in one instruction.
+ *
+ * The range check stays outside the lock: it throws, and an out of range
+ * track has no stream to lock anyway. */
 double Audio::bgmPos(int track)
 {
-	return p->getTrackByIndex(track)->playingOffset();
+	AudioStream *stream = p->getTrackByIndex(track);
+
+	stream->lockStream();
+	double offset = stream->playingOffset();
+	stream->unlockStream();
+
+	return offset;
 }
 
 double Audio::bgsPos()
 {
-	return p->bgs.playingOffset();
+	p->bgs.lockStream();
+	double offset = p->bgs.playingOffset();
+	p->bgs.unlockStream();
+
+	return offset;
 }
 
 void Audio::reset()
@@ -426,6 +492,12 @@ void Audio::reset()
 	p->bgs.stop();
 	p->me.stop();
 	p->se.stop();
+
+	/* Audio.__reset__ starts the game's audio over, so the record of which
+	 * files have already reported a decode failure starts over with it: the
+	 * first attempt at each of them after this is logged once more. */
+	ALStream::forgetDecodeFailures();
+	SoundEmitter::forgetDecodeFailures();
 }
 
 Audio::~Audio() { delete p; }

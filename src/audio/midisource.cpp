@@ -28,6 +28,7 @@
 #include "util.h"
 #include "debugwriter.h"
 #include "fluid-fun.h"
+#include "midi-se.h"
 
 #include <SDL_rwops.h>
 
@@ -36,6 +37,9 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <new>
+#include <memory>
+#include <atomic>
 
 /* Vocabulary:
  *
@@ -51,6 +55,8 @@
  *   Deltas are the abstract time unit in which the relative
  *   offsets between midi events are encoded.
  */
+
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "MIDI pitch must not allocate a lock");
 
 #define TICK_FRAMES 32
 #define BUF_TICKS (STREAM_BUF_SIZE / TICK_FRAMES)
@@ -72,6 +78,7 @@ enum MidiEventType
 	CC,
 	PC,
 	Tempo,
+	TrackEnd,
 
 	Last
 };
@@ -110,7 +117,7 @@ struct PCEvent : ChannelEvent
 
 struct TempoEvent
 {
-	uint32_t bpm;
+	uint32_t microseconds;
 };
 
 struct MidiEvent
@@ -163,7 +170,7 @@ struct MemChunk
 
 	void readData(void *buf, size_t n)
 	{
-		if (i + n > data.size())
+		if (n > data.size() - i)
 			endOfFile();
 
 		memcpy(buf, &data[i], n);
@@ -172,8 +179,9 @@ struct MemChunk
 
 	void skipData(size_t n)
 	{
-		if ((i += n) > data.size())
+		if (n > data.size() - i)
 			endOfFile();
+		i += n;
 	}
 
 	void endOfFile()
@@ -221,30 +229,33 @@ readVoiceEvent(MidiEvent &e, MemChunk &chunk,
 	e.e.chan.chan = (type & 0x0F);
 
 	uint8_t tmp;
+	if (data1 > 127) badMidiFormat();
+	auto dataByte = [&chunk]() { uint8_t v = chunk.readByte(); if (v > 127) badMidiFormat(); return v; };
 
 	switch (type >> 4)
 	{
 	case 0x8 :
 		e.type = NoteOff;
 		e.e.note.key = data1;
-		chunk.readByte(); /* We don't care about velocity */
+		dataByte(); /* We don't care about velocity */
 		break;
 
 	case 0x9 :
 		e.type = NoteOn;
 		e.e.note.key = data1;
-		e.e.note.vel = chunk.readByte();
+		e.e.note.vel = dataByte();
 		break;
 
 	case 0xA :
 		/* Note aftertouch unhandled */
+		dataByte();
 		handled = false;
 		break;
 
 	case 0xB :
 		e.type = CC;
 		e.e.cc.ctrl = data1;
-		e.e.cc.val = chunk.readByte();
+		e.e.cc.val = dataByte();
 		break;
 
 	case 0xC :
@@ -259,7 +270,7 @@ readVoiceEvent(MidiEvent &e, MemChunk &chunk,
 
 	case 0xE :
 		e.type = PitchBend;
-		tmp = chunk.readByte();
+		tmp = dataByte();
 		e.e.pitchBend.val = ((tmp & 0x7F) << 7) | (data1 & 0x7F);
 		break;
 
@@ -274,7 +285,7 @@ readEvent(MidiReadHandler *handler, MemChunk &chunk,
           uint8_t &prevType, uint32_t &deltaBase, uint32_t &deltaCarry,
           bool &endOfTrack)
 {
-	MidiEvent e;
+	MidiEvent e{};
 	bool handled = true;
 
 	e.delta = readVarNum(chunk);
@@ -320,7 +331,8 @@ readEvent(MidiReadHandler *handler, MemChunk &chunk,
 			              | (data[2] << 0x00);
 
 			e.type = Tempo;
-			e.e.tempo.bpm = 60000000 / mpqn;
+			if (mpqn < 1000) badMidiFormat();
+			e.e.tempo.microseconds = mpqn;
 		}
 		else if (metaType == 0x2F)
 		{
@@ -329,7 +341,7 @@ readEvent(MidiReadHandler *handler, MemChunk &chunk,
 				badMidiFormat();
 
 			endOfTrack = true;
-			handled = false;
+			e.type = TrackEnd;
 		}
 		else
 		{
@@ -357,6 +369,7 @@ readEvent(MidiReadHandler *handler, MemChunk &chunk,
 
 event_read:
 
+	if (uint64_t(deltaBase) + deltaCarry + e.delta > 0x7fffffff) badMidiFormat();
 	if (handled)
 	{
 		e.delta += deltaCarry;
@@ -483,6 +496,8 @@ struct Track
 
 	void appendEvent(const MidiEvent &e)
 	{
+		if (events.size() >= 32768)
+			throw Exception(Exception::MKXPError, "MIDI: more than 32768 events per track");
 		length += e.delta;
 		events.push_back(e);
 	}
@@ -512,7 +527,7 @@ struct Track
 			wrapAroundFlag = false;
 		}
 
-		if (looped && (index == events.size()) && loopI >= 0)
+		if (looped && length > 0 && (index == events.size()) && loopI >= 0)
 		{
 			index = loopI;
 			wrapAroundFlag = true;
@@ -603,7 +618,7 @@ struct MidiSource : ALDataSource, MidiReadHandler
 	/* Deltas per beat */
 	uint16_t dpb;
 
-	int8_t pitchShift;
+	std::atomic<int> pitchShift;
 
 	/* Deltas per tick */
 	float playbackSpeed;
@@ -616,16 +631,25 @@ struct MidiSource : ALDataSource, MidiReadHandler
 	MidiSource(SDL_RWops &ops,
 	           bool looped)
 	    : freq(SYNTH_SAMPLERATE),
+	      longestI(0),
 	      looped(looped),
+	      loopDelta(0),
 	      dpb(480),
 	      pitchShift(0),
 	      genDeltasCarry(0),
 	      curTrack(-1)
 	{
-		size_t dataLen = SDL_RWsize(&ops);
-		std::vector<uint8_t> data(dataLen);
+		Sint64 dataLen = SDL_RWsize(&ops);
+		if (dataLen <= 0 || dataLen > 256 * 1024)
+		{
+			SDL_RWclose(&ops);
+			throw Exception(Exception::MKXPError, "MIDI: invalid file size (256 KiB ceiling)");
+		}
+		std::vector<uint8_t> data;
+		try { data.resize(size_t(dataLen)); }
+		catch (...) { SDL_RWclose(&ops); throw; }
 
-		if (SDL_RWread(&ops, &data[0], 1, dataLen) < dataLen)
+		if (SDL_RWread(&ops, data.data(), 1, size_t(dataLen)) < size_t(dataLen))
 		{
 			SDL_RWclose(&ops);
 			throw Exception(Exception::MKXPError, "Reading midi data failed");
@@ -635,7 +659,6 @@ struct MidiSource : ALDataSource, MidiReadHandler
 
 		readMidi(this, data);
 
-		synth = shState->midiState().allocateSynth();
 
 		uint64_t longest = 0;
 
@@ -678,7 +701,8 @@ struct MidiSource : ALDataSource, MidiReadHandler
 			}
 		}
 
-		updatePlaybackSpeed(DEFAULT_BPM);
+		updatePlaybackSpeed(500000);
+		synth = shState->midiState().allocateSynth();
 
 		// FIXME: It would make the code in 'fillBuffer' a lot nicer if
 		// we could combine all tracks into one giant one on construction,
@@ -691,10 +715,9 @@ struct MidiSource : ALDataSource, MidiReadHandler
 	}
 
 
-	void updatePlaybackSpeed(uint32_t bpm)
+	void updatePlaybackSpeed(uint32_t microseconds)
 	{
-		float deltaLength = 60.0f / (dpb * bpm);
-		playbackSpeed = TICK_FRAMES / (deltaLength * freq);
+		playbackSpeed = (double(TICK_FRAMES) * dpb * 1000000.0) / (double(microseconds) * freq);
 	}
 
 	void activateEvent(const MidiEvent &e)
@@ -704,7 +727,7 @@ struct MidiSource : ALDataSource, MidiReadHandler
 		/* Apply pitch shift if necessary */
 		if ((e.type == NoteOn || e.type == NoteOff) && e.e.chan.chan != 9)
 		{
-			key += pitchShift;
+			key += pitchShift.load(std::memory_order_relaxed);
 
 			/* Drop events whose keys are out of bounds */
 			if (key < 0 || key > 127)
@@ -732,7 +755,7 @@ struct MidiSource : ALDataSource, MidiReadHandler
 			fluid.synth_program_change(synth, e.e.pc.chan, e.e.pc.prog);
 			break;
 		case Tempo:
-			updatePlaybackSpeed(e.e.tempo.bpm);
+			updatePlaybackSpeed(e.e.tempo.microseconds);
 			break;
 		default:
 			break;
@@ -754,6 +777,7 @@ struct MidiSource : ALDataSource, MidiReadHandler
 		if (midiType != 0 && midiType != 1)
 			throw Exception(Exception::MKXPError, "Midi: Type 2 not supported");
 
+		if (trackCount > 64 || !division) badMidiFormat();
 		tracks.resize(trackCount);
 
 		// SMTP unhandled
@@ -783,7 +807,7 @@ struct MidiSource : ALDataSource, MidiReadHandler
 	}
 
 	/* ALDataSource */
-	Status fillBuffer(AL::Buffer::ID buf)
+	Status renderBuffer()
 	{
 		/* In case there is no currently scheduled one */
 		for (size_t i = 0; i < tracks.size(); ++i)
@@ -870,13 +894,17 @@ struct MidiSource : ALDataSource, MidiReadHandler
 					tracks[i].remDeltas -= intDeltas;
 		}
 
-		/* Fill AL buffer */
-		AL::Buffer::uploadData(buf, AL_FORMAT_STEREO16, synthBuf, sizeof(synthBuf), freq);
-
 		if (tracks[longestI].atEnd)
 			return EndOfStream;
 
 		return NoError;
+	}
+
+	Status fillBuffer(AL::Buffer::ID buf)
+	{
+		Status status = renderBuffer();
+		AL::Buffer::uploadData(buf, AL_FORMAT_STEREO16, synthBuf, sizeof(synthBuf), freq);
+		return status;
 	}
 
 	int sampleRate()
@@ -892,7 +920,7 @@ struct MidiSource : ALDataSource, MidiReadHandler
 
 		/* Reset runtime variables */
 		genDeltasCarry = 0;
-		updatePlaybackSpeed(DEFAULT_BPM);
+		updatePlaybackSpeed(500000);
 
 		/* Reset tracks */
 		for (size_t i = 0; i < tracks.size(); ++i)
@@ -904,14 +932,40 @@ struct MidiSource : ALDataSource, MidiReadHandler
 	bool setPitch(float value)
 	{
 		// not completely correct, but close
-		pitchShift = round((value > 1.0f ? 14 : 24) * (value - 1.0f));
+		pitchShift.store(round((value > 1.0f ? 14 : 24) * (value - 1.0f)), std::memory_order_relaxed);
 
 		return true;
 	}
 };
 
 ALDataSource *createMidiSource(SDL_RWops &ops,
-                               bool looped)
+                               bool looped) try
 {
-	return new MidiSource(ops, looped);
+	MidiSource *source = new (std::nothrow) MidiSource(ops, looped);
+	if (!source)
+	{
+		SDL_RWclose(&ops);
+		throw Exception(Exception::MKXPError, "MIDI: cannot allocate stream buffer");
+	}
+	return source;
 }
+catch (const std::bad_alloc&)
+{ throw Exception(Exception::MKXPError, "MIDI: cannot allocate event data"); }
+
+void renderMidiSE(SDL_RWops &ops, std::vector<int16_t> &pcm) try
+{
+	std::unique_ptr<MidiSource> source(static_cast<MidiSource*>(createMidiSource(ops, false)));
+	const size_t maxSamples = (4 * 1024 * 1024) / sizeof(int16_t);
+	for (;;)
+	{
+		ALDataSource::Status status = source->renderBuffer();
+		const size_t count = sizeof(source->synthBuf) / sizeof(int16_t);
+		if (count > maxSamples - pcm.size())
+			throw Exception(Exception::MKXPError, "MIDI SE: PCM exceeds 4 MiB ceiling (about 23 seconds)");
+		pcm.reserve(pcm.size() + count);
+		pcm.insert(pcm.end(), source->synthBuf, source->synthBuf + count);
+		if (status == ALDataSource::EndOfStream) return;
+	}
+}
+catch (const std::bad_alloc&)
+{ throw Exception(Exception::MKXPError, "MIDI SE: cannot allocate PCM/event data"); }

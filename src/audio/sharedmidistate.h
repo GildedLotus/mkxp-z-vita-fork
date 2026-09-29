@@ -25,6 +25,9 @@
 #include "config.h"
 #include "debugwriter.h"
 #include "fluid-fun.h"
+#include "exception.h"
+#include <cstring>
+#include <new>
 
 #include <assert.h>
 #include <vector>
@@ -43,19 +46,20 @@ struct SharedMidiState
 {
 	bool inited;
 	std::vector<Synth> synths;
-	const std::string &soundFont;
+	std::string soundFont;
 	fluid_settings_t *flSettings;
 
 	SharedMidiState(const Config &conf)
 	    : inited(false),
-	      soundFont(conf.midi.soundFont)
+	      soundFont(conf.midi.soundFont),
+	      flSettings(nullptr)
 	{}
 
 	~SharedMidiState()
 	{
 		/* We might have initialized, but if the consecutive libfluidsynth
 		 * load failed, no resources will have been allocated */
-		if (!inited || !HAVE_FLUID)
+		if (!flSettings)
 			return;
 
 		for (size_t i = 0; i < synths.size(); ++i)
@@ -73,20 +77,67 @@ struct SharedMidiState
 			return;
 
 		inited = true;
+		try
+		{
 
-		initFluidFunctions();
+			initFluidFunctions();
 
-		if (!HAVE_FLUID)
-			return;
+			if (!HAVE_FLUID)
+				return;
 
-		flSettings = fluid.new_settings();
-		fluid.settings_setnum(flSettings, "synth.gain", 1.0f);
-		fluid.settings_setnum(flSettings, "synth.sample-rate", SYNTH_SAMPLERATE);
-		fluid.settings_setint(flSettings, "synth.chorus.active", conf.midi.chorus);
-		fluid.settings_setint(flSettings, "synth.reverb.active", conf.midi.reverb);
+#ifdef MKXPZ_TSF
+			if (soundFont == "off")
+			{
+				Debug() << "MIDI disabled: midiSoundFont is off";
+				memset(&fluid, 0, sizeof(fluid));
+				return;
+			}
+			soundFont = findMidiSoundFont(soundFont);
+			if (soundFont.empty())
+			{
+				Debug() << "MIDI disabled: no user SoundFont found";
+				memset(&fluid, 0, sizeof(fluid));
+				return;
+			}
+			synths.reserve(8);
+#endif
+			flSettings = fluid.new_settings();
+			if (!flSettings)
+			{
+				Debug() << "MIDI disabled: cannot allocate settings";
+				memset(&fluid, 0, sizeof(fluid));
+				return;
+			}
+			fluid.settings_setnum(flSettings, "synth.gain", 1.0f);
+			fluid.settings_setnum(flSettings, "synth.sample-rate", SYNTH_SAMPLERATE);
+			fluid.settings_setint(flSettings, "synth.chorus.active", conf.midi.chorus);
+			fluid.settings_setint(flSettings, "synth.reverb.active", conf.midi.reverb);
 
-		for (size_t i = 0; i < SYNTH_INIT_COUNT; ++i)
-			addSynth(false);
+			for (size_t i = 0; i < SYNTH_INIT_COUNT; ++i)
+				if (!addSynth(false))
+				{
+#ifdef MKXPZ_TSF
+					Debug() << midiSynthError();
+#else
+					Debug() << "MIDI disabled: cannot load synthesiser/SoundFont";
+#endif
+					for (Synth &entry : synths) fluid.delete_synth(entry.synth);
+					synths.clear();
+					fluid.delete_settings(flSettings);
+					flSettings = nullptr;
+					memset(&fluid, 0, sizeof(fluid));
+					return;
+				}
+		}
+		catch (const std::bad_alloc&)
+		{
+			for (Synth &entry : synths) fluid.delete_synth(entry.synth);
+			synths.clear();
+			if (flSettings) fluid.delete_settings(flSettings);
+			flSettings = nullptr;
+			memset(&fluid, 0, sizeof(fluid));
+			Debug() << "MIDI disabled: cannot allocate initial state";
+		}
 	}
 
 	fluid_synth_t *allocateSynth()
@@ -110,7 +161,13 @@ struct SharedMidiState
 		}
 		else
 		{
-			return addSynth(true);
+#ifdef MKXPZ_TSF
+			if (synths.size() >= 8)
+				throw Exception(Exception::MKXPError, "MIDI: eight simultaneous synths exhausted");
+#endif
+			fluid_synth_t *syn = addSynth(true);
+			if (!syn) throw Exception(Exception::MKXPError, "MIDI: cannot allocate synthesiser");
+			return syn;
 		}
 	}
 
@@ -132,8 +189,15 @@ private:
 	{
 		fluid_synth_t *syn = fluid.new_synth(flSettings);
 
+		if (!syn) return nullptr;
 		if (!soundFont.empty())
-			fluid.synth_sfload(syn, soundFont.c_str(), 1);
+		{
+			if (fluid.synth_sfload(syn, soundFont.c_str(), 1) < 0)
+			{
+				fluid.delete_synth(syn);
+				return nullptr;
+			}
+		}
 		else
 			Debug() << "Warning: No soundfont specified, sound might be mute";
 

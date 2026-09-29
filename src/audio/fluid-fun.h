@@ -70,4 +70,12 @@ extern FluidFunctions fluid;
 
 void initFluidFunctions();
 
+#ifdef MKXPZ_TSF
+#include <string>
+std::string findMidiSoundFont(const std::string &configured, const char *game = ".",
+                             const char *global = "ux0:/data/mkxp-z/sf2/",
+                             const char *bundle = "app0:/sf2/");
+const char *midiSynthError();
+#endif
+
 #endif // FLUIDFUN_H

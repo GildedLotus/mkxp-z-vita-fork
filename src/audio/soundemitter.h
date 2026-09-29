@@ -26,6 +26,7 @@
 #include "al-util.h"
 #include "boost-hash.h"
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -58,7 +59,19 @@ struct SoundEmitter
 
 	void stop();
 
+	/* Forget which files have already reported a decode failure, so the
+	 * next attempt at each of them is reported once more. Audio::reset()
+	 * calls this alongside ALStream::forgetDecodeFailures(). */
+	static void forgetDecodeFailures();
+
 private:
+	/* Filenames allocateBuffer() has already complained about. Kept apart
+	 * from ALStream's record on purpose: the two paths say different
+	 * things about the same file. See the definition in soundemitter.cpp. */
+	static std::set<std::string> reportedDecodeFailures;
+	/* Files refused past the SE decode budget; not re-read on each play. */
+	static std::set<std::string> overBudgetFiles;
+
 	SoundBuffer *allocateBuffer(const std::string &filename);
 };
 

@@ -42,7 +42,9 @@ ALStream::ALStream(LoopMode loopMode,
 	  source(0),
 	  thread(0),
 	  preemptPause(false),
-      pitch(1.0f)
+      pitch(1.0f),
+	  procFrames(0),
+	  wrapMark()
 {
 	alSrc = AL::Source::gen();
 
@@ -125,7 +127,8 @@ void ALStream::play(double offset)
 	case Playing:
 		return;
 	case Stopped:
-		startStream(offset);
+		if (!startStream(offset))
+			return;
 		break;
 	case Paused :
 		resumeStream();
@@ -178,7 +181,9 @@ double ALStream::queryOffset()
 	if (state == Closed || !source)
 		return 0;
 
-	double procOffset = static_cast<double>(procFrames) / source->sampleRate();
+	const uint64_t frames = procFrames.load(std::memory_order_relaxed);
+
+	double procOffset = static_cast<double>(frames) / source->sampleRate();
 
 	// TODO: getSecOffset returns a float, we should improve precision to double.
 	return procOffset + AL::Source::getSecOffset(alSrc);
@@ -194,6 +199,7 @@ struct ALStreamOpenHandler : FileSystem::OpenHandler
 	bool looped;
 	ALDataSource *source;
 	std::string errorMsg;
+	bool midiSilent = false;
 
 	ALStreamOpenHandler(bool looped)
 	    : looped(looped), source(0)
@@ -223,6 +229,9 @@ struct ALStreamOpenHandler : FileSystem::OpenHandler
 					source = createMidiSource(ops, looped);
 					return true;
 				}
+				SDL_RWclose(&ops);
+				midiSilent = true;
+				return true;
 			}
 
 			source = createSDLSource(ops, ext, STREAM_BUF_SIZE, looped);
@@ -238,6 +247,32 @@ struct ALStreamOpenHandler : FileSystem::OpenHandler
 		return true;
 	}
 };
+
+/* Filenames openSource() has already reported as undecodable.
+ *
+ * Upstream prints the line below on every attempt. On this port MIDI never
+ * decodes -- fluid-fun's SDL_LoadObject cannot succeed (the Vita
+ * SDL2 is built with SDL_LOADSO_DUMMY) and SDL_sound's MIDI decoder is off --
+ * and an RPG Maker XP game whose soundtrack is the XP RTP's .mid files
+ * reopens its BGM on every map change. Alternating between two maps reprints
+ * the same two lines forever, and the Vita's log sink is synchronous: two
+ * sceIoSyncByFd per line, paid on the thread that changed the map.
+ *
+ * One record for every stream, so the log holds one line per file rather
+ * than one per stream that tried it. It only ever grows by files that exist
+ * and cannot be decoded -- a missing file leaves openRead() by way of
+ * NoFileError, above -- so it is bounded by the game's own audio directory.
+ *
+ * No lock: openSource() is reached only through AudioStream::play(), whose
+ * only callers are Audio::bgmPlay / bgsPlay / mePlay on the RGSS thread. The
+ * MeWatch and the two fade threads reach ALStream::play / stop / queryState,
+ * never open. Audio::reset(), which clears this, is that same thread. */
+std::set<std::string> ALStream::reportedDecodeFailures;
+
+void ALStream::forgetDecodeFailures()
+{
+	reportedDecodeFailures.clear();
+}
 
 void ALStream::openSource(const std::string &filename)
 {
@@ -258,7 +293,9 @@ void ALStream::openSource(const std::string &filename)
 
 	close();
 
-	if (!handler.source)
+	/* Once per filename, not once per attempt. The text is unchanged, so a
+	 * log grep written against stock mkxp-z still matches. */
+	if (!handler.source && !handler.midiSilent && reportedDecodeFailures.insert(filename).second)
 	{
 		char buf[512];
 		snprintf(buf, sizeof(buf), "Unable to decode audio stream: %s: %s",
@@ -286,24 +323,36 @@ void ALStream::stopStream()
 	 * because it might have accidentally started it again before
 	 * seeing the term request */
 	AL::Source::stop(alSrc);
+	AL::Source::clearQueue(alSrc);
 
-	procFrames = 0;
+	procFrames.store(0, std::memory_order_relaxed);
 }
 
-void ALStream::startStream(double offset)
+bool ALStream::startStream(double offset)
 {
 	AL::Source::clearQueue(alSrc);
 
 	preemptPause = false;
 	streamInited.clear();
 	sourceExhausted.clear();
+	threadFinished.clear();
 	threadTermReq.clear();
+	for (int i = 0; i < STREAM_BUFS; ++i)
+		wrapMark[i] = false;
 
 	startOffset = offset;
-	procFrames = offset * source->sampleRate();
+	procFrames.store(static_cast<uint64_t>(offset * source->sampleRate()),
+	                 std::memory_order_relaxed);
 
 	thread = createSDLThread
 		<ALStream, &ALStream::streamData>(this, threadName);
+	if (!thread)
+	{
+		threadFinished.set();
+		stopStream();
+		return false;
+	}
+	return true;
 }
 
 void ALStream::pauseStream()
@@ -332,6 +381,14 @@ void ALStream::resumeStream()
 
 void ALStream::checkStopped()
 {
+	/* A failed worker can finish before it queues anything, or while paused. */
+	if ((state == Playing || state == Paused) && threadFinished)
+	{
+		stopStream();
+		state = Stopped;
+		return;
+	}
+
 	/* This only concerns the scenario where
 	 * state is still 'Playing', but the stream
 	 * has already ended on its own (EOF, Error) */
@@ -360,6 +417,42 @@ void ALStream::checkStopped()
 /* thread func */
 void ALStream::streamData()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	/* Above Ruby, before anything else this thread does. This is the thread that decodes and
+	 * refills; the OpenAL mixer that drains what it queues is raised
+	 * separately, by _oal_thread_priority in src/main.cpp, to this same
+	 * 112. A mixer that outranks the interpreter but a decoder that does
+	 * not just moves the underrun one step back: the mixer wakes on time
+	 * and finds no queued buffer.
+	 *
+	 * It has to be called HERE and not where the thread is created --
+	 * SDL_SetThreadPriority is sceKernelChangeThreadPriority(0, ...), and
+	 * the 0 is "self". SDL creates Vita threads with priority 0, which
+	 * sceKernelCreateThread reads as "the creator's priority", and the
+	 * creator here is whoever called ALStream::play: the rgss thread, or
+	 * AudioPrivate::meWatchFun when it un-ducks a BGM after an ME. Without
+	 * this line a refill thread's priority is whatever that caller happened
+	 * to have, which for the rgss thread is the Ruby interpreter's.
+	 *
+	 * The result is not checked because it cannot fail: the only error
+	 * sceKernelChangeThreadPriority has for a self-directed call is an
+	 * illegal priority, and SDL maps HIGH to 112, inside the 64..191 user
+	 * range. It is also cheap enough to sit on the start path -- one
+	 * syscall per stream start, not per buffer. */
+	SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+#endif
+
+	struct Finish
+	{
+		ALStream &stream;
+		~Finish()
+		{
+			AL::Source::stop(stream.alSrc);
+			AL::Source::clearQueue(stream.alSrc);
+			stream.threadFinished.set();
+		}
+	} finish = {*this};
+
 	/* Fill up queue */
 	bool firstBuffer = true;
 	ALDataSource::Status status;
@@ -380,7 +473,10 @@ void ALStream::streamData()
 		status = source->fillBuffer(buf);
 
 		if (status == ALDataSource::Error)
+		{
+			Debug() << "audio stream read error while priming; stream stopped";
 			return;
+		}
 
 		AL::Source::queueBuffer(alSrc, buf);
 
@@ -394,6 +490,12 @@ void ALStream::streamData()
 
 		if (threadTermReq)
 			return;
+
+		/* The prefill crosses the loop point just like a refill does; a
+		 * wrap buffer retired without this mark never resets procFrames,
+		 * and queryOffset() then runs one loop length ahead of the audible
+		 * position until the next wrap. */
+		wrapMark[i] = status == ALDataSource::WrapAround;
 
 		if (status == ALDataSource::EndOfStream)
 		{
@@ -421,12 +523,17 @@ void ALStream::streamData()
 			if (buf == AL::Buffer::ID(0))
 				break;
 
-			if (buf == lastBuf)
+			int slot = 0;
+			while (slot < STREAM_BUFS - 1 && !(alBuf[slot] == buf))
+				++slot;
+
+			if (wrapMark[slot])
 			{
 				/* Reset the processed sample count so
 				 * querying the playback offset returns 0.0 again */
-				procFrames = source->loopStartFrames();
-				lastBuf = AL::Buffer::ID(0);
+				procFrames.store(source->loopStartFrames(),
+				                 std::memory_order_relaxed);
+				wrapMark[slot] = false;
 			}
 			else
 			{
@@ -437,7 +544,8 @@ void ALStream::streamData()
 				ALint chan = AL::Buffer::getChannels(buf);
 
 				if (bits != 0 && chan != 0)
-					procFrames += ((size / (bits / 8)) / chan);
+					procFrames.fetch_add(((size / (bits / 8)) / chan),
+					                     std::memory_order_relaxed);
 			}
 
 			if (sourceExhausted)
@@ -447,6 +555,7 @@ void ALStream::streamData()
 
 			if (status == ALDataSource::Error)
 			{
+				Debug() << "audio stream read error; stream stopped";
 				sourceExhausted.set();
 				return;
 			}
@@ -462,14 +571,14 @@ void ALStream::streamData()
 			 * source loop wrapped around again, mark it as
 			 * such so we can catch it and reset the processed
 			 * sample count once it gets unqueued */
-			if (status == ALDataSource::WrapAround)
-				lastBuf = buf;
+			wrapMark[slot] = status == ALDataSource::WrapAround;
 
 			if (status == ALDataSource::EndOfStream)
 				sourceExhausted.set();
 		}
 
-		if (threadTermReq)
+		if (threadTermReq || (sourceExhausted &&
+		    AL::Source::getInteger(alSrc, AL_BUFFERS_QUEUED) == 0))
 			break;
 
 		SDL_Delay(AUDIO_SLEEP);
