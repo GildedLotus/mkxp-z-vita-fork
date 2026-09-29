@@ -1,0 +1,172 @@
+Notices of third-party code inside the SDL2 2.32.8 sources that are compiled into the Vita libSDL2.a (SDL's own zlib licence is in
+permissive-notices.txt). Each block is copied verbatim from the file named.
+
+===== libm (src/libm/*.c: e_*, k_*, s_*): Sun Microsystems fdlibm notice =====
+===== source: src/libm/s_sin.c
+
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+===== SDL_qsort (Gareth McCaughan, zlib) =====
+===== source: src/stdlib/SDL_qsort.c
+
+/* Copyright (c) 1998-2021 Gareth McCaughan
+ *
+ * This software is provided 'as-is', without any express or implied
+ * warranty. In no event will the authors be held liable for any
+ * damages arising from the use of this software.
+ *
+ * Permission is granted to anyone to use this software for any purpose,
+ * including commercial applications, and to alter it and redistribute it
+ * freely, subject to the following restrictions:
+ *
+ * 1. The origin of this software must not be misrepresented;
+ *    you must not claim that you wrote the original software.
+ *    If you use this software in a product, an acknowledgment
+ *    in the product documentation would be appreciated but
+ *    is not required.
+ *
+ * 2. Altered source versions must be plainly marked as such,
+ *    and must not be misrepresented as being the original software.
+ *
+ * 3. This notice may not be removed or altered from any source
+ *    distribution.
+ */
+
+===== dlmalloc (Doug Lea, public domain) =====
+===== source: src/stdlib/SDL_malloc.c
+
+  This is a version (aka dlmalloc) of malloc/free/realloc written by
+  Doug Lea and released to the public domain, as explained at
+  http://creativecommons.org/licenses/publicdomain.  Send questions,
+  comments, complaints, performance data, etc to dl@cs.oswego.edu
+
+
+===== yuv_rgb (Adrien Descamps, BSD 3-Clause) =====
+===== source: src/video/yuv2rgb/LICENSE
+
+Copyright (c) 2016, Adrien Descamps
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of yuv2rgb nor the names of its
+  contributors may be used to endorse or promote products derived from
+  this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+===== SDL_rotate (SDL_gfx, Andreas Schiffler, zlib) =====
+===== source: src/render/software/SDL_rotate.c
+
+/*
+
+SDL_rotate.c: rotates 32bit or 8bit surfaces
+
+Shamelessly stolen from SDL_gfx by Andreas Schiffler. Original copyright follows:
+
+Copyright (C) 2001-2011  Andreas Schiffler
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+   1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+
+   2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+
+   3. This notice may not be removed or altered from any source
+   distribution.
+
+Andreas Schiffler -- aschiffler at ferzkopp dot net
+
+*/
+
+===== controller_type (Valve, zlib) =====
+===== source: src/joystick/controller_type.c
+
+/*
+  Copyright (C) Valve Corporation
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+*/
+
+===== SDL_strtokr (PDCLib, CC0) =====
+===== source: src/stdlib/SDL_strtokr.c
+
+/*
+ * Adapted from _PDCLIB_strtok() of PDClib library at
+ * https://github.com/DevSolar/pdclib.git
+ *
+ * The code was under CC0 license:
+ * https://creativecommons.org/publicdomain/zero/1.0/legalcode :
+ *
+ *                        No Copyright
+ *
+ * The person who associated a work with this deed has dedicated the
+ * work to the public domain by waiving all of his or her rights to
+ * the work worldwide under copyright law, including all related and
+ * neighboring rights, to the extent allowed by law.
+ *
+ * You can copy, modify, distribute and perform the work, even for
+ * commercial purposes, all without asking permission. See Other
+ * Information below.
+ */
+
+===== SDL_crc32 (public domain) =====
+===== source: src/stdlib/SDL_crc32.c
+
+/* Public domain CRC implementation adapted from:
+   http://home.thep.lu.se/~bjorn/crc/crc32_simple.c
+
+   This algorithm is compatible with the 32-bit CRC described here:
+   https://www.lammertbies.nl/comm/info/crc-calculation
+*/
+
