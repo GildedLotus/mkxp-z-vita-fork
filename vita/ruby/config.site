@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# config.site for MRI 3.1.3 cross-compile to arm-vita-eabi (newlib).
+# Used as CONFIG_SITE=<this file> during configure.
+# Pattern: lie about POSIX bits newlib does not provide, so configure
+# does not try to link a host-only program and fail.
+
+# --- process / signals (no fork/exec/waitpid/signals on Vita) ---
+ac_cv_func_fork=no
+ac_cv_func_vfork=no
+ac_cv_func_execv=no
+ac_cv_func_execve=no
+ac_cv_func_execvp=no
+ac_cv_func_execvpe=no
+ac_cv_func_wait=no
+ac_cv_func_waitpid=no
+ac_cv_func_wait3=no
+ac_cv_func_wait4=no
+ac_cv_func_system=no
+ac_cv_func_popen=no
+ac_cv_func_daemon=no
+ac_cv_func_sigaction=no
+ac_cv_func_sigprocmask=no
+ac_cv_func_sigaltstack=no
+ac_cv_func_kill=no
+ac_cv_func_signal=no
+ac_cv_func_sigsetjmp=no
+# __builtin_setjmp / longjmp may still be used; leave those to configure.
+
+# --- resource limits ---
+# getrlimit EXISTS in Vita libc but always returns RLIM_INFINITY (0xFFFFFFFF)
+# for every resource. MRI's ruby_init_stack does `size = rlim.rlim_cur` and
+# then does pointer arithmetic with that value → wrap-around → garbage
+# stack_maxsize → GC scans wrong memory. Force "no" so MRI uses its
+# RUBY_VM_THREAD_VM_STACK_SIZE default (512 KiB) instead.
+ac_cv_func_getrlimit=no
+ac_cv_func_setrlimit=no
+ac_cv_func_getrusage=yes
+
+# --- mmap / mprotect (GC and friends must use malloc only) ---
+ac_cv_func_mmap=no
+ac_cv_func_munmap=no
+ac_cv_func_mprotect=no
+ac_cv_func_madvise=no
+
+# --- identity / pw ---
+ac_cv_func_getpwuid=no
+ac_cv_func_getpwnam=no
+ac_cv_func_getpwent=no
+ac_cv_func_setpwent=no
+ac_cv_func_endpwent=no
+ac_cv_func_getlogin=no
+ac_cv_func_getuid=no
+ac_cv_func_geteuid=no
+ac_cv_func_getgid=no
+ac_cv_func_getegid=no
+ac_cv_func_setuid=no
+ac_cv_func_setgid=no
+ac_cv_func_getgroups=no
+ac_cv_func_initgroups=no
+ac_cv_func_getpgrp=no
+ac_cv_func_setpgid=no
+ac_cv_func_getppid=no
+ac_cv_func_setsid=no
+
+# --- dlopen ---
+ac_cv_func_dlopen=no
+ac_cv_lib_dl_dlopen=no
+
+# --- select / poll: Vita newlib provides both (poll via sceNetEpoll) ---
+ac_cv_func_select=yes
+ac_cv_func_poll=yes
+ac_cv_func_ppoll=no
+ac_cv_header_poll_h=yes
+
+# pthread-embedded accepts setclock but timedwait uses ftime (REALTIME).
+# Monotonic absolute deadlines would expire immediately and spin in MRI.
+ac_cv_func_pthread_condattr_setclock=no
+
+# --- misc host-only ---
+ac_cv_func_nl_langinfo=yes
+ac_cv_func_setenv=no
+ac_cv_func_unsetenv=no
+ac_cv_func_putenv=yes
+ac_cv_func_chroot=no
+ac_cv_func_chown=no
+ac_cv_func_fchmod=no
+ac_cv_func_fchown=no
+ac_cv_func_lstat=no
+ac_cv_func_symlink=no
+ac_cv_func_readlink=no
+ac_cv_func_realpath=no
+ac_cv_func_getcwd=yes
+ac_cv_func_truncate=no
+ac_cv_func_ftruncate=yes
+ac_cv_func_gettimeofday=yes
+ac_cv_func_clock_gettime=yes
+ac_cv_func_nanosleep=yes
+ac_cv_func_usleep=yes
+ac_cv_func_strerror=yes
+ac_cv_func_strerror_r=no
+ac_cv_func_memmove=yes
+ac_cv_func_strerror=yes
+
+# --- locale ---
+ac_cv_func_setlocale=yes
+ac_cv_func_localeconv=no
+
+# --- filesystem bits newlib has ---
+ac_cv_func_fcntl=yes
+ac_cv_func_open=yes
+ac_cv_func_close=yes
+ac_cv_func_read=yes
+ac_cv_func_write=yes
+ac_cv_func_lseek=yes
+ac_cv_func_stat=yes
+ac_cv_func_fstat=yes
+ac_cv_func_dup=yes
+ac_cv_func_dup2=yes
+ac_cv_func_pipe=yes
+ac_cv_func_pipe2=yes
+ac_cv_func_mkfifo=no
+ac_cv_func_fileno=yes
+ac_cv_func_fdopen=yes
+ac_cv_func_fseeko=yes
+ac_cv_func_ftello=yes
+
+# --- socket (we also --with-out-ext=socket) ---
+ac_cv_func_socket=no
+ac_cv_func_socketpair=no
+
+# --- headers ---
+ac_cv_header_sys_time_h=yes
+ac_cv_header_sys_resource_h=yes
+ac_cv_header_sys_mman_h=no
+ac_cv_header_sys_ioctl_h=no
+ac_cv_header_sys_select_h=yes
+ac_cv_header_sys_wait_h=yes
+ac_cv_header_pwd_h=no
+ac_cv_header_grp_h=no
+ac_cv_header_dlfcn_h=no
+ac_cv_header_crypt_h=no
+ac_cv_header_syslog_h=no
+ac_cv_header_sys_sysinfo_h=no
+ac_cv_header_malloc_h=yes
+ac_cv_header_malloc_malloc_h=no
+ac_cv_header_alloca_h=yes
+ac_cv_header_langinfo_h=no
+ac_cv_header_glob_h=no
+ac_cv_header_wordexp_h=no
+ac_cv_header_sched_h=yes
+ac_cv_header_pthread_h=yes
+
+# --- type/size caches (armv7 hard-float) ---
+ac_cv_sizeof_int=4
+ac_cv_sizeof_long=4
+ac_cv_sizeof_long_long=8
+ac_cv_sizeof_voidp=4
+ac_cv_sizeof_float=4
+ac_cv_sizeof_double=8
+ac_cv_sizeof_size_t=4
+ac_cv_sizeof_ptrdiff_t=4
+# off_t, clock_t and time_t are measured by configure's target compile checks.
+# The build also rejects cached sizes that disagree with the target headers.
+ac_cv_sizeof_wchar_t=4
+ac_cv_sizeof_wint_t=4
+
+# --- endianness ---
+ac_cv_c_bigendian=no
