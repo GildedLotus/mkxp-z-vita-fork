@@ -785,7 +785,9 @@ public:
    *
    * @param istream An input stream
    */
-  parser(std::istream& istream) : istream(istream) {}
+  // Zero keeps the original unbounded behavior for other callers.
+  parser(std::istream& istream, std::size_t max_depth = 0)
+    : istream(istream), max_depth(max_depth) {}
 
   /**
    * @brief Apply flag manipulator
@@ -798,7 +800,7 @@ public:
   template <flags_type S, flags_type C>
   parser<((F&~C)|S)&M> operator>>(const manipulator_flags<S,C>& manip)
   {
-    return parser<((F&~C)|S)&M>(istream);
+    return parser<((F&~C)|S)&M>(istream, max_depth);
   }
 
   /**
@@ -1002,7 +1004,7 @@ private:
   void do_parse(value& v)
   {
     static const char context[] = "value";
-    parse_value(v, context);
+    parse_value(v, context, 0);
     if (F & flags::finished) {
       int ch = skip_spaces();
       if (ch != std::char_traits<char>::eof()) {
@@ -1017,18 +1019,21 @@ private:
    * @param v A value object to store parsed value
    * @param context A description of context
    */
-  void parse_value(value& v, const char *context)
+  void parse_value(value& v, const char *context, std::size_t depth)
   {
     int ch = skip_spaces();
+
+    if ((ch == '{' || ch == '[') && max_depth && depth >= max_depth)
+      throw std::runtime_error("JSON nesting depth limit exceeded");
 
     // [value]
     switch (ch) {
     case '{':
       // [object]
-      return parse_object(v);
+      return parse_object(v, depth + 1);
     case '[':
       // [array]
-      return parse_array(v);
+      return parse_array(v, depth + 1);
     case '"':
     case '\'':
       // [string]
@@ -1332,7 +1337,7 @@ private:
    *
    * @param v A value object to store parsed value
    */
-  void parse_array(value& v)
+  void parse_array(value& v, std::size_t depth)
   {
     static const char context[] = "array";
     v = array({});
@@ -1355,7 +1360,7 @@ private:
       }
       // [value]
       elements.emplace_back(nullptr);
-      parse_value(elements.back(), context);
+      parse_value(elements.back(), context, depth);
     }
   }
 
@@ -1396,7 +1401,7 @@ private:
    *
    * @param v A value object to store parsed value
    */
-  void parse_object(value& v)
+  void parse_object(value& v, std::size_t depth)
   {
     static const char context[] = "object";
     v = object({});
@@ -1426,11 +1431,12 @@ private:
       }
       // [value]
       auto result = elements.emplace(key, nullptr);
-      parse_value(result.first->second, context);
+      parse_value(result.first->second, context, depth);
     }
   }
 
   std::istream& istream;  ///< An input stream
+  const std::size_t max_depth;
 };
 
 /**
@@ -2079,14 +2085,15 @@ inline value parse(const void* pointer, std::size_t length)
  * @param finished If true, parse as finished(closed) JSON
  * @return JSON value
  */
-inline value parse5(std::istream& istream, bool finished = true)
+inline value parse5(std::istream& istream, bool finished = true,
+                    std::size_t max_depth = 0)
 {
   using namespace impl;
   value v;
   if (finished) {
-    parser<flags::json5_rules|flags::finished>(istream) >> v;
+    parser<flags::json5_rules|flags::finished>(istream, max_depth) >> v;
   } else {
-    parser<flags::json5_rules>(istream) >> v;
+    parser<flags::json5_rules>(istream, max_depth) >> v;
   }
   return v;
 }
@@ -2110,10 +2117,11 @@ inline value parse5(const value::json_type& string)
  * @param length Length of string (in bytes)
  * @return JSON value
  */
-inline value parse5(const void* pointer, std::size_t length)
+inline value parse5(const void* pointer, std::size_t length,
+                    std::size_t max_depth = 0)
 {
   impl::imemstream istream(pointer, length);
-  return parse5(istream, true);
+  return parse5(istream, true, max_depth);
 }
 
 /**

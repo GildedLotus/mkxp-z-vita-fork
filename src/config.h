@@ -85,6 +85,24 @@ struct Config {
     bool enableSettings;
     bool allowSymlinks;
     bool pathCache;
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* Fraction of SDL's int16 axis range a stick must travel before an axis
+     * binding counts as pressed. Vita only: off-device the
+     * gate stays stock's JAXIS_THRESHOLD_DEFAULT. Config::read clamps this to
+     * [JAXIS_DEADZONE_MIN, JAXIS_DEADZONE_MAX] and hands the resolved int16
+     * to setJAxisThreshold(); src/input/keybindings.h explains why the stock
+     * half-of-int16 gate is 50.4 percent of physical travel on this pad. */
+    double controllerDeadzone;
+
+    bool vitaTouchMouse;
+
+    /* vitaGL pool sizes in MiB; 0 = built-in default. Read only
+     * on the vitaGL backend; invalid values fall back in the glue. */
+    int vitaglRamPoolMiB;
+    int vitaglCdramPoolMiB;
+    int vitaglPhycontPoolMiB;
+#endif
     
     std::string dataPathOrg;
     std::string dataPathApp;

@@ -44,9 +44,7 @@ bool INIConfiguration::load (std::istream& is)
 	std::string currSectionName;
 
 	std::string line;
-	std::getline (is, line);
-
-	while (!is.eof() && !is.bad())
+	while (std::getline (is, line))
 	{
 		if (line[0] == '[')
 		{
@@ -69,8 +67,6 @@ bool INIConfiguration::load (std::istream& is)
 				addProperty (currSectionName, key , val);
 			}
 		}
-
-		std::getline (is, line);
 	}
 
 	if (is.bad())
