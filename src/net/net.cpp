@@ -5,6 +5,7 @@
 //  Created by ゾロアーク on 12/29/20.
 //
 
+#if !(defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC))
 #include <stdio.h>
 
 #if defined(MKXPZ_SSL)
@@ -242,3 +243,5 @@ HTTPResponse HTTPRequest::post(const char *body, const char *content_type) {
     delete client;
     return ret;
 }
+
+#endif

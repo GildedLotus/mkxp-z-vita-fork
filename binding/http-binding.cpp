@@ -10,6 +10,7 @@
 #include "util/json5pp.hpp"
 #include "binding-util.h"
 
+#if !(defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC))
 #include "net/net.h"
 
 VALUE stringMap2hash(mkxp_net::StringMap &map) {
@@ -194,6 +195,15 @@ RB_METHOD_GUARD(httpPostBody) {
 }
 RB_METHOD_GUARD_END
 
+#else
+// The player does not initialize sceNet; reject before parsing or dispatching.
+RB_METHOD(httpUnavailable) {
+    RB_UNUSED_PARAM;
+    rb_raise(rb_eNotImpError, "HTTPLite networking is not supported on PS Vita");
+    return Qnil;
+}
+#endif
+
 VALUE json2rb(json5pp::value const &v) {
     if (v.is_null())
         return Qnil;
@@ -311,9 +321,15 @@ RB_METHOD_GUARD_END
 
 void httpBindingInit() {
     VALUE mNet = rb_define_module("HTTPLite");
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    _rb_define_module_function(mNet, "get", httpUnavailable);
+    _rb_define_module_function(mNet, "post", httpUnavailable);
+    _rb_define_module_function(mNet, "post_body", httpUnavailable);
+#else
     _rb_define_module_function(mNet, "get", httpGet);
     _rb_define_module_function(mNet, "post", httpPost);
     _rb_define_module_function(mNet, "post_body", httpPostBody);
+#endif
     
     VALUE mNetJSON = rb_define_module_under(mNet, "JSON");
     _rb_define_module_function(mNetJSON, "stringify", httpJsonStringify);
