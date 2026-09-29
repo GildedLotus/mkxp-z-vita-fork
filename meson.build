@@ -73,6 +73,38 @@ elif gfx_backend == 'gl'
     # boop
 endif
 
+# Optional shaders (kglShadow H/V, bicubic, lanczos3). Some GLES2 drivers
+# fail to compile these at boot; ShaderSet constructs every program eagerly,
+# so one failure blocks startup. Disable to omit them entirely.
+if get_option('optional_shaders') == false
+    global_args += '-DMKXPZ_NO_OPTIONAL_SHADERS'
+endif
+
+# Expensive Vita render/input diagnostics are opt-in. Keep boot/error logs.
+if get_option('vita_frame_trace')
+    global_args += '-DVITA_GLUE_FRAME_TRACE=1'
+endif
+
+# CPU-authoritative Bitmap backend. Every Bitmap keeps
+# its pixels in client memory, all Bitmap mutation is software (vita/swraster),
+# and the GL texture is a lazily created, lazily uploaded, sample-only cache.
+# A Bitmap then never owns a render target, which is what exhausts the
+# fixed pool of GPU render surfaces. Off by default: stock mkxp-z
+# behaviour is untouched.
+if get_option('software_bitmaps') == true
+    global_args += '-DMKXPZ_SOFTWARE_BITMAPS'
+endif
+
+# Launcher mode. One eboot: with no
+# --game and no pinned root config it draws the game list with SDL2 alone and
+# never loads Ruby, and picking a game is sceAppMgrLoadExec of the same eboot.
+# MRI cannot be re-initialised in process, so "quit to the launcher" has to be
+# a process replacement, and a second eboot would double a 45 MB package.
+# Off by default: without it src/main.cpp is the pinned player it always was.
+if get_option('vita_launcher') == true
+    global_args += '-DMKXPZ_VITA_LAUNCHER'
+endif
+
 # ====================
 # Main source
 # ====================

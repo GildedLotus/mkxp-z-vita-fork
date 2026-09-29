@@ -21,3 +21,8 @@ option('steam_appid', type: 'string', value: '', description: 'Steam AppID. Set 
 option('steamshim_debug', type: 'boolean', value: false, description: 'Whether to show Steamshim debug messages in the console')
 
 option('gfx_backend', type: 'combo', value: 'gl', choices: ['gl', 'gles'], description: 'Graphics rendering API to use.')
+
+option('optional_shaders', type: 'boolean', value: true, description: 'Build optional shaders (kglShadow H/V, bicubic, lanczos3). Disable on drivers that fail to compile them at boot.')
+option('vita_frame_trace', type: 'boolean', value: false, description: 'Enable expensive Vita per-frame GL/input diagnostics (debug only).')
+option('software_bitmaps', type: 'boolean', value: false, description: 'CPU-authoritative Bitmap backend: software raster ops, GL texture as an upload-only sampling cache, no per-Bitmap render target.')
+option('vita_launcher', type: 'boolean', value: false, description: 'Build the on-device launcher into the player: same eboot, mode chosen by arguments and the root config.')
