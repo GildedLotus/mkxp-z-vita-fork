@@ -1,0 +1,25 @@
+diff --git a/thread_pthread.c b/thread_pthread.c
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -85,6 +85,21 @@
+ #define UBF_TIMER_POSIX 1
+ #define UBF_TIMER_PTHREAD 2
+ 
++#if defined(__vita__)
++/* Vita hardware: THREAD_MODEL=pthread is active even though
++ * vita/scripts/build-ruby-vita.sh passes --disable-pthread (ignored by Ruby 3.1
++ * configure; the real switch is --with-thread=, and this tree has no
++ * thread_none.c).  UBF_TIMER therefore defaults to UBF_TIMER_PTHREAD and
++ * ruby_setup spawns a timer thread via
++ * pthread_create(..., 0, timer_pthread_fn, ...) with VitaSDK's default
++ * 32 KiB stack.  On real hardware that thread prefetch-aborts at PC=0
++ * (privately retained ruby-harness crash dump, thread "pthread",
++ * stop_reason 0x30003).  Vita3K hides this.  Single-threaded Vita
++ * homebrew does not need the UBF timer; disable it. */
++# undef UBF_TIMER
++# define UBF_TIMER UBF_TIMER_NONE
++#endif
++
+ #ifndef UBF_TIMER
+ #  if defined(HAVE_TIMER_SETTIME) && defined(HAVE_TIMER_CREATE) && \
+       defined(CLOCK_MONOTONIC) && defined(USE_UBF_LIST)

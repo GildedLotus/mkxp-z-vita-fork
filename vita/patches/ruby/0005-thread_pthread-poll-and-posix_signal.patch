@@ -1,0 +1,30 @@
+diff --git a/thread_pthread.c b/thread_pthread.c
+index 6f0cc3d54c..85c15a30a9 100644
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -39,6 +39,11 @@
+ #endif
+ #include <time.h>
+ #include <signal.h>
++/* Vita/newlib: poll(2) exists (sceNetEpoll-backed) but configure may not
++   define HAVE_POLL, and thread.c only pulls <poll.h> via ruby/io.h when
++   HAVE_POLL is set. thread_pthread.c uses struct pollfd/nfds_t/POLLIN
++   unconditionally, so include the header here. */
++#include <poll.h>
+ 
+ #if defined(HAVE_SYS_EVENTFD_H) && defined(HAVE_EVENTFD)
+ #  define USE_EVENTFD (1)
+@@ -659,7 +664,13 @@ Init_native_thread(rb_thread_t *th)
+     ruby_thread_set_native(th);
+     fill_thread_id_str(th);
+     native_thread_init(th);
++#ifdef POSIX_SIGNAL
+     posix_signal(SIGVTALRM, null_func);
++#else
++    /* Vita/newlib: no sigaction => POSIX_SIGNAL undefined, posix_signal
++       is not compiled. BSD signal() is enough for the UBF timer poke. */
++    signal(SIGVTALRM, null_func);
++#endif
+ }
+ 
+ #ifdef RB_THREAD_T_HAS_NATIVE_ID

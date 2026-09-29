@@ -1,0 +1,35 @@
+diff --git a/addr2line.c b/addr2line.c
+--- a/addr2line.c
++++ b/addr2line.c
+@@ -1873,6 +1873,7 @@
+ 	/* main executable */
+ 	offset = 0;
+ 	if (dynsym_shdr && dynstr_shdr) {
++#ifdef HAVE_DLADDR
+ 	    char *strtab = file + dynstr_shdr->sh_offset;
+ 	    ElfW(Sym) *symtab = (ElfW(Sym) *)(file + dynsym_shdr->sh_offset);
+ 	    int symtab_count = (int)(dynsym_shdr->sh_size / sizeof(ElfW(Sym)));
+@@ -1892,6 +1893,7 @@
+                 }
+                 dlclose(handle);
+             }
++#endif /* HAVE_DLADDR */
+ 	    if (ehdr->e_type == ET_EXEC) {
+ 		obj->base_addr = 0;
+ 	    }
+@@ -2318,6 +2320,7 @@
+ 
+     /* fill source lines by reading dwarf */
+     for (i = 0; i < num_traces; i++) {
++#ifdef HAVE_DLADDR
+ 	Dl_info info;
+ 	if (lines[i].line) continue;
+ 	if (dladdr(traces[i], &info)) {
+@@ -2346,6 +2349,7 @@
+ 	    if (fill_lines(num_traces, traces, 1, &obj, lines, i) == (uintptr_t)-1)
+ 		break;
+ 	}
++#endif /* HAVE_DLADDR */
+ next_line:
+ 	continue;
+     }

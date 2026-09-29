@@ -1,0 +1,31 @@
+diff --git a/gc.c b/gc.c
+--- a/gc.c
++++ b/gc.c
+@@ -5045,7 +5045,7 @@
+      * to si_addr from sigaction */
+     old_handler = SetUnhandledExceptionFilter(read_barrier_signal);
+ }
+-#else
++#elif defined(HAVE_SIGACTION)
+ static struct sigaction old_sigbus_handler;
+ static struct sigaction old_sigsegv_handler;
+ 
+@@ -5091,6 +5091,18 @@
+ 
+     sigaction(SIGBUS, &action, &old_sigbus_handler);
+     sigaction(SIGSEGV, &action, &old_sigsegv_handler);
++}
++#else
++/* Vita/newlib: no sigaction. GC read-barrier protection cannot use
++   fault handlers; compaction stays off. */
++static void
++uninstall_handlers(void)
++{
++}
++
++static void
++install_handlers(void)
++{
+ }
+ #endif
+ 

@@ -1,0 +1,420 @@
+# vitagl-0001: OOM error contract for texture/buffer backing allocations.
+# At this pin a failed gpu_alloc_mapped_* leaves textures/buffers silently empty and
+# several paths copy into NULL. On backing-allocation failure the GL entry
+# points now report GL_OUT_OF_MEMORY through the existing SET_GL_ERROR
+# mechanism: gpu_alloc_texture and the level-0 path of
+# gpu_alloc_compressed_texture release the previous storage only after a
+# successful allocation (transactional re-specification); cube/paletted/planar
+# helpers mark the object cleanly unused instead; the glTexSubImage2D
+# orphan-copy, POT/ETC staging buffers, glCopyTexImage2D, glBufferSubData
+# orphan-copy, glNamedBufferData (stale-size reset) and _glReadPixels_gpu
+# temps no longer write through NULL; FBO render-target and depth/stencil
+# allocation failures set vgl_error (scene flow unchanged). The frame purge
+# lists drop instead of overwrite past their slots, and the circular-pool
+# fallback no longer queues a NULL entry that would stop the GC scan early.
+diff --git a/source/buffers.c b/source/buffers.c
+index 9ef4257..9b32f8d 100644
+--- a/source/buffers.c
++++ b/source/buffers.c
+@@ -425,6 +425,8 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
+ 
+ #ifndef SKIP_ERROR_HANDLING
+ 	if (!gpu_buf->ptr) {
++		// A stale size would let a later glBufferSubData write at NULL
++		gpu_buf->size = 0;
+ 		SET_GL_ERROR(GL_OUT_OF_MEMORY)
+ 	}
+ #endif
+@@ -482,12 +484,10 @@ inline void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size
+ 		uint8_t *ptr = gpu_buf->alloc_func(gpu_buf->size);
+ #endif
+ 
+-#ifdef LOG_ERRORS
++		// A failed orphan copy must not fall through into a NULL copy
+ 		if (!ptr) {
+-			vgl_log("%s:%d glBufferSubData failed to alloc a buffer of %ld bytes. Buffer content won't be updated.\n", __FILE__, __LINE__, gpu_buf->size);
+-			return;
++			SET_GL_ERROR(GL_OUT_OF_MEMORY)
+ 		}
+-#endif
+ 
+ 		// Copying up previous data combined to modified data
+ 		if (offset > 0)
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index 15e59ea..d2f5a1f 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -111,6 +111,9 @@ GLboolean _glReadPixels_gpu(GLint x, GLint y, GLsizei width, GLsizei height, GLe
+ 			return GL_FALSE;
+ 		}
+ 		dst = is_mapped ? data : gpu_alloc_mapped_temp(width * height * dst_bpp);
++		if (!dst) {
++			SET_GL_ERROR_WITH_RET(GL_OUT_OF_MEMORY, GL_FALSE)
++		}
+ #ifndef HAVE_UNFLIPPED_FBOS
+ 		uint8_t *src = (uint8_t *)active_read_fb->data;
+ 		int stride = active_read_fb->stride;
+@@ -126,6 +129,9 @@ GLboolean _glReadPixels_gpu(GLint x, GLint y, GLsizei width, GLsizei height, GLe
+ #endif
+ 	} else {
+ 		dst = is_mapped ? data : gpu_alloc_mapped_temp(width * height * dst_bpp);
++		if (!dst) {
++			SET_GL_ERROR_WITH_RET(GL_OUT_OF_MEMORY, GL_FALSE)
++		}
+ 		uint8_t *src;
+ 		if (display_read_mode == GL_BACK) {
+ 			src = (uint8_t *)gxm_color_surfaces_addr[gxm_back_buffer_index];
+diff --git a/source/gxm.c b/source/gxm.c
+index 4cbb40b..786917e 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -502,6 +502,12 @@ void init_depth_stencil_buffer(uint32_t w, uint32_t h, SceGxmDepthStencilSurface
+ 	// Allocating stencil surface
+ #ifndef DEPTH_STENCIL_HACK
+ 	void *stencil_buffer = has_stencil ? gpu_alloc_mapped_aligned_for_gpu(SCE_GXM_DEPTHSTENCIL_SURFACE_ALIGNMENT, depth_stencil_samples) : NULL;
++
++	// Attachment storage exhaustion is reported; the surface init itself
++	// cannot be skipped without reworking the scene state machine
++	if (!depth_buffer || (has_stencil && !stencil_buffer)) {
++		vgl_error = GL_OUT_OF_MEMORY;
++	}
+ #endif
+ 
+ 	// Initializing depth and stencil surfaces
+@@ -647,11 +653,12 @@ void scene_reset(void) {
+ 				active_write_fb->target = (SceGxmRenderTarget *)get_free_render_target(active_write_fb->width, active_write_fb->height);
+ #else
+ 				int r = setup_render_target(&active_write_fb->target, active_write_fb->width, active_write_fb->height, gxm_fbo_rt_size);
+-#ifdef LOG_ERRORS
+ 				if (r) {
++					vgl_error = GL_OUT_OF_MEMORY;
++#ifdef LOG_ERRORS
+ 					vgl_log("%s:%d Failed to create a rendertarget of size %dx%d for framebuffer 0x%08X (%s).\n", __FILE__, __LINE__, active_write_fb->width, active_write_fb->height, active_write_fb, get_gxm_error_literal(r));
+-				}
+ #endif
++				}
+ #endif
+ 			}
+ #ifdef RECYCLE_RENDERTARGETS
+diff --git a/source/textures.c b/source/textures.c
+index 7b5d704..4733a9c 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -888,6 +888,9 @@ static inline __attribute__((always_inline)) void _glTexImage2D_FlatIMPL(texture
+ 			void *target_data = (void *)data;
+ 			if ((uintptr_t)read_cb != (uintptr_t)read_rgba8888) {
+ 				target_data = vglMalloc(pot_w * pot_h * 4);
++				if (!target_data) {
++					SET_GL_ERROR(GL_OUT_OF_MEMORY)
++				}
+ 				if (data) {
+ 					uint8_t *src = (uint8_t *)data;
+ 					uint32_t *dst = target_data;
+@@ -902,6 +905,9 @@ static inline __attribute__((always_inline)) void _glTexImage2D_FlatIMPL(texture
+ 				}
+ 			} else if (pot_w != width || pot_h != height) {
+ 				target_data = vglMalloc(pot_w * pot_h * 4);
++				if (!target_data) {
++					SET_GL_ERROR(GL_OUT_OF_MEMORY)
++				}
+ 				if (data) {
+ 					uint32_t *src = (uint32_t *)data;
+ 					uint32_t *dst = target_data;
+@@ -1000,6 +1006,10 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
+ 			size = orig_h * VGL_ALIGN(orig_w, 8) * bpp;
+ 		}
+ 		void *texture_data = gpu_alloc_mapped_for_gpu(size);
++		if (!texture_data) {
++			// The in-place texture is kept intact and the upload refused
++			SET_GL_ERROR(GL_OUT_OF_MEMORY)
++		}
+ 		vgl_fast_memcpy(texture_data, tex->data, size);
+ 		gpu_free_texture_data(tex);
+ 		sceGxmTextureSetData(&tex->gxm_tex, texture_data);
+@@ -1502,6 +1512,9 @@ void _glCompressedTexImage2D(texture *tex, GLenum target, GLint level, GLenum in
+ #endif
+ 				non_native_format = GL_TRUE;
+ 				decompressed_data = vglMalloc(width * height * 3);
++				if (!decompressed_data) {
++					SET_GL_ERROR(GL_OUT_OF_MEMORY)
++				}
+ 				if (data) {
+ 					etc1_decode_image((etc1_byte *)data, (etc1_byte *)decompressed_data, width, height, 3, width * 3);
+ 				}
+@@ -1518,6 +1531,9 @@ void _glCompressedTexImage2D(texture *tex, GLenum target, GLint level, GLenum in
+ 		case GL_COMPRESSED_RGBA8_ETC2_EAC:
+ 			non_native_format = GL_TRUE;
+ 			decompressed_data = vglMalloc(width * height * 4);
++			if (!decompressed_data) {
++				SET_GL_ERROR(GL_OUT_OF_MEMORY)
++			}
+ 			if (data) {
+ 				eac_decode((uint8_t *)data, decompressed_data, width, height, EAC_ETC2);
+ 			}
+@@ -1532,6 +1548,9 @@ void _glCompressedTexImage2D(texture *tex, GLenum target, GLint level, GLenum in
+ 		case GL_ATC_RGB_AMD:
+ 			non_native_format = GL_TRUE;
+ 			decompressed_data = vglMalloc(width * height * 4);
++			if (!decompressed_data) {
++				SET_GL_ERROR(GL_OUT_OF_MEMORY)
++			}
+ 			if (data) {
+ 				atitc_decode((uint8_t *)data, decompressed_data, width, height, ATC_RGB);
+ 			}
+@@ -1546,6 +1565,9 @@ void _glCompressedTexImage2D(texture *tex, GLenum target, GLint level, GLenum in
+ 		case GL_ATC_RGBA_EXPLICIT_ALPHA_AMD:
+ 			non_native_format = GL_TRUE;
+ 			decompressed_data = vglMalloc(width * height * 4);
++			if (!decompressed_data) {
++				SET_GL_ERROR(GL_OUT_OF_MEMORY)
++			}
+ 			if (data) {
+ 				atitc_decode((uint8_t *)data, decompressed_data, width, height, ATC_EXPLICIT_ALPHA);
+ 			}
+@@ -1560,6 +1582,9 @@ void _glCompressedTexImage2D(texture *tex, GLenum target, GLint level, GLenum in
+ 		case GL_ATC_RGBA_INTERPOLATED_ALPHA_AMD:
+ 			non_native_format = GL_TRUE;
+ 			decompressed_data = vglMalloc(width * height * 4);
++			if (!decompressed_data) {
++				SET_GL_ERROR(GL_OUT_OF_MEMORY)
++			}
+ 			if (data) {
+ 				atitc_decode((uint8_t *)data, decompressed_data, width, height, ATC_INTERPOLATED_ALPHA);
+ 			}
+@@ -2265,6 +2290,9 @@ void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x
+ 	}
+ #endif
+ 	void *tmp = vglMalloc(width * height * 4);
++	if (!tmp) {
++		SET_GL_ERROR(GL_OUT_OF_MEMORY)
++	}
+ 	glReadPixels(x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+ 	glTexImage2D(target, level, internalformat, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+ 	vgl_free(tmp);
+@@ -2284,6 +2312,9 @@ void glCopyTextureImage2D(GLuint tex_id, GLint level, GLenum internalformat, GLi
+ 	}
+ #endif
+ 	void *tmp = vglMalloc(width * height * 4);
++	if (!tmp) {
++		SET_GL_ERROR(GL_OUT_OF_MEMORY)
++	}
+ 	glReadPixels(x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+ 	glTextureImage2D(tex_id, level, internalformat, width, height, border, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+ 	vgl_free(tmp);
+diff --git a/source/utils/gpu_utils.c b/source/utils/gpu_utils.c
+index 4464db5..67f5b3a 100644
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -325,6 +325,10 @@ void *gpu_alloc_palette(const void *data, uint32_t w, uint32_t bpe) {
+ 	void *texture_palette = gpu_alloc_mapped_aligned_for_gpu(SCE_GXM_PALETTE_ALIGNMENT, 256 * sizeof(uint32_t));
+ 
+ 	// Initializing palette
++	if (!texture_palette) {
++		SET_GL_ERROR_WITH_RET(GL_OUT_OF_MEMORY, NULL)
++	}
++
+ 	if (data == NULL)
+ 		vgl_memset(texture_palette, 0, 256 * sizeof(uint32_t));
+ 	else if (bpe == 4)
+@@ -380,14 +384,14 @@ void gpu_alloc_cube_texture(uint32_t w, uint32_t h, SceGxmTextureFormat format,
+ #ifdef HAVE_TEX_CACHE
+ 		mark_as_cacheable(tex)
+ #endif
++	} else {
++		// The old face storage was already recycled
++		tex->status = TEX_UNUSED;
++		SET_GL_ERROR(GL_OUT_OF_MEMORY)
+ 	}
+ }
+ 
+ void gpu_alloc_texture(uint32_t w, uint32_t h, SceGxmTextureFormat format, const void *data, texture *tex, uint8_t src_bpp, uint32_t (*read_cb)(void *), void (*write_cb)(void *, uint32_t), GLboolean fast_store) {
+-	// If there's already a texture in passed texture object we first dealloc it
+-	if (tex->status == TEX_VALID)
+-		gpu_free_texture_data(tex);
+-
+ 	// Getting texture format bpp
+ 	uint8_t bpp = tex_format_to_bytespp(format);
+ 
+@@ -397,6 +401,11 @@ void gpu_alloc_texture(uint32_t w, uint32_t h, SceGxmTextureFormat format, const
+ 	void *texture_data = gpu_alloc_mapped_for_gpu(tex_size);
+ 
+ 	if (texture_data) {
++		// The previous storage is released only after a successful
++		// allocation, so a failed re-specification keeps the texture intact
++		if (tex->status == TEX_VALID)
++			gpu_free_texture_data(tex);
++
+ 		// Initializing texture data buffer
+ 		if (data) {
+ 			uint8_t *src = (uint8_t *)data;
+@@ -441,6 +450,8 @@ void gpu_alloc_texture(uint32_t w, uint32_t h, SceGxmTextureFormat format, const
+ #ifdef HAVE_TEX_CACHE
+ 		mark_as_cacheable(tex)
+ #endif
++	} else {
++		SET_GL_ERROR(GL_OUT_OF_MEMORY)
+ 	}
+ }
+ 
+@@ -467,6 +478,12 @@ void gpu_alloc_paletted_texture(int32_t level, uint32_t w, uint32_t h, SceGxmTex
+ 	tex->palette_data = gpu_alloc_mapped_aligned_for_gpu(SCE_GXM_PALETTE_ALIGNMENT, num_entries * sizeof(uint32_t));
+ 	tex->data = gpu_alloc_mapped_for_gpu(tex_size);
+ 
++	// Both backing stores are required before any byte is written
++	if (!tex->palette_data || !tex->data) {
++		tex->status = TEX_UNUSED;
++		SET_GL_ERROR(GL_OUT_OF_MEMORY)
++	}
++
+ 	// Populating palette data
+ 	uint32_t *palette_data = (uint32_t *)tex->palette_data;
+ 	if (data) {
+@@ -657,14 +674,14 @@ void gpu_alloc_compressed_cube_texture(uint32_t w, uint32_t h, SceGxmTextureForm
+ #ifdef HAVE_TEX_CACHE
+ 		mark_as_cacheable(tex)
+ #endif
++	} else {
++		// The old face storage was already recycled
++		tex->status = TEX_UNUSED;
++		SET_GL_ERROR(GL_OUT_OF_MEMORY)
+ 	}
+ }
+ 
+ void gpu_alloc_compressed_texture(int32_t mip_level, uint32_t w, uint32_t h, SceGxmTextureFormat format, uint32_t image_size, const void *data, texture *tex, uint8_t src_bpp, GLboolean uncompressed) {
+-	// If there's already a texture in passed texture object we first dealloc it
+-	if (tex->status == TEX_VALID && !mip_level)
+-		gpu_free_texture_data(tex);
+-
+ 	// Calculating swizzled compressed texture size on memory
+ 	if (!image_size)
+ 		image_size = gpu_get_compressed_mip_size(mip_level, w, h, format);
+@@ -702,6 +719,10 @@ void gpu_alloc_compressed_texture(int32_t mip_level, uint32_t w, uint32_t h, Sce
+ 			if (!texture_data) {
+ 				// Reallocation in the same mspace failed, try manually.
+ 				texture_data = gpu_alloc_mapped_for_gpu(tex_size);
++				if (!texture_data) {
++					// The previous mipchain is kept intact and reported
++					SET_GL_ERROR(GL_OUT_OF_MEMORY)
++				}
+ 				const int old_data_size = gpu_get_compressed_mipchain_size(mip_count, aligned_max_width, aligned_max_height, format);
+ 				vgl_memcpy(texture_data, tex->data, old_data_size);
+ 				gpu_free_texture_data(tex);
+@@ -717,6 +738,13 @@ void gpu_alloc_compressed_texture(int32_t mip_level, uint32_t w, uint32_t h, Sce
+ 		texture_data = gpu_alloc_mapped_for_gpu(tex_size);
+ 	}
+ 
++	// A failed level-0 allocation keeps the previous storage intact
++	if (!mip_level && !texture_data) {
++		SET_GL_ERROR(GL_OUT_OF_MEMORY)
++	}
++	if (!mip_level && tex->status == TEX_VALID)
++		gpu_free_texture_data(tex);
++
+ 	// Initializing texture data buffer
+ 	if (texture_data) {
+ 		void *mip_data = (void *)((uint8_t *)texture_data + mip_offset);
+@@ -855,6 +883,10 @@ void gpu_alloc_mipmaps(int level, texture *tex) {
+ 		if (count <= 0 && !texture_data) {
+ 			// Reallocation in the same mspace failed, try manually.
+ 			texture_data = gpu_alloc_mapped_for_gpu(size);
++			if (!texture_data) {
++				// The existing mipchain is kept intact and reported
++				SET_GL_ERROR(GL_OUT_OF_MEMORY)
++			}
+ 			vgl_memcpy(texture_data, tex->data, VGL_ALIGN(orig_w, 8) * orig_h * bpp);
+ 			gpu_free_texture_data(tex);
+ 		}
+@@ -1006,5 +1038,9 @@ void gpu_alloc_planar_texture(uint32_t w, uint32_t h, SceGxmTextureFormat format
+ #ifdef HAVE_TEX_CACHE
+ 		mark_as_cacheable(tex)
+ #endif
++	} else {
++		// The old storage was already recycled
++		tex->status = TEX_UNUSED;
++		SET_GL_ERROR(GL_OUT_OF_MEMORY)
+ 	}
+ }
+diff --git a/source/utils/mem_utils.h b/source/utils/mem_utils.h
+index 80f3f86..b2d26b8 100644
+--- a/source/utils/mem_utils.h
++++ b/source/utils/mem_utils.h
+@@ -50,16 +50,16 @@ extern int frame_purge_idx; // Index for currently populatable purge list
+ extern int frame_elem_purge_idx; // Index for currently populatable purge list element
+ extern int frame_rt_purge_idx; // Index for currently populatable purge list rendertarget
+ 
+-// Macro to mark a pointer or a rendertarget as dirty for garbage collection
+-#ifdef DEBUG_GC
++// Macro to mark a pointer or a rendertarget as dirty for garbage collection.
++// A frame slot that is already full drops the deferred free (a bounded leak
++// with a logged trace) instead of writing past the purge list.
+ #define mark_as_dirty(x) \
+-	if (frame_elem_purge_idx >= FRAME_PURGE_LIST_SIZE) { \
+-		vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_LIST_SIZE.\n", __FILE__, __LINE__); \
+-	} \
+-	frame_purge_list[frame_purge_idx][frame_elem_purge_idx++] = x
+-#else
+-#define mark_as_dirty(x) frame_purge_list[frame_purge_idx][frame_elem_purge_idx++] = x
+-#endif
++	do { \
++		if (frame_elem_purge_idx >= FRAME_PURGE_LIST_SIZE) { \
++			vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_LIST_SIZE.\n", __FILE__, __LINE__); \
++		} else \
++			frame_purge_list[frame_purge_idx][frame_elem_purge_idx++] = x; \
++	} while (0)
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ typedef struct {
+ 	SceGxmRenderTarget *rt;
+@@ -72,26 +72,22 @@ typedef struct {
+ #endif
+ } render_target;
+ void __mark_rt_as_dirty(render_target *rt);
+-#ifdef DEBUG_GC
+ #define _mark_rt_as_dirty(x) \
+-	if (frame_rt_purge_idx >= FRAME_PURGE_RENDERTARGETS_LIST_SIZE) { \
+-		vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_RENDERTARGETS_LIST_SIZE.\n", __FILE__, __LINE__); \
+-	} \
+-	frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x
+-#else
+-#define _mark_rt_as_dirty(x) frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x
+-#endif
++	do { \
++		if (frame_rt_purge_idx >= FRAME_PURGE_RENDERTARGETS_LIST_SIZE) { \
++			vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_RENDERTARGETS_LIST_SIZE.\n", __FILE__, __LINE__); \
++		} else \
++			frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x; \
++	} while (0)
+ #define mark_rt_as_dirty(x) __mark_rt_as_dirty((render_target *)x)
+ #else
+-#ifdef DEBUG_GC
+ #define mark_rt_as_dirty(x) \
+-	if (frame_rt_purge_idx >= FRAME_PURGE_RENDERTARGETS_LIST_SIZE) { \
+-		vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_RENDERTARGETS_LIST_SIZE.\n", __FILE__, __LINE__); \
+-	} \
+-	frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x
+-#else
+-#define mark_rt_as_dirty(x) frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x
+-#endif
++	do { \
++		if (frame_rt_purge_idx >= FRAME_PURGE_RENDERTARGETS_LIST_SIZE) { \
++			vgl_log("%s:%d Garbage collector overflow. Consider increasing FRAME_PURGE_RENDERTARGETS_LIST_SIZE.\n", __FILE__, __LINE__); \
++		} else \
++			frame_rt_purge_list[frame_purge_idx][frame_rt_purge_idx++] = x; \
++	} while (0)
+ #endif
+ 
+ void vgl_mem_init(size_t size_ram, size_t size_cdram, size_t size_phycont, size_t size_cdlg);
+diff --git a/source/vgl.c b/source/vgl.c
+index 014e790..51d4bdd 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -140,7 +140,9 @@ uint8_t *vgl_reserve_data_pool(uint32_t size) {
+ 			vgl_log("%s:%d gpu_alloc_mapped_for_cpu failed with a requested size of %u bytes.\n", __FILE__, __LINE__, size);
+ 		}
+ #endif
+-		mark_as_dirty(res);
++		// A NULL entry would stop the garbage collector scan early
++		if (res)
++			mark_as_dirty(res);
+ 	}
+ #else
+ #ifdef LOG_ERRORS

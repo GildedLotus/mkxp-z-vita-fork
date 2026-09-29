@@ -1,0 +1,26 @@
+# vitagl-0008: title-id buffer contract in vglInitWithCustomSizes (review finding: 12-byte
+# titleid passed to sceAppMgrAppParamGetString with length 256).
+# - vgl.c: the length argument is the buffer size, so the kernel was told it could write 256 bytes into a
+#   12-byte stack array (a stack overwrite for any parameter longer than 11 characters; real title IDs are
+#   9, which is why it never showed). The call now fills a zeroed scratch buffer with sizeof - 1, so the
+#   last byte stays NUL, and a failed or empty read leaves "UNKNOWN": the old code kept an uninitialised
+#   array and built the shader-cache and texture-cache directory names from it.
+# The same review also noted the CDLG pool disabling common dialogs; that needs no vitaGL change: sdl2-0002
+# already refuses the message box while a pool is held.
+diff --git a/source/vgl.c b/source/vgl.c
+index 1aba7f6..82cfab8 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -184,8 +184,10 @@ GLboolean vglInitWithCustomSizes(int pool_size, int width, int height, int ram_p
+ #endif
+ 
+ #if defined(HAVE_SHADER_CACHE) || defined(HAVE_TEX_CACHE)
+-	char titleid[12];
+-	sceAppMgrAppParamGetString(0, 12, titleid , 256);
++	char titleid[12] = "UNKNOWN";
++	char param[12] = {};
++	if (sceAppMgrAppParamGetString(0, 12, param, sizeof(param) - 1) >= 0 && param[0])
++		strcpy(titleid, param);
+ #endif
+ #ifdef HAVE_TEX_CACHE
+ 	sceIoMkdir("ux0:data/vgl_cache", 0777);

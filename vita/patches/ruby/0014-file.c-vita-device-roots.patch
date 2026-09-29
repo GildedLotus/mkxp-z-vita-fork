@@ -1,0 +1,99 @@
+From: mkxp-z-vita
+Subject: [PATCH] file.c: preserve Vita device roots through Ruby path resolution
+
+A packaged game on a physical Vita reached its Scripts.rvdata2 entry but could not
+require date although app0:/ruby/date.rb was present and checksum verified.
+MRI treated app0:/ruby as relative to the game cwd. Teach the existing path
+machinery Vita mount prefixes, including expansion, realpath fallback and
+dirname (used by require_relative). Keep normal require and feature caching.
+Only __vita__ changes; do not enable DOS path or backslash semantics.
+
+--- a/file.c
++++ b/file.c
+@@ -3423,9 +3423,27 @@
+ #endif
+ #endif
+ 
++#ifdef __vita__
++/* Newlib accepts Vita mount paths directly.  They are roots, not relative
++ * filenames or DOS drive-relative paths (app0:foo remains relative). */
++static size_t
++vita_device_prefix_length(const char *path, const char *end)
++{
++    const char *p = path;
++    if (p == end || !ISALPHA((unsigned char)*p)) return 0;
++    while (p < end && ISALNUM((unsigned char)*p)) ++p;
++    if (end - p >= 2 && p[0] == ':' && p[1] == '/')
++        return p + 1 - path;
++    return 0;
++}
++#endif
++
+ static inline char *
+ skiproot(const char *path, const char *end, rb_encoding *enc)
+ {
++#ifdef __vita__
++    path += vita_device_prefix_length(path, end);
++#endif
+ #ifdef DOSISH_DRIVE_LETTER
+     if (path + 2 <= end && has_drive_letter(path)) path += 2;
+ #endif
+@@ -3443,7 +3461,7 @@
+     return (char *)s;
+ }
+ 
+-#if defined(DOSISH_UNC) || defined(DOSISH_DRIVE_LETTER)
++#if defined(DOSISH_UNC) || defined(DOSISH_DRIVE_LETTER) || defined(__vita__)
+ #define skipprefix rb_enc_path_skip_prefix
+ #else
+ #define skipprefix(path, end, enc) (path)
+@@ -3451,6 +3469,9 @@
+ char *
+ rb_enc_path_skip_prefix(const char *path, const char *end, rb_encoding *enc)
+ {
++#ifdef __vita__
++    path += vita_device_prefix_length(path, end);
++#endif
+ #if defined(DOSISH_UNC) || defined(DOSISH_DRIVE_LETTER)
+ #ifdef DOSISH_UNC
+     if (path + 2 <= end && isdirsep(path[0]) && isdirsep(path[1])) {
+@@ -3804,6 +3825,16 @@
+ 	BUFINIT();
+ 	p = pend;
+     }
++#ifdef __vita__
++    else if (vita_device_prefix_length(s, fend)) {
++        size_t prefixlen = vita_device_prefix_length(s, fend);
++        BUFCHECK(bdiff + prefixlen >= buflen);
++        memcpy(p, s, prefixlen);
++        p += prefixlen;
++        s += prefixlen;
++        rb_enc_copy(result, fname);
++    }
++#endif
+ #ifdef DOSISH_DRIVE_LETTER
+     /* skip drive letter */
+     else if (has_drive_letter(s)) {
+@@ -4821,7 +4852,11 @@
+     if (root > name + 1 && isdirsep(*name))
+ 	root = skipprefix(name = root - 2, end, enc);
+ #else
+-    if (root > name + 1)
++    if (root > name + 1
++#ifdef __vita__
++        && !vita_device_prefix_length(name, end)
++#endif
++    )
+ 	name = root - 1;
+ #endif
+     if (n > (end - root + 1) / 2) {
+@@ -6284,6 +6319,9 @@
+ int
+ rb_is_absolute_path(const char *path)
+ {
++#ifdef __vita__
++    if (vita_device_prefix_length(path, path + strlen(path))) return 1;
++#endif
+ #ifdef DOSISH_DRIVE_LETTER
+     if (has_drive_letter(path) && isdirsep(path[2])) return 1;
+ #endif

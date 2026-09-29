@@ -1,0 +1,20 @@
+diff --git a/object.c b/object.c
+--- a/object.c
++++ b/object.c
+@@ -4556,6 +4556,16 @@ InitVM_Object(void)
+     rb_define_method(rb_mKernel, "trust", rb_obj_trust, 0);
+     rb_define_method(rb_mKernel, "freeze", rb_obj_freeze, 0);
+
++    /* Kernel#class is NOT a C method upstream — it lives in
++       kernel.rb (Primitive.cexpr! 'rb_obj_class(self)') and is installed
++       only when rb_call_builtin_inits() runs (MRI CLI ruby_options path,
++       or an embedder that calls it explicitly). Under Vita, that prelude
++       was missing so `e.class` raised NoMethodError while
++       RuntimeError === e / e.message / e.backtrace still worked (all C).
++       Define the C equivalent here so #class always exists. kernel.rb may
++       later replace it with the inlined form — that is fine. */
++    rb_define_method(rb_mKernel, "class", rb_obj_class, 0);
++
+     rb_define_method(rb_mKernel, "to_s", rb_any_to_s, 0);
+     rb_define_method(rb_mKernel, "inspect", rb_obj_inspect, 0);
+     rb_define_method(rb_mKernel, "methods", rb_obj_methods, -1); /* in class.c */

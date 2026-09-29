@@ -1,0 +1,309 @@
+Subject: [Vita] Bound Ruby worker startup without exposing reclaimed thread state
+
+Use a five-second realtime deadline and an atomic ready/cancel decision. Fresh
+and cached children prepare stack/TLS through a separate two-owner record;
+only accepted children may dereference the Ruby thread. Reuse the interrupt
+pair, and cap unreclaimable no-entry records at eight instead of allocating
+unbounded tombstones. A late child releases its record without running Ruby.
+Timed waits use realtime on this build; a forward clock step larger than the deadline can end the wait early.
+Cancellation remains safe: a late child sees 'cancelled', and the only effect is a spurious ThreadError.
+
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -801,7 +801,7 @@
+ }
+ 
+ #if USE_THREAD_CACHE
+-static rb_thread_t *register_cached_thread_and_wait(void *);
++static void *register_cached_thread_and_wait(void *);
+ #endif
+ 
+ #if defined(__vita__)
+@@ -1110,6 +1110,26 @@
+ #define CHECK_ERR(expr) \
+     {int err = (expr); if (err) {rb_bug_errno(#expr, err);}}
+ 
++#ifdef __vita__
++static int
++vita_worker_stack(size_t vm_size, VALUE **stack_start, size_t *stack_maxsize)
++{
++    rb_nativethread_id_t curr = pthread_self();
++    void *start;
++    size_t size;
++    int err = get_stack(&start, &size);
++    if (err) return err > 0 ? err : EIO;
++    if (!start || (uintptr_t)start < (uintptr_t)&curr ||
++        (uintptr_t)start - (uintptr_t)&curr >= size) return EINVAL;
++    size -= (uintptr_t)start - (uintptr_t)&curr;
++    /* gc.c reserves 2048 VALUEs below the VM stack. */
++    if (size <= vm_size || size - vm_size <= 2048 * sizeof(VALUE)) return ERANGE;
++    *stack_start = (VALUE *)&curr;
++    *stack_maxsize = size;
++    return 0;
++}
++#endif
++
+ static int
+ native_thread_init_stack(rb_thread_t *th)
+ {
+@@ -1125,16 +1145,14 @@
+ 	th->ec->machine.stack_maxsize = native_main_thread.stack_maxsize;
+     }
+     else {
+-#ifdef STACKADDR_AVAILABLE
++#ifdef __vita__
++        return vita_worker_stack(th->vm->default_params.thread_vm_stack_size,
++                                 &th->ec->machine.stack_start, &th->ec->machine.stack_maxsize);
++#elif defined(STACKADDR_AVAILABLE)
+ 	void *start;
+ 	size_t size;
+ 
+         int err = get_stack(&start, &size);
+-#ifdef __vita__
+-        if (err) return err > 0 ? err : EIO;
+-        if (!start || (uintptr_t)start < (uintptr_t)&curr ||
+-            (uintptr_t)start - (uintptr_t)&curr >= size) return EINVAL;
+-#endif
+ 	if (err == 0) {
+ 	    uintptr_t diff = (uintptr_t)start - (uintptr_t)&curr;
+ 	    th->ec->machine.stack_start = (VALUE *)&curr;
+@@ -1163,34 +1181,95 @@
+ #endif
+ 
+ #ifdef __vita__
+-static int
+-vita_thread_startup(rb_thread_t *th)
+-{
+-    int err = native_thread_init_stack(th);
++#ifndef VITA_THREAD_STARTUP_TIMEOUT
++#define VITA_THREAD_STARTUP_TIMEOUT (5 * RB_HRTIME_PER_SEC)
++#endif
++
++/* Cancelled records cannot be reused until their child has exited startup.
++ * Eight absent children exhaust this pool instead of leaking without bound. */
++enum { VITA_START_PENDING, VITA_START_READY, VITA_START_CANCELLED };
++struct vita_thread_startup {
++    rb_atomic_t refs, state;
++    rb_thread_t *th;
++    rb_execution_context_t *ec;
++    size_t vm_size;
++    VALUE *stack_start;
++    size_t stack_maxsize;
++    int error;
++};
++static struct vita_thread_startup vita_startups[8];
++
++static struct vita_thread_startup *
++vita_startup_acquire(rb_thread_t *th)
++{
++    for (size_t i = 0; i < numberof(vita_startups); ++i) {
++        struct vita_thread_startup *startup = &vita_startups[i];
++        if (RUBY_ATOMIC_CAS(startup->refs, 0, 2) != 0) continue;
++        startup->th = th;
++        startup->ec = th->ec;
++        startup->vm_size = th->vm->default_params.thread_vm_stack_size;
++        RUBY_ATOMIC_SET(startup->state, VITA_START_PENDING);
++        return startup;
++    }
++    return NULL;
++}
++
++static void
++vita_startup_release(struct vita_thread_startup *startup)
++{
++    RUBY_ATOMIC_FETCH_SUB(startup->refs, 1);
++}
++
++static rb_thread_t *
++vita_thread_startup(struct vita_thread_startup *startup)
++{
++    rb_thread_t *th = NULL;
++    if (RUBY_ATOMIC_CAS(startup->state, VITA_START_PENDING, VITA_START_PENDING) == VITA_START_CANCELLED)
++        goto done;
++    /* Only the record is owned here: cancellation may already have freed th. */
++    int err = vita_worker_stack(startup->vm_size, &startup->stack_start, &startup->stack_maxsize);
+     if (!err && !ruby_native_tls_ready) err = EINVAL;
+-    if (!err) err = pthread_setspecific(ruby_native_thread_key, th);
++    if (!err) err = pthread_setspecific(ruby_native_thread_key, startup->th);
+     if (!err) {
+-        err = pthread_setspecific(ruby_current_ec_key, th->ec);
++        err = pthread_setspecific(ruby_current_ec_key, startup->ec);
+         if (err) {
+             int cleanup = pthread_setspecific(ruby_native_thread_key, NULL);
+             if (cleanup) rb_bug_errno("Ruby TLS startup cleanup", cleanup);
+         }
+     }
++    startup->error = err;
++    if (RUBY_ATOMIC_CAS(startup->state, VITA_START_PENDING, VITA_START_READY) != VITA_START_PENDING) {
++        if (!err) {
++            native_tls_set(ruby_current_ec_key, NULL);
++            native_tls_set(ruby_native_thread_key, NULL);
++        }
++        goto done;
++    }
++    if (err) goto done;
++    /* Winning READY commits the parent to success and keeps th alive. Wait
++     * for its stack publication using the existing interrupt pair. */
++    th = startup->th;
+     rb_native_mutex_lock(&th->interrupt_lock);
+-    th->native_thread_data.startup_error = err;
+-    th->native_thread_data.startup_ready = 1;
+     rb_native_cond_signal(&th->native_thread_data.cond.intr);
++    while (!th->native_thread_data.startup_ready)
++        rb_native_cond_wait(&th->native_thread_data.cond.intr, &th->interrupt_lock);
+     rb_native_mutex_unlock(&th->interrupt_lock);
+-    /* On failure the parent may now reclaim th. */
+-    return err;
++  done:
++    vita_startup_release(startup);
++    return th;
+ }
+ #endif
+ 
+ static void *
+ thread_start_func_1(void *th_ptr)
+ {
++#ifdef __vita__
++    rb_thread_t *th;
++    RB_ALTSTACK_INIT(void *altstack, NULL);
++#else
+     rb_thread_t *th = th_ptr;
+     RB_ALTSTACK_INIT(void *altstack, th->altstack);
++#endif
+ #if USE_THREAD_CACHE
+   thread_start:
+ #endif
+@@ -1199,10 +1278,14 @@
+ 	VALUE stack_start;
+ #endif
+ 
++#ifdef __vita__
++        th = vita_thread_startup(th_ptr);
++        if (!th) return 0;
++#else
++        th = th_ptr;
++#endif
+ 	fill_thread_id_str(th);
+-#ifdef __vita__
+-        if (vita_thread_startup(th)) return 0;
+-#else
++#ifndef __vita__
+ #if defined USE_NATIVE_THREAD_INIT
+ 	native_thread_init_stack(th);
+ #endif
+@@ -1217,7 +1300,7 @@
+     }
+ #if USE_THREAD_CACHE
+     /* cache thread */
+-    if ((th = register_cached_thread_and_wait(RB_ALTSTACK(altstack))) != 0) {
++    if ((th_ptr = register_cached_thread_and_wait(RB_ALTSTACK(altstack))) != 0) {
+         goto thread_start;
+     }
+ #else
+@@ -1229,7 +1312,7 @@
+ struct cached_thread_entry {
+     rb_nativethread_cond_t cond;
+     rb_nativethread_id_t thread_id;
+-    rb_thread_t *th;
++    void *th;
+     void *altstack;
+     struct list_node node;
+ };
+@@ -1256,7 +1339,7 @@
+ #  define THREAD_CACHE_TIME ((rb_hrtime_t)3 * RB_HRTIME_PER_SEC)
+ #endif
+ 
+-static rb_thread_t *
++static void *
+ register_cached_thread_and_wait(void *altstack)
+ {
+     rb_hrtime_t end = THREAD_CACHE_TIME;
+@@ -1302,7 +1385,11 @@
+     rb_native_mutex_lock(&thread_cache_lock);
+     entry = list_pop(&cached_thread_head, struct cached_thread_entry, node);
+     if (entry) {
++#ifdef __vita__
++        entry->th = th->native_thread_data.startup;
++#else
+         entry->th = th;
++#endif
+         /* th->thread_id must be set before signal for Thread#name= */
+         th->thread_id = entry->thread_id;
+         fill_thread_id_str(th);
+@@ -1364,7 +1451,11 @@
+         err = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+         if (err) goto attr_done;
+ 
+-        err = pthread_create(&th->thread_id, &attr, thread_start_func_1, th);
++        void *arg = th;
++#ifdef __vita__
++        arg = th->native_thread_data.startup;
++#endif
++        err = pthread_create(&th->thread_id, &attr, thread_start_func_1, arg);
+ 	thread_debug("create: %p (%d)\n", (void *)th, err);
+ 	/* should be done in the created thread */
+ 	fill_thread_id_str(th);
+@@ -1381,17 +1472,46 @@
+     native_thread_data_t *nd = &th->native_thread_data;
+     int err = vita_native_conds_init(th);
+     if (err) return err;
++    struct vita_thread_startup *startup = vita_startup_acquire(th);
++    nd->startup = startup;
+     nd->startup_ready = 0;
+-    nd->startup_error = 0;
+-    /* Reuse the interrupt pair: no extra kernel objects for the handshake. */
++    if (!startup) {
++        err = EAGAIN;
++        goto failed;
++    }
++    /* The child cannot use this pair until READY wins against cancellation. */
+     rb_native_mutex_lock(&th->interrupt_lock);
++    rb_hrtime_t end = native_cond_timeout(&nd->cond.intr, VITA_THREAD_STARTUP_TIMEOUT);
+     err = native_thread_create0(th);
+-    if (!err) {
+-        while (!nd->startup_ready)
+-            rb_native_cond_wait(&nd->cond.intr, &th->interrupt_lock);
+-        err = nd->startup_error;
++    if (err) vita_startup_release(startup); /* No child owns the second ref. */
++    else {
++        while (RUBY_ATOMIC_CAS(startup->state, VITA_START_PENDING, VITA_START_PENDING) == VITA_START_PENDING) {
++            rb_hrtime_t now = native_cond_timeout(&nd->cond.intr, 0);
++            if (now >= end) {
++                if (RUBY_ATOMIC_CAS(startup->state, VITA_START_PENDING, VITA_START_CANCELLED) == VITA_START_PENDING)
++                    err = ETIMEDOUT;
++                break;
++            }
++            /* Failed setup cannot safely notify through th. Recheck its
++             * record every 10 ms, keeping one absolute realtime deadline. */
++            rb_hrtime_t wake = rb_hrtime_add(now, 10 * RB_HRTIME_PER_MSEC);
++            if (wake > end) wake = end;
++            native_cond_timedwait(&nd->cond.intr, &th->interrupt_lock, &wake);
++        }
++        if (!err) {
++            err = startup->error;
++            if (!err) {
++                th->ec->machine.stack_start = startup->stack_start;
++                th->ec->machine.stack_maxsize = startup->stack_maxsize;
++                nd->startup_ready = 1;
++                rb_native_cond_signal(&nd->cond.intr);
++            }
++        }
+     }
+     rb_native_mutex_unlock(&th->interrupt_lock);
++    vita_startup_release(startup);
++    nd->startup = NULL;
++  failed:
+     if (err) {
+         rb_native_cond_destroy(&nd->cond.gvlq);
+         if (&nd->cond.gvlq != &nd->cond.intr)
+--- a/thread_pthread.h
++++ b/thread_pthread.h
+@@ -37,7 +37,7 @@
+     } cond;
+ #ifdef __vita__
+     int startup_ready;
+-    int startup_error;
++    struct vita_thread_startup *startup;
+ #endif
+ } native_thread_data_t;
+ 

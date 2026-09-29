@@ -1,0 +1,192 @@
+From: mkxp-z-vita
+Subject: [PATCH 0015] cont.c/thread_pthread.c: Vita fiber stacks inside the running thread's registered stack
+
+WHY
+---
+A Vita thread registers a stack with the kernel (sceKernelCreateThread;
+SceKernelThreadInfo.stack/.stackSize reports it back). A thread that enters a
+syscall while its SP is outside that range is stopped with 0x10006 -- no
+signal, no Ruby exception, the thread simply stops running.
+
+The first fiber patch gave this port fiber machine stacks from malloc, which puts
+every Fiber's SP on the libc heap. RGSS3 runs every event interpreter and the
+message window inside a Fiber, and the first thing such a fiber does that
+reaches the filesystem -- File.open, or Bitmap#draw_text, whose glyph load is
+an FT_Stream_Seek + read -- stops the rgss thread. Hardware evidence
+(three different player builds, byte-identical each time): the
+rgss thread stopped at SceLibKernel seg1+0x69d4 with R0 = a file UID and
+R2:R3 = 0x1a8a8:0, i.e. sceIoLseek(fd, 108712, 0), SP = 0x84d71a68 while its
+THREAD_INFO said stack 0x8b201000 + 8 MiB.
+
+WHAT
+----
+cont.c
+  * fiber_pool_allocate_memory asks vita/ruby/vita_fiber_arena.c first. That
+    module carves ONE arena out of the low end of the current thread's own
+    registered stack and returns it with the number of stacks that fit. Every
+    later request returns NULL, which fiber_pool_expand already turns into a
+    FiberError -- deliberately, because the only other way to satisfy it is
+    malloc, which is the bug. If the thread's stack is too small for an arena
+    the module says so (one loud log line) and the stock malloc path runs.
+  * fiber_pool_stack_acquire refuses to run a fiber on a thread that does not
+    own the arena: its stacks are inside one specific thread's stack. Stacks
+    are acquired at the first resume, so this is exactly where a fiber both
+    created and resumed on a foreign thread arrives; Ruby's own "fiber called
+    across threads" already covers the rest. A FiberError, not a 0x10006.
+  * fiber_pool_stack_release never frees an arena-backed allocation. It is a
+    slice of a live thread's stack, not a malloc block, and keeping its
+    vacancies is what lets short-lived fibers recycle slots forever.
+
+thread_pthread.c
+  * ruby_init_stack gives Ruby the real floor of the thread's own stack. Vita
+    has neither getrlimit(RLIMIT_STACK) nor pthread_getattr_np, so stock code
+    leaves native_main_thread.stack_maxsize at 0; gc.c's stack_check() then
+    evaluates STACK_LEVEL_MAX - 2048 as SIZE_MAX-2047 and never fires, so a
+    runaway main-context recursion raises nothing and walks off the bottom of
+    the stack. That was survivable while nothing lived down there. With the
+    arena down there it would shred suspended fibers, so the floor is now the
+    top of the arena plus a 128 KiB guard and an overflow is a SystemStackError
+    long before it reaches a fiber.
+
+Only __vita__ changes; off Vita every hunk preprocesses to stock MRI.
+The -I that resolves <vita_fiber_arena.h> is injected into XCFLAGS by
+vita/scripts/build-ruby-vita.sh, which also compiles the module into
+libruby-vita.a.
+
+--- a/cont.c
++++ b/cont.c
+@@ -44,6 +44,19 @@
+ #define RB_PAGE_SIZE (pagesize)
+ #define RB_PAGE_MASK (~(RB_PAGE_SIZE - 1))
+ static long pagesize;
++
++#ifdef __vita__
++/* a Vita thread may only enter a syscall while its SP is inside
++ * the stack it registered with the kernel; one caught outside is stopped with
++ * 0x10006 at that syscall, deterministically and uncatchably. Fiber machine
++ * stacks therefore cannot come from malloc: the first
++ * File, Bitmap#draw_text (glyph load = seek + read) or sleep inside a Fiber
++ * kills the thread -- and RGSS3 runs every event interpreter and the message
++ * window inside a Fiber. vita/ruby/vita_fiber_arena.c carves the pool's
++ * backing memory out of the low end of that same thread stack instead.
++ * The -I for this header is injected by vita/scripts/build-ruby-vita.sh. */
++#include <vita_fiber_arena.h>
++#endif
+ 
+ static const rb_data_type_t cont_data_type, fiber_data_type;
+ static VALUE rb_cContinuation;
+@@ -417,6 +430,22 @@
+ inline static void *
+ fiber_pool_allocate_memory(size_t * count, size_t stride)
+ {
++#ifdef __vita__
++    /* One allocation, covering the whole arena, never freed. `count` comes
++     * back as everything that fits, which fiber_pool_expand then turns into
++     * that many vacancies. Any later request has to FAIL: satisfying it could
++     * only mean malloc, and a fiber running on malloc'd memory is exactly the
++     * 0x10006 stop this port is fixing. fiber_pool_expand turns the NULL into
++     * a FiberError, which is a Ruby exception, not a crash. */
++    {
++        void *arena = NULL;
++        int rc = vita_fiber_arena_acquire(&arena, count, stride);
++
++        if (rc == VITA_FIBER_ARENA_OK) return arena;
++        if (rc != VITA_FIBER_ARENA_FALLBACK) return NULL;
++    }
++#endif
++
+     // We use a divide-by-2 strategy to try and allocate memory. We are trying
+     // to allocate `count` stacks. In normal situation, this won't fail. But
+     // if we ran out of address space, or we are allocating more memory than
+@@ -626,8 +655,24 @@
+ static struct fiber_pool_stack
+ fiber_pool_stack_acquire(struct fiber_pool * fiber_pool)
+ {
+-    struct fiber_pool_vacancy * vacancy = fiber_pool_vacancy_pop(fiber_pool);
++    struct fiber_pool_vacancy * vacancy;
+ 
++#ifdef __vita__
++    /* Every stack in the pool lives inside ONE thread's registered stack, so
++     * a fiber running on any other thread would be right back outside it.
++     * Stacks are acquired at the first resume (fiber_prepare_stack), which is
++     * where a fiber both created and resumed on a foreign thread arrives;
++     * Ruby's own "fiber called across threads" catches the rest. Either way
++     * the answer is a Ruby exception rather than a 0x10006. */
++    if (vita_fiber_arena_active() && !vita_fiber_arena_owns_current_thread()) {
++        rb_raise(rb_eFiberError,
++                 "can't run a Fiber on this thread: the Vita fiber stack "
++                 "arena belongs to the thread that started Ruby");
++    }
++#endif
++
++    vacancy = fiber_pool_vacancy_pop(fiber_pool);
++
+     if (DEBUG) fprintf(stderr, "fiber_pool_stack_acquire: %p used=%"PRIuSIZE"\n", (void*)fiber_pool->vacancies, fiber_pool->used);
+ 
+     if (!vacancy) {
+@@ -733,11 +778,21 @@
+ 
+ #ifdef FIBER_POOL_ALLOCATION_FREE
+     struct fiber_pool_allocation * allocation = stack->allocation;
++
++#ifdef __vita__
++    /* The arena is a slice of a live thread's stack. Handing it back would
++     * unhook every vacancy and then free() a pointer malloc never returned;
++     * it stays for the life of the process, and the vacancies with it, which
++     * is what lets short-lived fibers recycle slots forever. */
++    const int arena_backed = vita_fiber_arena_contains(allocation->base);
++#else
++    const int arena_backed = 0;
++#endif
+ 
+     allocation->used -= 1;
+ 
+     // Release address space and/or dirty memory:
+-    if (allocation->used == 0) {
++    if (allocation->used == 0 && !arena_backed) {
+         fiber_pool_allocation_free(allocation);
+     }
+     else if (stack->pool->free_stacks) {
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -14,6 +14,13 @@
+ #include "gc.h"
+ #include "mjit.h"
+ 
++#ifdef __vita__
++/* the fiber arena sits at the bottom of this thread's stack, so
++ * ruby_init_stack has to know where the thread's own stack really ends.
++ * The -I is injected by vita/scripts/build-ruby-vita.sh. */
++#include <vita_fiber_arena.h>
++#endif
++
+ #ifdef HAVE_SYS_RESOURCE_H
+ #include <sys/resource.h>
+ #endif
+@@ -939,6 +946,26 @@
+ {
+     native_main_thread.id = pthread_self();
+ 
++#ifdef __vita__
++    /* Vita has neither getrlimit(RLIMIT_STACK) nor pthread_getattr_np, so
++     * MAINSTACKADDR_AVAILABLE is 0 and the HAVE_GETRLIMIT block below is
++     * compiled out: stack_maxsize stays 0. gc.c's stack_check() then computes
++     * maximum_length = STACK_LEVEL_MAX - 2048 == SIZE_MAX-2047 and never
++     * fires, so a runaway recursion on this thread raises nothing and simply
++     * walks off the bottom of the stack. With the fiber arena down there
++     * that would silently shred suspended fibers, so tell
++     * Ruby where the thread's own stack really ends. */
++    {
++        uintptr_t floor = vita_fiber_arena_main_stack_floor();
++
++        if (floor != 0 && (uintptr_t)addr > floor) {
++            native_main_thread.stack_start = (VALUE *)addr;
++            native_main_thread.stack_maxsize = (size_t)((uintptr_t)addr - floor);
++            return;
++        }
++    }
++#endif
++
+ #if MAINSTACKADDR_AVAILABLE
+     if (native_main_thread.stack_maxsize) return;
+     {

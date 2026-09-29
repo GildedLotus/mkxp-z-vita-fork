@@ -1,0 +1,55 @@
+# vitagl-0004: create shader cache subdirectories on demand, not at vglInit.
+# vglInit pre-created v/00..FF and f/00..FF (512 mkdirs) only when v/00 was
+# new. On hardware that took minutes on the memory card, a first
+# boot interrupted part-way left f/ with no subdirectories forever (every
+# fragment cache write then failed silently and each boot recompiled all
+# fragment shaders), and a player's first launch would sit black for minutes.
+# Now vglInit makes only the v/ and f/ stage directories; compile_shader makes
+# the one hash subdirectory it writes into, just before creating the file.
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -785,6 +785,14 @@
+ 	shark_clear_output();
+ #ifdef HAVE_SHADER_CACHE
+ 	if (s->prog) {
++		// The hash subdirectory (<cache>/<v|f>/XX) is made here, on first use (vitagl-0004)
++		char subdir[256];
++		snprintf(subdir, sizeof(subdir), "%s", cache_fname);
++		char *slash = strrchr(subdir, '/');
++		if (slash) {
++			*slash = 0;
++			sceIoMkdir(subdir, 0777);
++		}
+ 		SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+ 		size_t sz;
+ 		void *buf = serialize_shader(NULL, &sz, s, save_bindings);
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -206,25 +206,12 @@
+ 	sceIoMkdir(shader_cache_root, 0777);
+ 	sprintf(vgl_shader_cache_path, "%s/v%d", shader_cache_root, SHADER_CACHE_MAGIC);
+ 	sceIoMkdir(vgl_shader_cache_path, 0777);
++	// Stage and hash subdirectories are created on demand when a program is cached
++	// (compile_shader); pre-creating all 512 took minutes on some memory cards.
+ 	sprintf(fname, "%s/v", vgl_shader_cache_path);
+ 	sceIoMkdir(fname, 0777);
+-	char dirname[256];
+-	sprintf(dirname, "%s/00", fname);
+-	GLboolean skip_creation = sceIoMkdir(dirname, 0777) != 0;
+-	if (!skip_creation) {
+-		for (int i = 1; i <= 0xFF; i++) {
+-			sprintf(dirname, "%s/%02X", fname, i);
+-			sceIoMkdir(dirname, 0777);
+-		}
+-	}
+ 	sprintf(fname, "%s/f", vgl_shader_cache_path);
+ 	sceIoMkdir(fname, 0777);
+-	if (!skip_creation) {
+-		for (int i = 0; i <= 0xFF; i++) {
+-			sprintf(dirname, "%s/%02X", fname, i);
+-			sceIoMkdir(dirname, 0777);
+-		}
+-	}
+ #endif
+ 	// Check if framebuffer size is valid
+ 	GLboolean res_fallback = GL_FALSE;

@@ -1,0 +1,33 @@
+diff --git a/thread_pthread.c b/thread_pthread.c
+index 6f0cc3d..d1b2feb 100644
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -1612,12 +1612,24 @@ set_nonblock(int fd)
+     int err;
+ 
+     oflags = fcntl(fd, F_GETFL);
+-    if (oflags == -1)
+-	rb_sys_fail(0);
++    if (oflags == -1) {
++#if defined(__vita__)
++        /* Vita: fcntl F_GETFL fails on sceKernelCreateMsgPipe fds.
++           Non-blocking is best-effort; don't abort init. */
++        return;
++#else
++        rb_sys_fail(0);
++#endif
++    }
+     oflags |= O_NONBLOCK;
+     err = fcntl(fd, F_SETFL, oflags);
+-    if (err == -1)
+-	rb_sys_fail(0);
++    if (err == -1) {
++#if defined(__vita__)
++        return;
++#else
++        rb_sys_fail(0);
++#endif
++    }
+ }
+ 
+ /* communication pipe with timer thread and signal handler */

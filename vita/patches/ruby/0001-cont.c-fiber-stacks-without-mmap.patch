@@ -1,0 +1,78 @@
+diff --git a/cont.c b/cont.c
+index 82b7e96..551ffbd 100644
+--- a/cont.c
++++ b/cont.c
+@@ -13,8 +13,10 @@
+ 
+ #ifndef _WIN32
+ #include <unistd.h>
++#ifdef HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
+ #endif
++#endif
+ 
+ // On Solaris, madvise() is NOT declared for SUS (XPG4v2) or later,
+ // but MADV_* macros are defined when __EXTENSIONS__ is defined.
+@@ -431,7 +433,7 @@ fiber_pool_allocate_memory(size_t * count, size_t stride)
+         else {
+             return base;
+         }
+-#else
++#elif defined(HAVE_MMAP)
+         errno = 0;
+         void * base = mmap(NULL, (*count)*stride, PROT_READ | PROT_WRITE, FIBER_STACK_FLAGS, -1, 0);
+ 
+@@ -448,6 +450,17 @@ fiber_pool_allocate_memory(size_t * count, size_t stride)
+ #endif
+             return base;
+         }
++#else
++        /* Vita / newlib: no mmap. Fiber stacks come from malloc; no guard pages. */
++        errno = 0;
++        void * base = malloc((*count)*stride);
++
++        if (base == NULL) {
++            *count = (*count) >> 1;
++        }
++        else {
++            return base;
++        }
+ #endif
+     }
+ 
+@@ -503,11 +516,14 @@ fiber_pool_expand(struct fiber_pool * fiber_pool, size_t count)
+             VirtualFree(allocation->base, 0, MEM_RELEASE);
+             rb_raise(rb_eFiberError, "can't set a guard page: %s", ERRNOMSG);
+         }
+-#else
++#elif defined(HAVE_MMAP)
+         if (mprotect(page, RB_PAGE_SIZE, PROT_NONE) < 0) {
+             munmap(allocation->base, count*stride);
+             rb_raise(rb_eFiberError, "can't set a guard page: %s", ERRNOMSG);
+         }
++#else
++        /* no guard page without mmap */
++        (void)page;
+ #endif
+ 
+         vacancies = fiber_pool_vacancy_initialize(
+@@ -582,8 +598,10 @@ fiber_pool_allocation_free(struct fiber_pool_allocation * allocation)
+ 
+ #ifdef _WIN32
+     VirtualFree(allocation->base, 0, MEM_RELEASE);
+-#else
++#elif defined(HAVE_MMAP)
+     munmap(allocation->base, allocation->stride * allocation->count);
++#else
++    free(allocation->base);
+ #endif
+ 
+     if (allocation->previous) {
+@@ -3243,6 +3261,7 @@ Init_Cont(void)
+ #else /* not WIN32 */
+     pagesize = sysconf(_SC_PAGESIZE);
+ #endif
++    if (pagesize <= 0) pagesize = 4096;
+     SET_MACHINE_STACK_END(&th->ec->machine.stack_end);
+ 
+     fiber_pool_initialize(&shared_fiber_pool, stack_size, FIBER_POOL_INITIAL_SIZE, vm_stack_size);

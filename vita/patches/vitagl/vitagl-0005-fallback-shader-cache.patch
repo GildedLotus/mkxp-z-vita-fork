@@ -1,0 +1,159 @@
+# vitagl-0005: a second, read-only shader cache root, and no compiler needed for postponed GLSL.
+# Ships precompiled GXP: players have no libshacccg, so the engine points vitaGL at a
+# tree inside the VPK (app0:) that holds the boot programs' cache files.
+# - vglSetShaderCacheFallbackPath(root): files are looked up under <root>/v<SHADER_CACHE_MAGIC>/...
+#   only after the primary path (ux0:data/shader_cache/<titleid>) misses. Same key, same layout.
+#   The three cache readers (glCompileShader, glLinkProgram vertex and fragment) share one opener;
+#   a bad fallback file is not removed (read-only), it falls through to a compile.
+# - glCompileShader returned a GL_INVALID_OPERATION and retried shark_init for every shader when no
+#   compiler is installed, before the VGL_MODE_POSTPONED early return that compiles nothing. The
+#   early return now comes first, so a cache-only boot leaves the GL error state clean.
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index ffcd8ee..7c8e24b 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -35,6 +35,20 @@
+ #include "utils/xxhash_utils.h"
+ #ifdef HAVE_SHADER_CACHE
+ char vgl_shader_cache_path[256];
++char vgl_shader_cache_fallback_path[256];
++
++// Primary cache first, then the read-only fallback tree (shipped GXP). Fallback files are never removed.
++static SceUID open_cached_gxp(const char *fname, GLboolean *from_fallback) {
++	SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
++	*from_fallback = GL_FALSE;
++	if (f < 0 && vgl_shader_cache_fallback_path[0]) {
++		char alt[256];
++		snprintf(alt, sizeof(alt), "%s%s", vgl_shader_cache_fallback_path, fname + strlen(vgl_shader_cache_path));
++		f = sceIoOpen(alt, SCE_O_RDONLY, 0777);
++		*from_fallback = f >= 0;
++	}
++	return f;
++}
+ #endif
+ #ifdef HAVE_TEX_CACHE
+ char vgl_file_cache_path[256];
+@@ -1999,24 +2013,25 @@ void glShaderBinary(GLsizei count, const GLuint *handles, GLenum binaryFormat, c
+ void glCompileShader(GLuint handle) {
+ 	THREAD_SAFE()
+ 
+-	// If vitaShaRK is not enabled, we try to initialize it
+-	if (!is_shark_online && !start_shader_compiler()) {
+-		SET_GL_ERROR(GL_INVALID_OPERATION)
+-	}
+-	
+ 	// Grabbing passed shader
+ 	shader *s = shaders[handle - 1];
+ 	
+-	// If we use VGL_MODE_POSTPONED, we compile shaders in glLinkProgram
++	// If we use VGL_MODE_POSTPONED, we compile shaders in glLinkProgram (no compiler needed yet)
+ 	if (s->is_glsl && glsl_sema_mode == VGL_MODE_POSTPONED)
+ 		return;
+ 	
++	// If vitaShaRK is not enabled, we try to initialize it
++	if (!is_shark_online && !start_shader_compiler()) {
++		SET_GL_ERROR(GL_INVALID_OPERATION)
++	}
++	
+ #ifdef HAVE_SHADER_CACHE
+ 	char fname[256];
+ 	uint64_t hash = XXH3_64bits(s->source, s->size);
+ 	uint8_t subdir_hash = hash >> 56;
+ 	sprintf(fname, "%s/%s/%02X/%llX.gxp", vgl_shader_cache_path, s->type == GL_VERTEX_SHADER ? "v" : "f", subdir_hash, hash);
+-	SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
++	GLboolean from_fallback;
++	SceUID f = open_cached_gxp(fname, &from_fallback);
+ 	if (f >= 0) {
+ 		size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+ 		sceIoLseek(f, 0, SCE_SEEK_SET);
+@@ -2031,7 +2046,8 @@ void glCompileShader(GLuint handle) {
+ 			s->source = NULL;
+ 			return;
+ 		}
+-		sceIoRemove(fname);
++		if (!from_fallback)
++			sceIoRemove(fname);
+ 	}
+ #endif
+ 
+@@ -2422,7 +2438,8 @@ void glLinkProgram(GLuint progr) {
+ 			uint64_t hash = XXH3_64bits(p->vshader->source, p->vshader->size);
+ 			uint8_t subdir_hash = hash >> 56;
+ 			sprintf(vert_fname, "%s/v/%02X/%llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
+-			SceUID f = sceIoOpen(vert_fname, SCE_O_RDONLY, 0777);
++			GLboolean from_fallback;
++			SceUID f = open_cached_gxp(vert_fname, &from_fallback);
+ 			if (f >= 0) {
+ 				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+ 				sceIoLseek(f, 0, SCE_SEEK_SET);
+@@ -2430,7 +2447,7 @@ void glLinkProgram(GLuint progr) {
+ 				if (buf)
+ 					sceIoRead(f, buf, sz);
+ 				sceIoClose(f);
+-				if (!unserialize_shader(buf, sz, p->vshader, GL_TRUE))
++				if (!unserialize_shader(buf, sz, p->vshader, GL_TRUE) && !from_fallback)
+ 					sceIoRemove(vert_fname);
+ 				vgl_free(buf);
+ 			}
+@@ -2439,7 +2456,8 @@ void glLinkProgram(GLuint progr) {
+ 			uint64_t hash = XXH3_64bits(p->fshader->source, p->fshader->size);
+ 			uint8_t subdir_hash = hash >> 56;
+ 			sprintf(frag_fname, "%s/f/%02X/%llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
+-			SceUID f = sceIoOpen(frag_fname, SCE_O_RDONLY, 0777);
++			GLboolean from_fallback;
++			SceUID f = open_cached_gxp(frag_fname, &from_fallback);
+ 			if (f >= 0) {
+ 				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+ 				sceIoLseek(f, 0, SCE_SEEK_SET);
+@@ -2447,7 +2465,7 @@ void glLinkProgram(GLuint progr) {
+ 				if (buf)
+ 					sceIoRead(f, buf, sz);
+ 				sceIoClose(f);
+-				if (!unserialize_shader(buf, sz, p->fshader, GL_TRUE))
++				if (!unserialize_shader(buf, sz, p->fshader, GL_TRUE) && !from_fallback)
+ 					sceIoRemove(frag_fname);
+ 				vgl_free(buf);
+ 			}
+diff --git a/source/shared.h b/source/shared.h
+index 167e4f2..bce26d6 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -304,6 +304,7 @@ extern int NEW_DISPLAY_HEIGHT; // Requested new display height in pixels
+ #ifdef HAVE_SHADER_CACHE
+ #define SHADER_CACHE_MAGIC 2
+ extern char vgl_shader_cache_path[256];
++extern char vgl_shader_cache_fallback_path[256];
+ #endif
+ 
+ extern GLboolean prim_is_non_native; // Flag for when a primitive not supported natively by sceGxm is used
+diff --git a/source/vgl.c b/source/vgl.c
+index 51d4bdd..4d2fba1 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -787,6 +787,12 @@ void vglSetShaderCachePath(const char *path) {
+ #endif
+ }
+ 
++void vglSetShaderCacheFallbackPath(const char *path) {
++#ifdef HAVE_SHADER_CACHE
++	snprintf(vgl_shader_cache_fallback_path, sizeof(vgl_shader_cache_fallback_path), "%s/v%d", path, SHADER_CACHE_MAGIC);
++#endif
++}
++
+ void vglSetShaderAssociationPath(const char *path) {
+ 	shark_set_shader_association_path(path);
+ }
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 933bf4f..171d58c 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1261,6 +1261,9 @@ void vglSetShaderAssociationPath(const char *path);
+ // Overloads the shader cache path when HAVE_SHADER_CACHE=1 is used. Must be called before vglInit*. Default value: ux0:data/shader_cache.
+ void vglSetShaderCachePath(const char *path);
+ 
++// Read-only second lookup root (same v<N>/<v|f>/XX/HASH.gxp layout), tried after the cache path. Requires HAVE_SHADER_CACHE.
++void vglSetShaderCacheFallbackPath(const char *path);
++
+ // Change the lifetime for a texture to be considered cacheable. Requires HAVE_TEXTURE_CACHE.
+ void vglSetTextureCacheFrequency(GLuint freq);
+ 

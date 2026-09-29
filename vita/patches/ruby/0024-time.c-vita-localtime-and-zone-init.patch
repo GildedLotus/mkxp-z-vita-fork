@@ -1,0 +1,54 @@
+Subject: [Vita] Make localtime_r usable, and never fstring an unassigned zone
+
+MRI's LOCALTIME_OVERFLOW_PROBLEM check runs mktime over what localtime_r
+returned and rejects the result when the two disagree. On this device they
+always disagree: VitaSDK's localtime_r converts through
+sceRtcConvertUtcToLocalTime (the console's own time zone) while newlib's
+mktime reads only TZ, which nothing here sets, so mktime answers as if the
+fields were UTC. rb_localtime_r therefore returned NULL for every timestamp,
+localtimew fell through to guess_local_offset, and its "last resort" block ran
+with `VALUE zone;` never assigned: rb_fstring dereferenced that garbage and
+stopped the rgss thread with a data abort (stop 0x30004) at rb_fstring+0x18,
+string.c:409, called from time.c:1485. That crash was the first thing a file-I/O test run hit when it rendered a
+Time, and any game interpolating one would have hit it.
+
+Drop the round trip on Vita, where localtime_r already reports an unusable t
+as NULL, and give the last-resort block its UTC answer so a localtime_r
+failure can no longer produce a wild VALUE or read an unset struct tm.
+Evidence: a hardware crash dump.
+
+--- a/time.c
++++ b/time.c
+@@ -706,7 +706,13 @@
+ 	if (tmp) *result = *tmp;
+     }
+ #endif
+-#if defined(HAVE_MKTIME) && defined(LOCALTIME_OVERFLOW_PROBLEM)
++/* Vita: localtime_r converts through sceRtcConvertUtcToLocalTime, i.e. the
++ * console's own time zone, while newlib's mktime reads only the TZ variable,
++ * which nothing on this device sets (so: UTC). The round trip below therefore
++ * disagrees by the console offset for every t and rejected every local time.
++ * VitaSDK's localtime_r already returns NULL when sceRtc refuses t, which is
++ * the overflow this check exists to catch. */
++#if defined(HAVE_MKTIME) && defined(LOCALTIME_OVERFLOW_PROBLEM) && !defined(__vita__)
+     if (result) {
+         long gmtoff1 = 0;
+         long gmtoff2 = 0;
+@@ -1478,10 +1484,14 @@
+         static int now_isdst = 0;
+         static VALUE now_zone;
+         if (now == 0) {
+-            VALUE zone;
++            /* On a platform where localtime_r fails for every t this is
++             * reached with nothing assigned: zone stayed uninitialised and
++             * rb_fstring dereferenced a garbage VALUE, and tm was read
++             * uninitialised. The statics already hold the UTC answer. */
++            VALUE zone = str_utc;
+             now = time(NULL);
+-            localtime_with_gmtoff_zone(&now, &tm, &now_gmtoff, &zone);
+-            now_isdst = tm.tm_isdst;
++            if (localtime_with_gmtoff_zone(&now, &tm, &now_gmtoff, &zone))
++                now_isdst = tm.tm_isdst;
+             zone = rb_fstring(zone);
+             rb_gc_register_mark_object(zone);
+             now_zone = zone;

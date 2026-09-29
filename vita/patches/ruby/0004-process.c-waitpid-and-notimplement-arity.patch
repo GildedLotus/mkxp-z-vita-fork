@@ -1,0 +1,25 @@
+diff --git a/process.c b/process.c
+index 399f0d7532..281a520619 100644
+--- a/process.c
++++ b/process.c
+@@ -1052,7 +1052,10 @@ do_waitpid(rb_pid_t pid, int *st, int flags)
+ #elif defined HAVE_WAIT4
+     return wait4(pid, st, flags, NULL);
+ #else
+-#  error waitpid or wait4 is required.
++    /* Vita/newlib: no waitpid/wait4. */
++    (void)pid; (void)st; (void)flags;
++    errno = ENOSYS;
++    return -1;
+ #endif
+ }
+ 
+@@ -6938,7 +6941,7 @@ proc_setgroups(VALUE obj, VALUE ary)
+ 
+     ALLOCV_END(tmp);
+ 
+-    return proc_getgroups(obj);
++    return proc_getgroups(0, NULL, obj, Qundef);
+ }
+ #else
+ #define proc_setgroups rb_f_notimplement

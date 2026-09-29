@@ -1,0 +1,184 @@
+# vitagl-0002: shader compile/cache failures must fail the link, not crash it.
+# GLSL compiles are postponed to glLinkProgram (VGL_MODE_POSTPONED), so
+# GL_COMPILE_STATUS reads GL_TRUE even with no compiler present. At link,
+# compile_shader() left s->prog NULL and HAVE_SHADER_CACHE serialized it anyway
+# (data abort in serialize_shader, device crash dump); the
+# create-then-write left an empty .gxp that the next boot's unserialize_shader
+# read without a size check (second crash dump). Now: the cache is written
+# only for a compiled program; unserialize_shader returns GL_FALSE for an
+# empty, truncated or non-GXP blob (sceGxmProgramCheck, and the GXP must fit;
+# serialized programs carry one byte past the GXP header size), and the
+# cache readers delete such a file and compile instead; glLinkProgram leaves
+# the program unlinked (GL_LINK_STATUS false) when either stage has no program,
+# checked before attribute binding touches the programs (third crash dump).
+# With HAVE_SHARK_LOG, glGetProgramInfoLog returns both shader logs, since the
+# postponed compile writes its diagnostics there and the engine reads the program log.
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 3b91d11..d0a82cd 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -690,11 +690,18 @@ void *serialize_shader(void *out, size_t *sz, shader *s, GLboolean save_bindings
+ 	return _out;
+ }
+ 
+-void unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings) {
++GLboolean unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings) {
+ 	uint8_t *buf = (uint8_t *)in;
+ 	uint32_t matrix_uniforms_num;
++	// A cache file can be empty or truncated (e.g. a crash between create and write)
++	if (!in || sz < sizeof(uint32_t) + sizeof(SceGxmProgram *))
++		return GL_FALSE;
+ 	vgl_fast_memcpy(&matrix_uniforms_num, buf, sizeof(uint32_t));
++	if (matrix_uniforms_num > (sz - sizeof(uint32_t)) / sizeof(uint32_t))
++		return GL_FALSE;
+ 	buf += sizeof(uint32_t) * (matrix_uniforms_num + 1);
++	if ((size_t)(buf - (uint8_t *)in) + (load_bindings ? sizeof(binds_map) : 0) >= sz)
++		return GL_FALSE;
+ 	if (load_bindings) {
+ 		vgl_fast_memcpy(&s->semantics, buf, sizeof(binds_map));
+ 		buf += sizeof(binds_map);
+@@ -707,7 +714,11 @@ void unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings)
+ 		buf += sizeof(glsl_samplers_info) * s->sized_samplers_num;
+ 	}
+ #endif
++	if ((uintptr_t)buf - (uintptr_t)in >= sz)
++		return GL_FALSE;
+ 	s->size = sz - ((uintptr_t)buf - (uintptr_t)in);
++	if (sceGxmProgramCheck((const SceGxmProgram *)buf) || sceGxmProgramGetSize((const SceGxmProgram *)buf) > s->size)
++		return GL_FALSE;
+ 	s->prog = (SceGxmProgram *)vglMalloc(s->size);
+ 	vgl_fast_memcpy((SceGxmProgram *)s->prog, buf, s->size);
+ 	sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, s->prog, &s->id);
+@@ -722,6 +733,7 @@ void unserialize_shader(void *in, size_t sz, shader *s, GLboolean load_bindings)
+ 			s->mat = m;
+ 		}
+ 	}
++	return GL_TRUE;
+ }
+ 
+ #ifdef HAVE_SHADER_CACHE
+@@ -772,12 +784,14 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ #endif
+ 	shark_clear_output();
+ #ifdef HAVE_SHADER_CACHE
+-	SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+-	size_t sz;
+-	void *buf = serialize_shader(NULL, &sz, s, save_bindings);
+-	sceIoWrite(f, buf, sz);
+-	sceIoClose(f);
+-	vgl_free(buf);
++	if (s->prog) {
++		SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
++		size_t sz;
++		void *buf = serialize_shader(NULL, &sz, s, save_bindings);
++		sceIoWrite(f, buf, sz);
++		sceIoClose(f);
++		vgl_free(buf);
++	}
+ #endif
+ }
+ 
+@@ -2004,16 +2018,20 @@ void glCompileShader(GLuint handle) {
+ 	sprintf(fname, "%s/%s/%02X/%llX.gxp", vgl_shader_cache_path, s->type == GL_VERTEX_SHADER ? "v" : "f", subdir_hash, hash);
+ 	SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+ 	if (f >= 0) {
+-		vgl_free(s->source);
+-		s->source = NULL;
+ 		size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+ 		sceIoLseek(f, 0, SCE_SEEK_SET);
+-		void *buf = vglMalloc(sz);
+-		sceIoRead(f, buf, sz);
++		void *buf = sz ? vglMalloc(sz) : NULL;
++		if (buf)
++			sceIoRead(f, buf, sz);
+ 		sceIoClose(f);
+-		unserialize_shader(buf, sz, s, GL_FALSE);
++		GLboolean ok = unserialize_shader(buf, sz, s, GL_FALSE);
+ 		vgl_free(buf);
+-		return;
++		if (ok) {
++			vgl_free(s->source);
++			s->source = NULL;
++			return;
++		}
++		sceIoRemove(fname);
+ 	}
+ #endif
+ 
+@@ -2285,6 +2303,17 @@ void glGetProgramInfoLog(GLuint program, GLsizei maxLength, GLsizei *length, GLc
+ 
+ 	if (length)
+ 		*length = 0;
++#ifdef HAVE_SHARK_LOG
++	// Compiles are postponed to glLinkProgram, so the compiler output lives in the shader logs
++	__typeof__(progs[0]) *p = &progs[program - 1]; // the parameter hides the program type
++	if (!infoLog || maxLength <= 0)
++		return;
++	int n = snprintf(infoLog, maxLength, "vertex: %s\nfragment: %s",
++		(p->vshader && p->vshader->log) ? p->vshader->log : "",
++		(p->fshader && p->fshader->log) ? p->fshader->log : "");
++	if (length)
++		*length = n < 0 ? 0 : (n >= maxLength ? maxLength - 1 : n);
++#endif
+ }
+ 
+ void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
+@@ -2303,7 +2332,12 @@ void glGetProgramiv(GLuint progr, GLenum pname, GLint *params) {
+ 		*params = p->status == PROG_LINKED;
+ 		break;
+ 	case GL_INFO_LOG_LENGTH:
++#ifdef HAVE_SHARK_LOG
++		// Matches glGetProgramInfoLog: "vertex: <log>\nfragment: <log>" plus the terminator
++		*params = 20 + (p->vshader && p->vshader->log ? strlen(p->vshader->log) : 0) + (p->fshader && p->fshader->log ? strlen(p->fshader->log) : 0);
++#else
+ 		*params = 0;
++#endif
+ 		break;
+ 	case GL_PROGRAM_BINARY_LENGTH:
+ 		*params = serialized_shader_size(p->vshader, GL_FALSE, &dummy) + serialized_shader_size(p->fshader, GL_FALSE, &dummy) + sizeof(GLuint) * 3 + sizeof(SceGxmVertexAttribute) * VERTEX_ATTRIBS_NUM;
+@@ -2392,10 +2426,12 @@ void glLinkProgram(GLuint progr) {
+ 			if (f >= 0) {
+ 				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+ 				sceIoLseek(f, 0, SCE_SEEK_SET);
+-				void *buf = vglMalloc(sz);
+-				sceIoRead(f, buf, sz);
++				void *buf = sz ? vglMalloc(sz) : NULL;
++				if (buf)
++					sceIoRead(f, buf, sz);
+ 				sceIoClose(f);
+-				unserialize_shader(buf, sz, p->vshader, GL_TRUE);
++				if (!unserialize_shader(buf, sz, p->vshader, GL_TRUE))
++					sceIoRemove(vert_fname);
+ 				vgl_free(buf);
+ 			}
+ 		}
+@@ -2407,10 +2443,12 @@ void glLinkProgram(GLuint progr) {
+ 			if (f >= 0) {
+ 				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+ 				sceIoLseek(f, 0, SCE_SEEK_SET);
+-				void *buf = vglMalloc(sz);
+-				sceIoRead(f, buf, sz);
++				void *buf = sz ? vglMalloc(sz) : NULL;
++				if (buf)
++					sceIoRead(f, buf, sz);
+ 				sceIoClose(f);
+-				unserialize_shader(buf, sz, p->fshader, GL_TRUE);
++				if (!unserialize_shader(buf, sz, p->fshader, GL_TRUE))
++					sceIoRemove(frag_fname);
+ 				vgl_free(buf);
+ 			}
+ 		}
+@@ -2433,6 +2471,13 @@ void glLinkProgram(GLuint progr) {
+ 			}
+ 		}
+ 
++		// A stage that failed to compile (or no shader compiler) leaves the program unlinked
++		if (!p->vshader->prog || !p->fshader->prog) {
++			vgl_log("%s:%d: %s: %s shader failed to compile; program left unlinked.\n", __FILE__, __LINE__, __func__, p->vshader->prog ? "fragment" : "vertex");
++			glsl_sema_mode = VGL_MODE_POSTPONED;
++			return;
++		}
++
+ 		// Setting progressive default attribute bindings
+ 		set_default_attrib_binding();
+ 

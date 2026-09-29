@@ -1,0 +1,450 @@
+Subject: [Vita] Fail closed on Ruby startup and preserve fiber state on allocation failure
+
+Check TLS keys and worker startup before Ruby runs; report worker setup errors
+in the parent using the existing interrupt condition. Optional EC lookups are
+safe before key setup and on foreign threads. Allocate and root passing values
+before acquiring a fiber slot. Let configure measure scalar types and reject
+stale ABI caches with target compilation assertions.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -1469,6 +1469,21 @@
+ RUBY_CHECK_SIZEOF(time_t, [long "long long"], [], [@%:@include <time.h>])
+ RUBY_CHECK_SIZEOF(clock_t, [], [], [@%:@include <time.h>])
+ 
++AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
++@%:@ifdef __vita__
++@%:@include <sys/types.h>
++@%:@include <sys/stat.h>
++@%:@include <sys/time.h>
++@%:@include <time.h>
++_Static_assert(sizeof(off_t) == SIZEOF_OFF_T, "off_t ABI mismatch");
++_Static_assert(sizeof(clock_t) == SIZEOF_CLOCK_T, "clock_t ABI mismatch");
++_Static_assert(sizeof(time_t) == SIZEOF_TIME_T, "time_t ABI mismatch");
++_Static_assert(sizeof(((struct stat *)0)->st_size) == SIZEOF_OFF_T, "st_size ABI mismatch");
++_Static_assert(sizeof(((struct timespec *)0)->tv_sec) == SIZEOF_TIME_T, "timespec ABI mismatch");
++_Static_assert(sizeof(((struct timeval *)0)->tv_sec) == SIZEOF_TIME_T, "timeval ABI mismatch");
++@%:@endif
++]], [[]])], [], [AC_MSG_ERROR([Vita scalar sizes disagree with the target headers])])
++
+ AC_CACHE_CHECK(packed struct attribute, rb_cv_packed_struct,
+     [rb_cv_packed_struct=no
+     for mac in \
+--- a/cont.c
++++ b/cont.c
+@@ -2394,7 +2394,8 @@
+     VM_ASSERT(!current_fiber->resuming_fiber);
+ 
+ #ifdef __vita__
+-    /* Exhaustion must raise before changing resume links or blocking depth. */
++    /* Both allocations must precede resume links and blocking depth changes. */
++    VALUE passing = make_passing_arg(argc, argv);
+     if (FIBER_CREATED_P(fiber)) fiber_prepare_stack(fiber);
+ #endif
+ 
+@@ -2415,7 +2416,12 @@
+ 
+     cont->argc = argc;
+     cont->kw_splat = kw_splat;
++#ifdef __vita__
++    cont->value = passing;
++    RB_GC_GUARD(passing);
++#else
+     cont->value = make_passing_arg(argc, argv);
++#endif
+ 
+     fiber_store(fiber, th);
+ 
+--- a/thread.c
++++ b/thread.c
+@@ -667,7 +667,8 @@
+ void
+ ruby_thread_init_stack(rb_thread_t *th)
+ {
+-    native_thread_init_stack(th);
++    int err = native_thread_init_stack(th);
++    if (err) rb_bug_errno("Ruby main stack discovery", err);
+ }
+ 
+ const VALUE *
+@@ -791,7 +792,12 @@
+ 
+     // setup native thread
+     gvl_acquire(rb_ractor_gvl(th->ractor), th);
++#ifdef __vita__
++    /* TLS was checked before the parent accepted startup. Publish under GVL. */
++    th->ractor->threads.running_ec = th->ec;
++#else
+     ruby_thread_set_native(th);
++#endif
+ 
+     // setup ractor
+     if (rb_ractor_status_p(th->ractor, ractor_blocking)) {
+@@ -991,7 +997,15 @@
+     th->pending_interrupt_mask_stack = rb_ary_dup(current_th->pending_interrupt_mask_stack);
+     RBASIC_CLEAR_CLASS(th->pending_interrupt_mask_stack);
+ 
++#ifdef __vita__
++    err = pthread_mutex_init(&th->interrupt_lock, 0);
++    if (err) {
++        th->status = THREAD_KILLED;
++        rb_raise(rb_eThreadError, "can't initialize Thread: %s", strerror(err));
++    }
++#else
+     rb_native_mutex_initialize(&th->interrupt_lock);
++#endif
+ 
+     RUBY_DEBUG_LOG("r:%u th:%p", rb_ractor_id(th->ractor), (void *)th);
+ 
+@@ -1000,6 +1014,9 @@
+     /* kick thread */
+     err = native_thread_create(th);
+     if (err) {
++#ifdef __vita__
++        rb_native_mutex_destroy(&th->interrupt_lock);
++#endif
+ 	th->status = THREAD_KILLED;
+         rb_ractor_living_threads_remove(th->ractor, th);
+         rb_raise(rb_eThreadError, "can't create Thread: %s", strerror(err));
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -642,6 +642,24 @@
+ static RB_THREAD_LOCAL_SPECIFIER rb_thread_t *ruby_native_thread;
+ #else
+ static pthread_key_t ruby_native_thread_key;
++int ruby_native_tls_ready;
++
++static int
++native_tls_keys_create(void)
++{
++    int err;
++    if (ruby_native_tls_ready) return 0;
++    err = pthread_key_create(&ruby_native_thread_key, 0);
++    if (err) return err;
++    err = pthread_key_create(&ruby_current_ec_key, 0);
++    if (err) {
++        int cleanup = pthread_key_delete(ruby_native_thread_key);
++        if (cleanup) rb_bug_errno("pthread_key_delete", cleanup);
++        return err;
++    }
++    ruby_native_tls_ready = 1;
++    return 0;
++}
+ #endif
+ 
+ static void
+@@ -656,13 +674,17 @@
+ #ifdef RB_THREAD_LOCAL_SPECIFIER
+     return ruby_native_thread;
+ #else
+-    return pthread_getspecific(ruby_native_thread_key);
++    return native_tls_get(ruby_native_thread_key);
+ #endif
+ }
+ 
+ int
+ ruby_thread_set_native(rb_thread_t *th)
+ {
++#ifndef RB_THREAD_LOCAL_SPECIFIER
++    if (!ruby_native_tls_ready || pthread_setspecific(ruby_native_thread_key, th) != 0) return 0;
++    if (!th) native_tls_set(ruby_current_ec_key, NULL);
++#endif
+     if (th && th->ec) {
+         rb_ractor_set_current_ec(th->ractor, th->ec);
+     }
+@@ -670,7 +692,7 @@
+     ruby_native_thread = th;
+     return 1;
+ #else
+-    return pthread_setspecific(ruby_native_thread_key, th) == 0;
++    return 1;
+ #endif
+ }
+ 
+@@ -690,15 +712,11 @@
+ #endif
+ 
+ #ifndef RB_THREAD_LOCAL_SPECIFIER
+-    if (pthread_key_create(&ruby_native_thread_key, 0) == EAGAIN) {
+-        rb_bug("pthread_key_create failed (ruby_native_thread_key)");
+-    }
+-    if (pthread_key_create(&ruby_current_ec_key, 0) == EAGAIN) {
+-        rb_bug("pthread_key_create failed (ruby_current_ec_key)");
+-    }
++    int err = native_tls_keys_create();
++    if (err) rb_bug_errno("Ruby TLS key setup", err);
+ #endif
+     th->thread_id = pthread_self();
+-    ruby_thread_set_native(th);
++    if (!ruby_thread_set_native(th)) rb_bug("Ruby native thread TLS setup failed");
+     fill_thread_id_str(th);
+     native_thread_init(th);
+ #ifdef POSIX_SIGNAL
+@@ -722,6 +740,24 @@
+ }
+ #endif
+ 
++#ifdef __vita__
++static int
++vita_native_conds_init(rb_thread_t *th)
++{
++    native_thread_data_t *nd = &th->native_thread_data;
++#ifdef USE_UBF_LIST
++    list_node_init(&nd->node.ubf);
++#endif
++    int err = pthread_cond_init(&nd->cond.gvlq, condattr_monotonic);
++    if (err) return err;
++    if (&nd->cond.gvlq != &nd->cond.intr) {
++        err = pthread_cond_init(&nd->cond.intr, condattr_monotonic);
++        if (err) rb_native_cond_destroy(&nd->cond.gvlq);
++    }
++    return err;
++}
++#endif
++
+ static void
+ native_thread_init(rb_thread_t *th)
+ {
+@@ -733,9 +769,14 @@
+ #ifdef USE_UBF_LIST
+     list_node_init(&nd->node.ubf);
+ #endif
++#ifdef __vita__
++    int err = vita_native_conds_init(th);
++    if (err) rb_bug_errno("Ruby native condition setup", err);
++#else
+     rb_native_cond_initialize(&nd->cond.gvlq);
+     if (&nd->cond.gvlq != &nd->cond.intr)
+         rb_native_cond_initialize(&nd->cond.intr);
++#endif
+ }
+ 
+ #ifndef USE_THREAD_CACHE
+@@ -755,8 +796,8 @@
+      * prevent false positive from ruby_thread_has_gvl_p if that
+      * gets called from an interposing function wrapper
+      */
+-    if (USE_THREAD_CACHE)
+-        ruby_thread_set_native(0);
++    if (USE_THREAD_CACHE && !ruby_thread_set_native(0))
++        rb_bug("Ruby native thread TLS cleanup failed");
+ }
+ 
+ #if USE_THREAD_CACHE
+@@ -1074,6 +1115,11 @@
+ {
+     rb_nativethread_id_t curr = pthread_self();
+ 
++#ifdef __vita__
++    th->ec->machine.stack_start = NULL;
++    th->ec->machine.stack_maxsize = 0;
++#endif
++
+     if (pthread_equal(curr, native_main_thread.id)) {
+ 	th->ec->machine.stack_start = native_main_thread.stack_start;
+ 	th->ec->machine.stack_maxsize = native_main_thread.stack_maxsize;
+@@ -1083,7 +1129,13 @@
+ 	void *start;
+ 	size_t size;
+ 
+-	if (get_stack(&start, &size) == 0) {
++        int err = get_stack(&start, &size);
++#ifdef __vita__
++        if (err) return err > 0 ? err : EIO;
++        if (!start || (uintptr_t)start < (uintptr_t)&curr ||
++            (uintptr_t)start - (uintptr_t)&curr >= size) return EINVAL;
++#endif
++	if (err == 0) {
+ 	    uintptr_t diff = (uintptr_t)start - (uintptr_t)&curr;
+ 	    th->ec->machine.stack_start = (VALUE *)&curr;
+ 	    th->ec->machine.stack_maxsize = size - diff;
+@@ -1093,11 +1145,45 @@
+ #endif
+     }
+ 
++#ifdef __vita__
++    /* gc.c's stack_check subtracts 2048 VALUEs from this bound. */
++    if (!th->ec->machine.stack_start ||
++        th->ec->machine.stack_maxsize <= th->vm->default_params.thread_vm_stack_size ||
++        th->ec->machine.stack_maxsize - th->vm->default_params.thread_vm_stack_size <= 2048 * sizeof(VALUE)) {
++        th->ec->machine.stack_start = NULL;
++        th->ec->machine.stack_maxsize = 0;
++        return ERANGE;
++    }
++#endif
+     return 0;
+ }
+ 
+ #ifndef __CYGWIN__
+ #define USE_NATIVE_THREAD_INIT 1
++#endif
++
++#ifdef __vita__
++static int
++vita_thread_startup(rb_thread_t *th)
++{
++    int err = native_thread_init_stack(th);
++    if (!err && !ruby_native_tls_ready) err = EINVAL;
++    if (!err) err = pthread_setspecific(ruby_native_thread_key, th);
++    if (!err) {
++        err = pthread_setspecific(ruby_current_ec_key, th->ec);
++        if (err) {
++            int cleanup = pthread_setspecific(ruby_native_thread_key, NULL);
++            if (cleanup) rb_bug_errno("Ruby TLS startup cleanup", cleanup);
++        }
++    }
++    rb_native_mutex_lock(&th->interrupt_lock);
++    th->native_thread_data.startup_error = err;
++    th->native_thread_data.startup_ready = 1;
++    rb_native_cond_signal(&th->native_thread_data.cond.intr);
++    rb_native_mutex_unlock(&th->interrupt_lock);
++    /* On failure the parent may now reclaim th. */
++    return err;
++}
+ #endif
+ 
+ static void *
+@@ -1114,10 +1200,14 @@
+ #endif
+ 
+ 	fill_thread_id_str(th);
++#ifdef __vita__
++        if (vita_thread_startup(th)) return 0;
++#else
+ #if defined USE_NATIVE_THREAD_INIT
+ 	native_thread_init_stack(th);
+ #endif
+ 	native_thread_init(th);
++#endif
+ 	/* run */
+ #if defined USE_NATIVE_THREAD_INIT
+         thread_start_func_2(th, th->ec->machine.stack_start);
+@@ -1241,7 +1331,7 @@
+ }
+ 
+ static int
+-native_thread_create(rb_thread_t *th)
++native_thread_create0(rb_thread_t *th)
+ {
+     int err = 0;
+ 
+@@ -1258,25 +1348,61 @@
+ #endif
+         th->ec->machine.stack_maxsize = stack_size - space;
+ 
+-	CHECK_ERR(pthread_attr_init(&attr));
++        err = pthread_attr_init(&attr);
++        if (err) return err;
+ 
+ # ifdef PTHREAD_STACK_MIN
+ 	thread_debug("create - stack size: %lu\n", (unsigned long)stack_size);
+-	CHECK_ERR(pthread_attr_setstacksize(&attr, stack_size));
++        err = pthread_attr_setstacksize(&attr, stack_size);
++        if (err) goto attr_done;
+ # endif
+ 
+ # ifdef HAVE_PTHREAD_ATTR_SETINHERITSCHED
+-	CHECK_ERR(pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED));
++        err = pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
++        if (err) goto attr_done;
+ # endif
+-	CHECK_ERR(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED));
++        err = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++        if (err) goto attr_done;
+ 
+         err = pthread_create(&th->thread_id, &attr, thread_start_func_1, th);
+ 	thread_debug("create: %p (%d)\n", (void *)th, err);
+ 	/* should be done in the created thread */
+ 	fill_thread_id_str(th);
+-	CHECK_ERR(pthread_attr_destroy(&attr));
++      attr_done:
++        CHECK_ERR(pthread_attr_destroy(&attr));
+     }
+     return err;
++}
++
++static int
++native_thread_create(rb_thread_t *th)
++{
++#ifdef __vita__
++    native_thread_data_t *nd = &th->native_thread_data;
++    int err = vita_native_conds_init(th);
++    if (err) return err;
++    nd->startup_ready = 0;
++    nd->startup_error = 0;
++    /* Reuse the interrupt pair: no extra kernel objects for the handshake. */
++    rb_native_mutex_lock(&th->interrupt_lock);
++    err = native_thread_create0(th);
++    if (!err) {
++        while (!nd->startup_ready)
++            rb_native_cond_wait(&nd->cond.intr, &th->interrupt_lock);
++        err = nd->startup_error;
++    }
++    rb_native_mutex_unlock(&th->interrupt_lock);
++    if (err) {
++        rb_native_cond_destroy(&nd->cond.gvlq);
++        if (&nd->cond.gvlq != &nd->cond.intr)
++            rb_native_cond_destroy(&nd->cond.intr);
++        th->ec->machine.stack_start = NULL;
++        th->ec->machine.stack_maxsize = 0;
++    }
++    return err;
++#else
++    return native_thread_create0(th);
++#endif
+ }
+ 
+ #if USE_NATIVE_THREAD_PRIORITY
+--- a/thread_pthread.h
++++ b/thread_pthread.h
+@@ -35,6 +35,10 @@
+         rb_nativethread_cond_t intr; /* th->interrupt_lock */
+         rb_nativethread_cond_t gvlq; /* vm->gvl.lock */
+     } cond;
++#ifdef __vita__
++    int startup_ready;
++    int startup_error;
++#endif
+ } native_thread_data_t;
+ 
+ #undef except
+@@ -78,21 +82,20 @@
+ #else
+ 
+ typedef pthread_key_t native_tls_key_t;
++RUBY_SYMBOL_EXPORT_BEGIN
++RUBY_EXTERN int ruby_native_tls_ready;
++RUBY_SYMBOL_EXPORT_END
+ 
+ static inline void *
+ native_tls_get(native_tls_key_t key)
+ {
+-    void *ptr = pthread_getspecific(key);
+-    if (UNLIKELY(ptr == NULL)) {
+-        rb_bug("pthread_getspecific returns NULL");
+-    }
+-    return ptr;
++    return ruby_native_tls_ready ? pthread_getspecific(key) : NULL;
+ }
+ 
+ static inline void
+ native_tls_set(native_tls_key_t key, void *ptr)
+ {
+-    if (UNLIKELY(pthread_setspecific(key, ptr) != 0)) {
++    if (UNLIKELY(!ruby_native_tls_ready || pthread_setspecific(key, ptr) != 0)) {
+         rb_bug("pthread_setspecific error");
+     }
+ }
+--- a/vm_core.h
++++ b/vm_core.h
+@@ -1872,7 +1872,9 @@
+ #else
+     rb_execution_context_t *ec = native_tls_get(ruby_current_ec_key);
+ #endif
+-    VM_ASSERT(!expect_ec || ec != NULL);
++    if (UNLIKELY(expect_ec && ec == NULL)) {
++        rb_bug("current Ruby context is unavailable");
++    }
+     return ec;
+ }
+ 

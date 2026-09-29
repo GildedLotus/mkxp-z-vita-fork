@@ -1,0 +1,97 @@
+Subject: [Vita] Measure actual conservative stack ranges in GC::Profiler
+
+The arena hypothesis must be measured before changing roots. When the existing
+GC profiler is enabled, record active-thread and suspended-context bytes plus
+the largest individual range in each raw_data entry. Counts are visits, not
+unique bytes; incremental marking can visit a range more than once. This adds
+no roots, allocations, syscalls or changes to stack bounds in the collector.
+RUBY_VITA_GC_PROFILE enables the same observation on a native host MRI build.
+
+--- a/gc.c
++++ b/gc.c
+@@ -529,6 +529,9 @@
+     size_t heap_use_size;
+     size_t heap_total_size;
+     size_t moved_objects;
++#if defined(__vita__) || defined(RUBY_VITA_GC_PROFILE)
++    size_t machine_stack_bytes, suspended_stack_bytes, max_machine_range_bytes;
++#endif
+ 
+ #if GC_PROFILE_MORE_DETAIL
+     double gc_mark_time;
+@@ -6485,6 +6488,20 @@
+      ((start) = STACK_END, (end) = STACK_START) : ((start) = STACK_START, (end) = STACK_END+(appendix)))
+ #endif
+ 
++#if defined(__vita__) || defined(RUBY_VITA_GC_PROFILE)
++/* Observe the exact ranges passed to the marker; never alter GC roots. */
++void
++rb_vita_gc_record_stack(size_t bytes, int suspended)
++{
++    gc_profile_record *record = gc_prof_record(&rb_objspace);
++    if (!record) return;
++    if (suspended) record->suspended_stack_bytes += bytes;
++    else record->machine_stack_bytes += bytes;
++    if (bytes > record->max_machine_range_bytes)
++        record->max_machine_range_bytes = bytes;
++}
++#endif
++
+ static void each_stack_location(rb_objspace_t *objspace, const rb_execution_context_t *ec,
+                                  const VALUE *stack_start, const VALUE *stack_end, void (*cb)(rb_objspace_t *, VALUE));
+ 
+@@ -6556,6 +6573,9 @@
+ 		     const VALUE *stack_start, const VALUE *stack_end, void (*cb)(rb_objspace_t *, VALUE))
+ {
+ 
++#if defined(__vita__) || defined(RUBY_VITA_GC_PROFILE)
++    rb_vita_gc_record_stack((stack_end - stack_start) * sizeof(VALUE), 0);
++#endif
+     gc_mark_locations(objspace, stack_start, stack_end, cb);
+ 
+ #if defined(__mc68000__)
+@@ -12735,6 +12755,11 @@
+         rb_hash_aset(prof, ID2SYM(rb_intern("HEAP_TOTAL_OBJECTS")), SIZET2NUM(record->heap_total_objects));
+         rb_hash_aset(prof, ID2SYM(rb_intern("MOVED_OBJECTS")), SIZET2NUM(record->moved_objects));
+         rb_hash_aset(prof, ID2SYM(rb_intern("GC_IS_MARKED")), Qtrue);
++#if defined(__vita__) || defined(RUBY_VITA_GC_PROFILE)
++        rb_hash_aset(prof, ID2SYM(rb_intern("MACHINE_STACK_BYTES")), SIZET2NUM(record->machine_stack_bytes));
++        rb_hash_aset(prof, ID2SYM(rb_intern("SUSPENDED_STACK_BYTES")), SIZET2NUM(record->suspended_stack_bytes));
++        rb_hash_aset(prof, ID2SYM(rb_intern("MAX_MACHINE_RANGE_BYTES")), SIZET2NUM(record->max_machine_range_bytes));
++#endif
+ #if GC_PROFILE_MORE_DETAIL
+         rb_hash_aset(prof, ID2SYM(rb_intern("GC_MARK_TIME")), DBL2NUM(record->gc_mark_time));
+         rb_hash_aset(prof, ID2SYM(rb_intern("GC_SWEEP_TIME")), DBL2NUM(record->gc_sweep_time));
+--- a/cont.c
++++ b/cont.c
+@@ -38,6 +38,10 @@
+ #include "vm_core.h"
+ #include "id_table.h"
+ #include "ractor_core.h"
++
++#if defined(__vita__) || defined(RUBY_VITA_GC_PROFILE)
++void rb_vita_gc_record_stack(size_t bytes, int suspended);
++#endif
+ 
+ static const int DEBUG = 0;
+ 
+@@ -1036,6 +1040,9 @@
+     if (cont->machine.stack) {
+         if (cont->type == CONTINUATION_CONTEXT) {
+             /* cont */
++#if defined(__vita__) || defined(RUBY_VITA_GC_PROFILE)
++                rb_vita_gc_record_stack(cont->machine.stack_size * sizeof(VALUE), 1);
++#endif
+             rb_gc_mark_locations(cont->machine.stack,
+                                  cont->machine.stack + cont->machine.stack_size);
+         }
+@@ -1044,6 +1051,9 @@
+             const rb_fiber_t *fiber = (rb_fiber_t*)cont;
+ 
+             if (!FIBER_TERMINATED_P(fiber)) {
++#if defined(__vita__) || defined(RUBY_VITA_GC_PROFILE)
++                rb_vita_gc_record_stack(cont->machine.stack_size * sizeof(VALUE), 1);
++#endif
+                 rb_gc_mark_locations(cont->machine.stack,
+                                      cont->machine.stack + cont->machine.stack_size);
+             }

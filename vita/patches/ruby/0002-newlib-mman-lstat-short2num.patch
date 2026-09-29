@@ -1,0 +1,106 @@
+diff --git a/addr2line.c b/addr2line.c
+index f660be9129..8589e9c782 100644
+--- a/addr2line.c
++++ b/addr2line.c
+@@ -35,7 +35,9 @@
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
++#ifdef HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
++#endif
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+diff --git a/file.c b/file.c
+index e73ac53015..26e54c0419 100644
+--- a/file.c
++++ b/file.c
+@@ -594,6 +594,11 @@ rb_stat_cmp(VALUE self, VALUE other)
+ 
+ #define ST2UINT(val) ((val) & ~(~1UL << (sizeof(val) * CHAR_BIT - 1)))
+ 
++#ifndef SHORT2NUM
++/* MRI has NUM2SHORT/USHORT2NUM but intentionally no SHORT2NUM. Configure
++   maps a 2-byte dev_t to SHORT2NUM; provide it for newlib/Vita. */
++# define SHORT2NUM(v) INT2NUM((int)(v))
++#endif
+ #ifndef NUM2DEVT
+ # define NUM2DEVT(v) NUM2UINT(v)
+ #endif
+@@ -1419,6 +1424,16 @@ lstat_without_gvl(const char *path, struct stat *st)
+ }
+ #endif /* HAVE_LSTAT */
+ 
++#ifndef HAVE_LSTAT
++/* Vita/newlib: no lstat. Call sites still reference this helper. */
++static int
++lstat_without_gvl(const char *path, struct stat *st)
++{
++    return stat(path, st);
++}
++#endif
++
++
+ /*
+  *  call-seq:
+  *     File.lstat(file_name)   -> stat
+diff --git a/gc.c b/gc.c
+index 030a4627bd..45b31fd0a3 100644
+--- a/gc.c
++++ b/gc.c
+@@ -25,8 +25,10 @@
+ 
+ #ifndef _WIN32
+ #include <unistd.h>
++#ifdef HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
+ #endif
++#endif
+ 
+ #include <setjmp.h>
+ #include <stdarg.h>
+diff --git a/io_buffer.c b/io_buffer.c
+index 0ca6ec5632..52a9341d80 100644
+--- a/io_buffer.c
++++ b/io_buffer.c
+@@ -27,8 +27,10 @@ size_t RUBY_IO_BUFFER_DEFAULT_SIZE;
+ #ifdef _WIN32
+ #else
+ #include <unistd.h>
++#ifdef HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
+ #endif
++#endif
+ 
+ struct rb_io_buffer {
+     void *base;
+diff --git a/transient_heap.c b/transient_heap.c
+index c3df263491..2566e84f1c 100644
+--- a/transient_heap.c
++++ b/transient_heap.c
+@@ -46,7 +46,9 @@
+ #define TRANSIENT_HEAP_DEBUG_INFINITE_BLOCK 0
+ 
+ #if TRANSIENT_HEAP_DEBUG_INFINITE_BLOCK
++#ifdef HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
++#endif
+ #include <errno.h>
+ #endif
+ 
+diff --git a/yjit_asm.c b/yjit_asm.c
+index 9f84e3974b..7d28054f0a 100644
+--- a/yjit_asm.c
++++ b/yjit_asm.c
+@@ -15,8 +15,10 @@
+ // For mmapp(), sysconf()
+ #ifndef _WIN32
+ #include <unistd.h>
++#ifdef HAVE_SYS_MMAN_H
+ #include <sys/mman.h>
+ #endif
++#endif
+ 
+ #include "yjit_asm.h"
+ 

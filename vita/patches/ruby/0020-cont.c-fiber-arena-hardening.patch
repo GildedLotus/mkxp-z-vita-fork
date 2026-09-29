@@ -1,0 +1,146 @@
+From: mkxp-z-vita
+Subject: [PATCH 0020] Fail closed on unavailable fiber arenas; opt-in stack diagnostics
+
+Never use malloc stacks on Vita. Defer arena failure until first resume so
+Init_Cont completes before FiberError can be raised and shown by the player.
+Prepare stacks before changing resume links so exhaustion leaves fibers usable.
+Diagnostic-only boundary canaries detect corruption; they do not prevent it.
+Paint only the machine stack before first entry, sample before recycling, and
+expose per-slot written-byte high-water marks to the capacity diagnostic.
+All changes are Vita-only; the 49 x 328 KiB default geometry is unchanged.
+
+--- a/cont.c
++++ b/cont.c
+@@ -442,9 +442,9 @@
+         int rc = vita_fiber_arena_acquire(&arena, count, stride);
+ 
+         if (rc == VITA_FIBER_ARENA_OK) return arena;
+-        if (rc != VITA_FIBER_ARENA_FALLBACK) return NULL;
+-    }
+-#endif
++        return NULL;
++    }
++#else
+ 
+     // We use a divide-by-2 strategy to try and allocate memory. We are trying
+     // to allocate `count` stacks. In normal situation, this won't fail. But
+@@ -494,6 +494,7 @@
+     }
+ 
+     return NULL;
++#endif /* !__vita__ */
+ }
+ 
+ // Given an existing fiber pool, expand it by the specified number of stacks.
+@@ -512,7 +513,18 @@
+     void * base = fiber_pool_allocate_memory(&count, stride);
+ 
+     if (base == NULL) {
++#ifdef __vita__
++        /* Init_Cont creates FiberError after the pool. Leave it empty until
++         * first use, so ruby_init can finish and the script panel can run. */
++        if (!rb_eFiberError) return NULL;
++        if (!vita_fiber_arena_active()) {
++            rb_raise(rb_eFiberError, "fiber arena unavailable: %s",
++                     vita_fiber_arena_failure_reason());
++        }
++        rb_raise(rb_eFiberError, "Vita fiber arena exhausted (%"PRIuSIZE" live slots)", fiber_pool->count);
++#else
+         rb_raise(rb_eFiberError, "can't alloc machine stack to fiber (%"PRIuSIZE" x %"PRIuSIZE" bytes): %s", count, size, ERRNOMSG);
++#endif
+     }
+ 
+     struct fiber_pool_vacancy * vacancies = fiber_pool->vacancies;
+@@ -765,6 +777,9 @@
+ 
+     if (DEBUG) fprintf(stderr, "fiber_pool_stack_release: %p used=%"PRIuSIZE"\n", stack->base, stack->pool->used);
+ 
++#ifdef __vita__
++    vita_fiber_arena_slot_end(stack->base);
++#endif
+     // Copy the stack details into the vacancy area:
+     vacancy->stack = *stack;
+     // After this point, be careful about updating/using state in stack, since it's copied to the vacancy area.
+@@ -865,6 +880,9 @@
+     vm_stack = fiber_pool_stack_alloca(&fiber->stack, fiber_pool->vm_stack_size);
+     *vm_stack_size = fiber_pool->vm_stack_size;
+ 
++#ifdef __vita__
++    vita_fiber_arena_slot_begin(fiber_pool_stack_base(&fiber->stack), fiber->stack.available);
++#endif
+     coroutine_initialize(&fiber->context, fiber_entry, fiber_pool_stack_base(&fiber->stack), fiber->stack.available);
+ 
+     // The stack for this execution context is the one we allocated:
+@@ -2310,9 +2328,11 @@
+         fiber = root_fiber_alloc(th);
+     }
+ 
++#ifndef __vita__
+     if (FIBER_CREATED_P(next_fiber)) {
+         fiber_prepare_stack(next_fiber);
+     }
++#endif
+ 
+     VM_ASSERT(FIBER_RESUMED_P(fiber) || FIBER_TERMINATED_P(fiber));
+     VM_ASSERT(FIBER_RUNNABLE_P(next_fiber));
+@@ -2372,6 +2392,11 @@
+     rb_fiber_t *current_fiber = fiber_current();
+ 
+     VM_ASSERT(!current_fiber->resuming_fiber);
++
++#ifdef __vita__
++    /* Exhaustion must raise before changing resume links or blocking depth. */
++    if (FIBER_CREATED_P(fiber)) fiber_prepare_stack(fiber);
++#endif
+ 
+     if (resuming_fiber) {
+         current_fiber->resuming_fiber = resuming_fiber;
+@@ -3301,6 +3326,37 @@
+ }
+ #endif
+ 
++#ifdef __vita__
++static VALUE
++rb_fiber_vita_stack_diagnostics(VALUE klass)
++{
++    if (shared_fiber_pool.used || !vita_fiber_arena_diagnostics_enable()) {
++        rb_raise(rb_eFiberError, "Vita stack diagnostics require an idle, intact arena of at most 49 slots");
++    }
++    return Qnil;
++}
++
++static VALUE
++rb_fiber_vita_stack_stats(VALUE klass)
++{
++    struct vita_fiber_slot_stats slots[VITA_FIBER_DIAGNOSTIC_SLOTS];
++    size_t count = vita_fiber_arena_snapshot(slots, VITA_FIBER_DIAGNOSTIC_SLOTS);
++    if (!count) rb_raise(rb_eFiberError, "Vita stack diagnostics are not enabled on this thread");
++    VALUE result = rb_ary_new_capa(count);
++    for (size_t i = 0; i < count; ++i) {
++        VALUE row = rb_hash_new();
++        rb_hash_aset(row, ID2SYM(rb_intern("slot")), SIZET2NUM(i));
++        rb_hash_aset(row, ID2SYM(rb_intern("machine_bytes")), SIZET2NUM(slots[i].machine_bytes));
++        rb_hash_aset(row, ID2SYM(rb_intern("high_water_bytes")), SIZET2NUM(slots[i].high_water_bytes));
++        rb_hash_aset(row, ID2SYM(rb_intern("uses")), SIZET2NUM(slots[i].uses));
++        rb_hash_aset(row, ID2SYM(rb_intern("active")), RBOOL(slots[i].active));
++        rb_hash_aset(row, ID2SYM(rb_intern("canary_ok")), RBOOL(slots[i].canary_ok));
++        rb_ary_push(result, row);
++    }
++    return result;
++}
++#endif
++
+ void
+ Init_Cont(void)
+ {
+@@ -3334,6 +3390,10 @@
+     rb_eFiberError = rb_define_class("FiberError", rb_eStandardError);
+     rb_define_singleton_method(rb_cFiber, "yield", rb_fiber_s_yield, -1);
+     rb_define_singleton_method(rb_cFiber, "current", rb_fiber_s_current, 0);
++#ifdef __vita__
++    rb_define_singleton_method(rb_cFiber, "vita_stack_diagnostics", rb_fiber_vita_stack_diagnostics, 0);
++    rb_define_singleton_method(rb_cFiber, "vita_stack_stats", rb_fiber_vita_stack_stats, 0);
++#endif
+     rb_define_method(rb_cFiber, "initialize", rb_fiber_initialize, -1);
+     rb_define_method(rb_cFiber, "blocking?", rb_fiber_blocking_p, 0);
+     rb_define_method(rb_cFiber, "resume", rb_fiber_m_resume, -1);

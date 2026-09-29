@@ -1,0 +1,21 @@
+diff --git a/thread_pthread.h b/thread_pthread.h
+--- a/thread_pthread.h
++++ b/thread_pthread.h
+@@ -97,6 +97,17 @@ native_tls_set(native_tls_key_t key, void *ptr)
+     }
+ }
+ #endif
++
++#if defined(__vita__)
++/* Vita/newlib: crt0 (_start in crt0.o) does NOT initialize TPIDRURO
++   (CP15 c13).  GCC emits `mrc p15,0,rX,c13,c0,3` for every __thread /
++   _Thread_local access, so ruby_current_ec loads from address
++   0 + tls_offset and dies with EXC_BAD_ACCESS (observed at 0x200114
++   under Vita3K).  Force plain globals — Vita homebrew MRI is
++   single-threaded, so a process-global EC pointer is correct. */
++#undef RB_THREAD_LOCAL_SPECIFIER
++#define RB_THREAD_LOCAL_SPECIFIER /* empty: plain global, no TLS */
++#endif
+ 
+ RUBY_SYMBOL_EXPORT_BEGIN
+ #ifdef RB_THREAD_LOCAL_SPECIFIER

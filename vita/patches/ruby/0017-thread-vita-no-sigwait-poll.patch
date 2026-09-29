@@ -1,0 +1,214 @@
+diff --git a/thread.c b/thread.c
+--- a/thread.c
++++ b/thread.c
+@@ -4317,6 +4317,15 @@
+         rb_thread_wait_for(*timeout);
+         return 0;
+     }
++
++#if defined(__vita__)
++    /* Waiting on real fds uses select(), which this newlib implements via
++     * sceNet epoll. Kernel#sleep / Thread#join / Mutex#sleep never reach
++     * here (empty fd-sets take the condvar path above). Raise cleanly
++     * rather than prefetch-abort at PC 0. */
++    rb_notimplement();
++    return -1;
++#endif
+ 
+     set.sigwait_fd = rb_sigwait_fd_get(set.th);
+     if (set.sigwait_fd >= 0) {
+@@ -4364,6 +4373,13 @@
+ int
+ rb_thread_wait_for_single_fd(int fd, int events, struct timeval *timeout)
+ {
++#if defined(__vita__)
++    (void)fd;
++    (void)events;
++    (void)timeout;
++    rb_notimplement();
++    return -1;
++#else
+     struct pollfd fds[2];
+     int result = 0;
+     int drained;
+@@ -4464,6 +4480,7 @@
+ 	result |= events;
+ 
+     return result;
++#endif /* !__vita__ */
+ }
+ #else /* ! USE_POLL - implement rb_io_poll_fd() using select() */
+ struct select_args {
+@@ -4520,6 +4537,13 @@
+ int
+ rb_thread_wait_for_single_fd(int fd, int events, struct timeval *timeout)
+ {
++#if defined(__vita__)
++    (void)fd;
++    (void)events;
++    (void)timeout;
++    rb_notimplement();
++    return -1;
++#else
+     rb_fdset_t rfds, wfds, efds;
+     struct select_args args;
+     int r;
+@@ -4544,6 +4568,7 @@
+ 	errno = args.as.error;
+ 
+     return r;
++#endif /* !__vita__ */
+ }
+ #endif /* ! USE_POLL */
+ 
+diff --git a/thread_pthread.c b/thread_pthread.c
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -1870,6 +1870,14 @@
+ static void
+ rb_thread_create_timer_thread(void)
+ {
++#if defined(__vita__)
++    /* Vita/newlib poll() is sceNet-epoll backed and the net library is never
++     * initialised (observed on hardware:
++     * prefetch abort at PC 0, R12 = sceNetEpollCreate). Do not create the
++     * signal self-pipe: rb_sigwait_fd_get stays -1 and native_sleep uses
++     * native_cond_sleep instead of rb_sigwait_sleep / native_ppoll_sleep. */
++    return;
++#else
+     /* we only create the pipe, and lazy-spawn */
+     rb_pid_t current = getpid();
+     rb_pid_t owner = signal_self_pipe.owner_process;
+@@ -1889,6 +1897,7 @@
+         sigwait_th = THREAD_INVALID;
+         signal_self_pipe.owner_process = current;
+     }
++#endif
+ }
+ 
+ static void
+@@ -2104,6 +2113,10 @@
+ int
+ rb_sigwait_fd_get(const rb_thread_t *th)
+ {
++#if defined(__vita__)
++    (void)th;
++    return -1;
++#else
+     if (signal_self_pipe.normal[0] >= 0) {
+         VM_ASSERT(signal_self_pipe.owner_process == getpid());
+         /*
+@@ -2117,6 +2130,7 @@
+         }
+     }
+     return -1; /* avoid thundering herd and work stealing/starvation */
++#endif
+ }
+ 
+ void
+@@ -2155,7 +2169,16 @@
+     else
+ 	timeout_ms = -1;
+ 
++#if defined(__vita__)
++    (void)fds;
++    (void)nfds;
++    (void)sigmask;
++    (void)timeout_ms;
++    errno = ENOSYS;
++    return -1;
++#else
+     return poll(fds, nfds, timeout_ms);
++#endif
+ }
+ #  define ppoll(fds,nfds,ts,sigmask) ruby_ppoll((fds),(nfds),(ts),(sigmask))
+ #endif
+@@ -2163,6 +2186,14 @@
+ void
+ rb_sigwait_sleep(rb_thread_t *th, int sigwait_fd, const rb_hrtime_t *rel)
+ {
++#if defined(__vita__)
++    /* Unreachable: rb_sigwait_fd_get is -1 and native_sleep uses condvar.
++     * Keep poll/ppoll compiled out so a preprocessor scan cannot miss it. */
++    (void)th;
++    (void)sigwait_fd;
++    (void)rel;
++    rb_bug("rb_sigwait_sleep on Vita");
++#else
+     struct pollfd pfd;
+     struct timespec ts;
+ 
+@@ -2202,6 +2233,7 @@
+                 return;
+         }
+     }
++#endif
+ }
+ 
+ /*
+@@ -2249,6 +2281,10 @@
+ static void
+ native_ppoll_sleep(rb_thread_t *th, rb_hrtime_t *rel)
+ {
++#if defined(__vita__)
++    /* Unreachable: native_sleep never takes this path. Keep ppoll compiled out. */
++    native_cond_sleep(th, rel);
++#else
+     rb_native_mutex_lock(&th->interrupt_lock);
+     th->unblock.func = ubf_ppoll_sleep;
+     rb_native_mutex_unlock(&th->interrupt_lock);
+@@ -2275,14 +2311,23 @@
+     }
+     unblock_function_clear(th);
+     GVL_UNLOCK_END(th);
++#endif
+ }
+ 
+ static void
+ native_sleep(rb_thread_t *th, rb_hrtime_t *rel)
+ {
+-    int sigwait_fd = rb_sigwait_fd_get(th);
+     rb_ractor_blocking_threads_inc(th->ractor, __FILE__, __LINE__);
+ 
++#if defined(__vita__)
++    /* Always the condvar path. Skipping only rb_sigwait_sleep is not enough:
++     * with sigwait_fd == -1 the main thread still entered native_ppoll_sleep,
++     * which polls the self-pipe. pthread cond+timedwait is the verified
++     * primitive (MKXPZ0010). */
++    native_cond_sleep(th, rel);
++#else
++    int sigwait_fd = rb_sigwait_fd_get(th);
++
+     if (sigwait_fd >= 0) {
+         rb_native_mutex_lock(&th->interrupt_lock);
+         th->unblock.func = ubf_sigwait;
+@@ -2307,6 +2352,7 @@
+     else {
+         native_cond_sleep(th, rel);
+     }
++#endif
+ 
+     rb_ractor_blocking_threads_dec(th->ractor, __FILE__, __LINE__);
+ }
+@@ -2325,6 +2371,13 @@
+     pfd.events = POLLIN;
+ 
+     while (system_working > 0) {
++#if defined(__vita__)
++        /* UBF_TIMER is NONE; this thread is never spawned.
++         * Keep poll() compiled out for the Vita preprocessor scan. */
++        (void)pfd;
++        (void)timeout;
++        break;
++#else
+         (void)poll(&pfd, 1, timeout);
+         ccp = consume_communication_pipe(pfd.fd);
+ 
+@@ -2346,6 +2399,7 @@
+                 timeout = -1;
+             }
+         }
++#endif
+     }
+ 
+     return 0;

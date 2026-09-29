@@ -1,0 +1,201 @@
+# vitagl-0009: shader-cache write and layout fixes from a code review.
+# - custom_shaders.c: vgl_cache_write (also used by ffp.c) writes <entry>.tmp, checks open, the full write and the
+#   close, renames into place and removes the .tmp on any failure, so a torn write never sits under the final
+#   name (readers already reject short files, 0007). It is not an atomic replace; entries
+#   are regenerable. compile_shader no longer writes through an unchecked handle, and serialize_shader returns
+#   NULL on allocation failure instead of copying into NULL.
+# - custom_shaders.c: glCompileShader keys its no-bindings layout as <hash>-nb.gxp; glLinkProgram keeps
+#   <hash>.gxp (bindings layout), so the two layouts of one source no longer share a file. Shipped GXPs are
+#   the bindings layout under <hash>.gxp: unchanged, still valid.
+# - ffp.c: the fixed-function program cache reads whole files into a validated GXP (size window, full read,
+#   sceGxmProgramCheck, program size <= file), removes an invalid file, and writes through vgl_cache_write.
+# - shared.h: vgl_cache_write declaration.
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 0044cd9..b81507a 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -37,6 +37,24 @@
+ char vgl_shader_cache_path[256];
+ char vgl_shader_cache_fallback_path[256];
+ #endif
++
++// A cache entry is written to <path>.tmp and renamed into place, and only counts once every byte is
++// written; readers reject short files anyway. A stale .tmp is never read and the next write overwrites it.
++GLboolean vgl_cache_write(const char *path, const void *data, size_t size) {
++	char tmp[264];
++	if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
++		return GL_FALSE;
++	SceUID f = sceIoOpen(tmp, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
++	if (f < 0)
++		return GL_FALSE;
++	int n = sceIoWrite(f, data, size);
++	int c = sceIoClose(f);
++	if (n != (int)size || c < 0 || sceIoRename(tmp, path) < 0) {
++		sceIoRemove(tmp);
++		return GL_FALSE;
++	}
++	return GL_TRUE;
++}
+ #ifdef HAVE_TEX_CACHE
+ char vgl_file_cache_path[256];
+ #endif
+@@ -664,6 +682,8 @@ void *serialize_shader(void *out, size_t *sz, shader *s, GLboolean save_bindings
+ 	void *_out = out;
+ 	if (!_out) {
+ 		_out = vglMalloc(*sz);
++		if (!_out)
++			return NULL;
+ 	}
+ 	uint8_t *buf = (uint8_t *)_out;
+ 	vgl_fast_memcpy(buf, &matrix_uniforms_num, sizeof(uint32_t));
+@@ -907,12 +927,13 @@ static inline __attribute__((always_inline)) void compile_shader(shader *s, GLbo
+ 			*slash = 0;
+ 			sceIoMkdir(subdir, 0777);
+ 		}
+-		SceUID f = sceIoOpen(cache_fname, SCE_O_CREAT | SCE_O_WRONLY | SCE_O_TRUNC, 0777);
+ 		size_t sz;
+ 		void *buf = serialize_shader(NULL, &sz, s, save_bindings);
+-		sceIoWrite(f, buf, sz);
+-		sceIoClose(f);
+-		vgl_free(buf);
++		if (buf) {
++			if (!vgl_cache_write(cache_fname, buf, sz))
++				vgl_log("%s:%d %s: Could not write shader cache file %s.\n", __FILE__, __LINE__, __func__, cache_fname);
++			vgl_free(buf);
++		}
+ 	}
+ #endif
+ }
+@@ -2151,7 +2172,8 @@ void glCompileShader(GLuint handle) {
+ 	char fname[256];
+ 	uint64_t hash = XXH3_64bits(s->source, s->size);
+ 	uint8_t subdir_hash = hash >> 56;
+-	sprintf(fname, "%s/%s/%02X/%llX.gxp", vgl_shader_cache_path, s->type == GL_VERTEX_SHADER ? "v" : "f", subdir_hash, hash);
++	// The link path stores the same source with bindings under <hash>.gxp: this layout gets its own name
++	sprintf(fname, "%s/%s/%02X/%llX-nb.gxp", vgl_shader_cache_path, s->type == GL_VERTEX_SHADER ? "v" : "f", subdir_hash, hash);
+ 	if (load_cached_shader(fname, s, GL_FALSE)) {
+ 		vgl_free(s->source);
+ 		s->source = NULL;
+diff --git a/source/ffp.c b/source/ffp.c
+index 99a75b8..f2dd429 100644
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -568,6 +568,46 @@ void setup_combiner_pass(int i, char *dst) {
+ }
+ #endif
+ 
++// Loads a cached FFP program: whole file, read fully, a well-formed GXP no larger than the file. NULL when
++// the entry is missing, unreadable or short of memory; a file that fails the checks is removed so it is rebuilt.
++// This validates the header and size only (the FFP programs' parameter tables are not walked).
++static SceGxmProgram *ffp_read_cached_program(const char *fname) {
++	SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
++	if (f < 0)
++		return NULL;
++	SceOff size = sceIoLseek(f, 0, SCE_SEEK_END);
++	sceIoLseek(f, 0, SCE_SEEK_SET);
++	SceGxmProgram *prog = NULL;
++	GLboolean corrupt = GL_TRUE;
++	if (size < 0) {
++		corrupt = GL_FALSE;
++	} else if (size >= 64 && size <= 4 * 1024 * 1024) {
++		prog = (SceGxmProgram *)vglMalloc((uint32_t)size);
++		if (!prog) {
++			corrupt = GL_FALSE;
++		} else {
++			SceOff got = 0;
++			int n = 1;
++			while (got < size && (n = sceIoRead(f, (uint8_t *)prog + got, (SceSize)(size - got))) > 0)
++				got += n;
++			if (n < 0)
++				corrupt = GL_FALSE;
++			else if (got == size && !sceGxmProgramCheck(prog) && sceGxmProgramGetSize(prog) <= (uint32_t)size)
++				corrupt = GL_FALSE;
++			if (corrupt || n < 0) {
++				vgl_free(prog);
++				prog = NULL;
++			}
++		}
++	}
++	sceIoClose(f);
++	if (corrupt) {
++		vgl_log("%s:%d %s: Removing invalid FFP shader cache file %s.\n", __FILE__, __LINE__, __func__, fname);
++		sceIoRemove(fname);
++	}
++	return prog;
++}
++
+ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *streams, SceGxmIndexSource index_type) {
+ #ifdef HAVE_PROFILING
+ 	uint32_t reload_ffp_shaders_start = sceKernelGetProcessTimeLow();
+@@ -817,15 +857,8 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ #else
+ 		sprintf(fname, "ux0:data/shader_cache/v%d/v/%08X-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
+ #endif
+-		SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+-		if (f >= 0) {
+-			// Gathering the precompiled shader from cache
+-			uint32_t size = sceIoLseek(f, 0, SCE_SEEK_END);
+-			sceIoLseek(f, 0, SCE_SEEK_SET);
+-			ffp_vertex_program = (SceGxmProgram *)vglMalloc(size);
+-			sceIoRead(f, ffp_vertex_program, size);
+-			sceIoClose(f);
+-		} else {
++		ffp_vertex_program = ffp_read_cached_program(fname);
++		if (!ffp_vertex_program) {
+ 			// Restarting vitaShaRK if we released it before
+ 			if (!is_shark_online)
+ 				start_shader_compiler();
+@@ -840,9 +873,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 			shark_clear_output();
+ 				
+ 			// Saving compiled shader in filesystem cache
+-			f = sceIoOpen(fname, SCE_O_WRONLY | SCE_O_TRUNC | SCE_O_CREAT, 0777);
+-			sceIoWrite(f, ffp_vertex_program, size);
+-			sceIoClose(f);
++			vgl_cache_write(fname, ffp_vertex_program, size);
+ 		}
+ 		sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, ffp_vertex_program, &ffp_vertex_program_id);
+ 		ffp_vertex_unif_buf_size = sceGxmProgramGetDefaultUniformBufferSize(ffp_vertex_program);
+@@ -1045,15 +1076,8 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 		sprintf(fname, "ux0:data/shader_cache/v%d/f/%08X-0000000000000000.gxp", FFP_SHADER_CACHE_MAGIC, frag_shader_mask);
+ #endif
+ #endif
+-		SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+-		if (f >= 0) {
+-			// Gathering the precompiled shader from cache
+-			uint32_t size = sceIoLseek(f, 0, SCE_SEEK_END);
+-			sceIoLseek(f, 0, SCE_SEEK_SET);
+-			ffp_fragment_program = (SceGxmProgram *)vglMalloc(size);
+-			sceIoRead(f, ffp_fragment_program, size);
+-			sceIoClose(f);
+-		} else {
++		ffp_fragment_program = ffp_read_cached_program(fname);
++		if (!ffp_fragment_program) {
+ 			// Restarting vitaShaRK if we released it before
+ 			if (!is_shark_online)
+ 				start_shader_compiler();
+@@ -1128,9 +1152,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 			shark_clear_output();
+ 
+ 			// Saving compiled shader in filesystem cache
+-			f = sceIoOpen(fname, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+-			sceIoWrite(f, ffp_fragment_program, size);
+-			sceIoClose(f);
++			vgl_cache_write(fname, ffp_fragment_program, size);
+ 		}
+ 		sceGxmShaderPatcherRegisterProgram(gxm_shader_patcher, ffp_fragment_program, &ffp_fragment_program_id);
+ 		ffp_fragment_unif_buf_size = sceGxmProgramGetDefaultUniformBufferSize(ffp_fragment_program);
+diff --git a/source/shared.h b/source/shared.h
+index 53ad650..f23e65f 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -300,6 +300,9 @@ extern int NEW_DISPLAY_HEIGHT; // Requested new display height in pixels
+ // Fixed-function pipeline shader cache settings
+ #define FFP_SHADER_CACHE_MAGIC 31 // This must be increased whenever ffp shader sources or shader mask/combiner mask changes
+ 
++// Writes a cache entry through <path>.tmp and a rename, so a torn write never sits under the final name
++GLboolean vgl_cache_write(const char *path, const void *data, size_t size);
++
+ // Custom shaders pipeline shader cache settings
+ #ifdef HAVE_SHADER_CACHE
+ #define SHADER_CACHE_MAGIC 2

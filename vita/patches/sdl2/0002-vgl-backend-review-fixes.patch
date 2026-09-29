@@ -1,0 +1,231 @@
+# sdl2-0002: review fixes for the VIDEO_VITA_VGL backend added by 0001. vitaGL has one global context and cannot be deinitialised.
+#   MakeCurrent: no glClear/glClearColor/glFinish (it wiped the bound
+#     framebuffer and desynchronised the caller's cached clear colour).
+#   SwapWindow: vglSwapBuffers(GL_FALSE); the argument is has_commondialog.
+#   Load/UnloadLibrary: SDL owns gl_config.driver_loaded (the backend setting
+#     it leaked a count, so SDL never called Unload); Unload keeps the latch.
+#   SetSwapInterval: negative (adaptive) is rejected instead of wrapping to
+#     0xFFFFFFFF vblank waits in vitaGL's uint32_t vsync_interval.
+#   LoadLibrary probes every non-zero pool (vitaGL ignores failed memblocks)
+#     and errors out; the CDLG hint is capped at vitaGL's own 9 MiB maximum.
+#   Message box: SDL_SetError on failure; refused while a CDLG pool is held
+#     (vitaGL then never calls sceCommonDialogUpdate, so the box could not end).
+#   CMake: VIDEO_VITA_VGL with VIDEO_VITA_PIB/PVR is a FATAL_ERROR (both
+#     backends define VITA_GLES_*).
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 01ab675..9d1c13e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2590,6 +2590,9 @@ elseif(VITA)
+     endif()
+ 
+     if(VIDEO_VITA_VGL)
++      if(VIDEO_VITA_PIB OR VIDEO_VITA_PVR)
++        message(FATAL_ERROR "VIDEO_VITA_VGL cannot be combined with VIDEO_VITA_PIB or VIDEO_VITA_PVR: their VITA_GLES_* backends collide")
++      endif()
+       check_include_file(vitaGL.h HAVE_VITAGL_H)
+ 
+       if(HAVE_VITAGL_H)
+diff --git a/src/video/vita/SDL_vitagles_vgl.c b/src/video/vita/SDL_vitagles_vgl.c
+index 11fdeba..8a8b7a8 100644
+--- a/src/video/vita/SDL_vitagles_vgl.c
++++ b/src/video/vita/SDL_vitagles_vgl.c
+@@ -43,14 +43,18 @@
+ #define VITAGL_DEFAULT_RAM_POOL     (96 * 1024 * 1024)
+ #define VITAGL_DEFAULT_CDRAM_POOL   (64 * 1024 * 1024)
+ #define VITAGL_DEFAULT_PHYCONT_POOL (16 * 1024 * 1024)
+-/* vitaGL's mem_utils.h SCE_KERNEL_MAX_MAIN_CDIALOG_MEM_SIZE (9 MiB), the
+-   cdialog pool the stock init would have given. */
++/* vitaGL's mem_utils.h SCE_KERNEL_MAX_MAIN_CDIALOG_MEM_SIZE (9 MiB), the most
++   it ever pools (its own vglInit pools none). A non-zero pool takes the memory
++   common dialogs need, so vitaGL then never calls sceCommonDialogUpdate. */
+ #define VITAGL_DEFAULT_CDLG_POOL    0x8C6000
++#define VITAGL_MAX_CDLG_POOL        VITAGL_DEFAULT_CDLG_POOL
+ 
+ /* only one instance of vitaGL can run at the same time */
+ static int vgl_initialized = 0;
++static const char *vgl_failed_pool = NULL;
++static int vgl_cdlg_pool = 0;
+ 
+-static int VITA_VGL_PoolSize(const char *hint, int fallback)
++static int VITA_VGL_PoolSize(const char *hint, int fallback, unsigned long max)
+ {
+     const char *value = SDL_GetHint(hint);
+     char *end = NULL;
+@@ -60,12 +64,37 @@ static int VITA_VGL_PoolSize(const char *hint, int fallback)
+         return fallback;
+     }
+     parsed = SDL_strtoul(value, &end, 0);
+-    if (!end || *end || parsed > 0x7FFFFFFF) {
++    if (!end || *end || parsed > max) {
+         return fallback;
+     }
+     return (int)parsed;
+ }
+ 
++/* vitaGL never checks its pool memblocks; a pool it could not create answers
++   every allocation with NULL. */
++static const char *VITA_VGL_ProbePool(vglMemType type, int size, const char *name)
++{
++    void *block;
++
++    if (size <= 0) {
++        return NULL;
++    }
++    block = vglAlloc(16, type);
++    if (!block) {
++        return name;
++    }
++    vglFree(block);
++    return NULL;
++}
++
++int
++VITA_GLES_CdlgPoolSize(void)
++{
++    return vgl_cdlg_pool;
++}
++
++/* SDL owns gl_config.driver_loaded (SDL_GL_LoadLibrary counts it): touching it
++   here leaks a reference, so SDL_GL_UnloadLibrary never reaches the backend. */
+ int
+ VITA_GLES_LoadLibrary(_THIS, const char *path)
+ {
+@@ -73,10 +102,10 @@ VITA_GLES_LoadLibrary(_THIS, const char *path)
+         /* init vitaGL once and never deinit it again until the driver dies.
+            MSAA is always off: the extra render-target storage is not budgeted
+            for any consumer of this backend. */
+-        int ram = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_RAM_POOL, VITAGL_DEFAULT_RAM_POOL);
+-        int cdram = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_CDRAM_POOL, VITAGL_DEFAULT_CDRAM_POOL);
+-        int phycont = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_PHYCONT_POOL, VITAGL_DEFAULT_PHYCONT_POOL);
+-        int cdlg = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_CDLG_POOL, VITAGL_DEFAULT_CDLG_POOL);
++        int ram = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_RAM_POOL, VITAGL_DEFAULT_RAM_POOL, 0x7FFFFFFF);
++        int cdram = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_CDRAM_POOL, VITAGL_DEFAULT_CDRAM_POOL, 0x7FFFFFFF);
++        int phycont = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_PHYCONT_POOL, VITAGL_DEFAULT_PHYCONT_POOL, 0x7FFFFFFF);
++        int cdlg = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_CDLG_POOL, VITAGL_DEFAULT_CDLG_POOL, VITAGL_MAX_CDLG_POOL);
+ 
+         sceSysmoduleLoadModule(SCE_SYSMODULE_IME);
+         /* The result is not a status: GL_TRUE only reports that vitaGL fell
+@@ -84,20 +113,31 @@ VITA_GLES_LoadLibrary(_THIS, const char *path)
+         (void)vglInitWithCustomSizes(0, 960, 544, ram, cdram, phycont, cdlg,
+                                      SCE_GXM_MULTISAMPLE_NONE);
+         vgl_initialized = 1;
++        vgl_cdlg_pool = cdlg;
++        vgl_failed_pool = VITA_VGL_ProbePool(VGL_MEM_VRAM, cdram, "CDRAM");
++        if (!vgl_failed_pool) {
++            vgl_failed_pool = VITA_VGL_ProbePool(VGL_MEM_RAM, ram, "RAM");
++        }
++        if (!vgl_failed_pool) {
++            vgl_failed_pool = VITA_VGL_ProbePool(VGL_MEM_PHYCONT, phycont, "PHYCONT");
++        }
++        if (!vgl_failed_pool) {
++            vgl_failed_pool = VITA_VGL_ProbePool(VGL_MEM_BUDGET, cdlg, "CDLG");
++        }
+     }
+ 
+-    _this->gl_config.driver_loaded = 1;
++    if (vgl_failed_pool) {
++        return SDL_SetError("vitaGL could not create its %s pool; lower SDL_VITA_VGL_%s_POOL",
++                            vgl_failed_pool, vgl_failed_pool);
++    }
+     return 0;
+ }
+ 
+ void
+ VITA_GLES_UnloadLibrary(_THIS)
+ {
+-    if (vgl_initialized)
+-    {
+-        vgl_initialized = 0;
+-    }
+-    _this->gl_config.driver_loaded = 0;
++    /* vitaGL has no deinit: vgl_initialized stays set so a later load
++       reuses the running instance instead of initialising it again. */
+ }
+ 
+ void *
+@@ -144,11 +184,9 @@ VITA_GLES_MakeCurrent(_THIS, SDL_Window * window, SDL_GLContext context)
+         return -1;
+     }
+ 
+-    glFinish();
+-    glClearColor(0.f, 0.f, 0.f, 0.f);
+-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+-    glFinish();
+-
++    /* vitaGL has one global context and back buffer, so there is nothing to
++       switch; drawing here would clear the caller's framebuffer and reset
++       its clear colour. */
+     return 0;
+ }
+ 
+@@ -159,6 +197,9 @@ VITA_GLES_SetSwapInterval(_THIS, int interval)
+         SDL_SetError("vitaGL is not initialized");
+         return -1;
+     }
++    if (interval < 0) {
++        return SDL_SetError("Adaptive vsync is not supported");
++    }
+     _this->gl_data->swapinterval = interval;
+     eglSwapInterval(0, interval);
+     return 0;
+@@ -188,7 +229,8 @@ VITA_GLES_SwapWindow(_THIS, SDL_Window * window)
+         sceImeUpdate();
+     }
+ 
+-    vglSwapBuffers(GL_TRUE);
++    /* GL_FALSE: no common dialog is up here; the message box loop swaps for itself. */
++    vglSwapBuffers(GL_FALSE);
+ 
+     return 0;
+ }
+diff --git a/src/video/vita/SDL_vitagles_vgl.h b/src/video/vita/SDL_vitagles_vgl.h
+index 9d76790..3388f76 100644
+--- a/src/video/vita/SDL_vitagles_vgl.h
++++ b/src/video/vita/SDL_vitagles_vgl.h
+@@ -38,6 +38,7 @@ extern int VITA_GLES_MakeCurrent(_THIS, SDL_Window * window, SDL_GLContext conte
+ extern int VITA_GLES_SwapWindow(_THIS, SDL_Window * window);
+ extern SDL_GLContext VITA_GLES_CreateContext(_THIS, SDL_Window * window);
+ extern int VITA_GLES_LoadLibrary(_THIS, const char *path);
++extern int VITA_GLES_CdlgPoolSize(void);
+ extern void VITA_GLES_UnloadLibrary(_THIS);
+ extern int VITA_GLES_SetSwapInterval(_THIS, int interval);
+ extern int VITA_GLES_GetSwapInterval(_THIS);
+diff --git a/src/video/vita/SDL_vitamessagebox.c b/src/video/vita/SDL_vitamessagebox.c
+index d801a52..4324503 100644
+--- a/src/video/vita/SDL_vitamessagebox.c
++++ b/src/video/vita/SDL_vitamessagebox.c
+@@ -28,6 +28,7 @@
+ 
+ #if SDL_VIDEO_VITA_VGL
+ #include <vitaGL.h>
++#include "SDL_vitagles_vgl.h"
+ #endif
+ 
+ #if SDL_VIDEO_RENDER_VITA_GXM
+@@ -53,6 +54,14 @@ int VITA_ShowMessageBox(const SDL_MessageBoxData *messageboxdata, int *buttonid)
+         return -1;
+     }
+ 
++#if SDL_VIDEO_VITA_VGL
++    /* A non-zero cdialog pool holds the memory common dialogs need and makes
++       vitaGL skip sceCommonDialogUpdate, so the dialog could never finish. */
++    if (VITA_GLES_CdlgPoolSize() != 0) {
++        return SDL_SetError("Message boxes need SDL_VITA_VGL_CDLG_POOL=0 under vitaGL");
++    }
++#endif
++
+     SDL_zero(param);
+     sceMsgDialogParamInit(&param);
+     param.mode = SCE_MSG_DIALOG_MODE_USER_MSG;
+@@ -117,6 +126,10 @@ int VITA_ShowMessageBox(const SDL_MessageBoxData *messageboxdata, int *buttonid)
+         }
+         sceMsgDialogTerm();
+     } else {
++#if SDL_VIDEO_VITA_VGL
++        SDL_SetError("sceMsgDialogInit failed (0x%08x); vitaGL must be initialised first",
++                     (unsigned int)init_result);
++#endif
+         return -1;
+     }
+ 

@@ -1,0 +1,269 @@
+# taihen-0001: build the pinned taiHEN (309b3800bcb8) against the current
+# VitaSDK (GCC 15.2, 2026-08 headers). Upstream drift this fixes: process
+# context became a 12-byte struct (int[3] no longer matches); the memcpy
+# helpers moved to explicit ksceKernelCopy{To,From}UserProc with pointer
+# arguments; ksceKernelCpuUnrestrictedMemcpy and the Cpu cache/interrupt
+# wrappers were replaced (SuspendIntr/ResumeIntr, DcacheCleanInvalidateRange,
+# IcacheInvalidateRange); the sbl headers moved to kernel/{acmgr,aimgr}.h
+# (acmgr.h keeps a ksceSblACMgrIsShell back-compat macro); hen.c needs
+# kernel/sysroot.h for the GetProcessTitleId macro; substitute's execmem.c
+# (inside the substitute gitlink, patched here across the submodule) used the
+# removed unrestricted memcpy and the old Rx-macro argument order.
+# The module is built only so vita-elf-export can derive libtaihen_stub.a
+# from exports.yml; the device runs the community taiHEN module, so these
+# branches only have to compile and link. uintptr_t->pointer int-conversion
+# warnings in the user wrappers are downgraded in the script, not here.
+diff --git a/hen.c b/hen.c
+index 905fce9..8b2b42f 100644
+--- a/hen.c
++++ b/hen.c
+@@ -8,6 +8,7 @@
+ #include <psp2kern/ctrl.h>
+ #include <psp2kern/types.h>
+ #include <psp2kern/kernel/sysmem.h>
++#include <psp2kern/kernel/sysroot.h>
+ #include <string.h>
+ #include "error.h"
+ #include "hen.h"
+diff --git a/module.c b/module.c
+index 0c8233a..5647b9b 100644
+--- a/module.c
++++ b/module.c
+@@ -171,8 +171,8 @@ static int sce_to_tai_module_info(SceUID pid, void *sceinfo, tai_module_info_t *
+  * @return     0 if not found or the offset to the needle
+  */
+ static int find_int_for_user(SceUID pid, uintptr_t src, uint32_t needle, size_t size) {
+-  int my_context[3];
+-  int *other_context;
++  SceKernelProcessContext my_context;
++  SceKernelProcessContext *other_context = NULL;
+   int flags;
+   uintptr_t end;
+   uint32_t data;
+@@ -186,8 +186,8 @@ static int find_int_for_user(SceUID pid, uintptr_t src, uint32_t needle, size_t
+     return 0;
+   }
+   size = end-src;
+-  flags = ksceKernelCpuDisableInterrupts();
+-  ksceKernelCpuSaveContext(my_context);
++  flags = ksceKernelCpuSuspendIntr();
++  ksceKernelCpuSaveContext(&my_context);
+   ret = ksceKernelGetPidContext(pid, &other_context);
+   if (ret >= 0) {
+     ksceKernelCpuRestoreContext(other_context);
+@@ -199,8 +199,8 @@ static int find_int_for_user(SceUID pid, uintptr_t src, uint32_t needle, size_t
+       count += 4;
+     }
+   }
+-  ksceKernelCpuRestoreContext(my_context);
+-  ksceKernelCpuEnableInterrupts(flags);
++  ksceKernelCpuRestoreContext(&my_context);
++  ksceKernelCpuResumeIntr(flags);
+   if (ret < 0) {
+     LOG("Error trying to get context for %x", pid);
+     count = ret;
+@@ -346,7 +346,7 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
+     if (pid == KERNEL_PID) {
+       export = (sce_module_exports_t *)cur;
+     } else {
+-      if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, &local, cur, sizeof(local))) < 0) {
++      if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, &local, (void *)cur, sizeof(local))) < 0) {
+         LOG("Error trying to read address %p for %x: %x", cur, pid, ret);
+         return ret;
+       }
+@@ -365,7 +365,7 @@ int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uin
+       } else {
+         found = find_int_for_user(pid, (uintptr_t)export->nid_table, funcnid, export->num_functions * 4);
+         if (found >= 0) {
+-          if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, func, (uintptr_t)export->entry_table + found, 4)) < 0) {
++          if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, func, (void *)((uintptr_t)export->entry_table + found), 4)) < 0) {
+             LOG("Error trying to read address %p for %x: %x", (uintptr_t)export->entry_table + found, pid, ret);
+             return ret;
+           }
+@@ -412,12 +412,12 @@ int module_get_import_func(SceUID pid, const char *modname, uint32_t target_libn
+     if (pid == KERNEL_PID) {
+       import = (sce_module_imports_t *)cur;
+     } else {
+-      if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, &local.size, cur, sizeof(local.size))) < 0) {
++      if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, &local.size, (void *)cur, sizeof(local.size))) < 0) {
+         LOG("Error trying to read address %p for %x: %x", cur, pid, ret);
+         return ret;
+       }
+       if (local.size <= sizeof(local)) {
+-        if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, &local, cur, local.size)) < 0) {
++        if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, &local, (void *)cur, local.size)) < 0) {
+           LOG("Error trying to read address %p for %x: %x", cur, pid, ret);
+           return ret;
+         }
+@@ -439,7 +439,7 @@ int module_get_import_func(SceUID pid, const char *modname, uint32_t target_libn
+         } else {
+           found = find_int_for_user(pid, (uintptr_t)import->type1.func_nid_table, funcnid, import->type1.num_functions * 4);
+           if (found >= 0) {
+-            if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, stub, (uintptr_t)import->type1.func_entry_table + found, 4)) < 0) {
++            if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, stub, (void *)((uintptr_t)import->type1.func_entry_table + found), 4)) < 0) {
+               LOG("Error trying to read address %p for %x: %x", (uintptr_t)import->type1.func_entry_table + found, pid, ret);
+               return ret;
+             }
+@@ -461,7 +461,7 @@ int module_get_import_func(SceUID pid, const char *modname, uint32_t target_libn
+         } else {
+           found = find_int_for_user(pid, (uintptr_t)import->type2.func_nid_table, funcnid, import->type2.num_functions * 4);
+           if (found >= 0) {
+-            if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, stub, (uintptr_t)import->type2.func_entry_table + found, 4)) < 0) {
++            if ((ret = ksceKernelMemcpyUserToKernelForPid(pid, stub, (void *)((uintptr_t)import->type2.func_entry_table + found), 4)) < 0) {
+               LOG("Error trying to read address %p for %x: %x", (uintptr_t)import->type2.func_entry_table + found, pid, ret);
+               return ret;
+             }
+diff --git a/patches.c b/patches.c
+index 17f6a0d..5c4488b 100644
+--- a/patches.c
++++ b/patches.c
+@@ -170,9 +170,9 @@ static inline void hex_dump(uintptr_t paddr, const char *addr, unsigned int size
+ void cache_flush(SceUID pid, uintptr_t vma, size_t len) {
+   uintptr_t vma_align;
+   int flags;
+-  int my_context[3];
++  SceKernelProcessContext my_context;
++  SceKernelProcessContext *other_context = NULL;
+   int ret;
+-  int *other_context;
+   int dacr;
+ 
+   vma_align = vma & ~0x1F;
+@@ -180,25 +180,25 @@ void cache_flush(SceUID pid, uintptr_t vma, size_t len) {
+   LOG("cache flush: vma %p, vma_align %p, len %x", vma, vma_align, len);
+ 
+   if (pid == KERNEL_PID) {
+-    ksceKernelCpuDcacheWritebackInvalidateRange((void *)vma_align, len);
+-    ksceKernelCpuIcacheAndL2WritebackInvalidateRange((void *)vma_align, len);
++    ksceKernelDcacheCleanInvalidateRange((void *)vma_align, len);
++    ksceKernelIcacheInvalidateRange((void *)vma_align, len);
+     hex_dump(vma_align, (char *)vma_align, len);
+   } else {
+     // TODO: Take care of SHARED_PID
+-    flags = ksceKernelCpuDisableInterrupts();
+-    ksceKernelCpuSaveContext(my_context);
++    flags = ksceKernelCpuSuspendIntr();
++    ksceKernelCpuSaveContext(&my_context);
+     ret = ksceKernelGetPidContext(pid, &other_context);
+     if (ret >= 0) {
+       ksceKernelCpuRestoreContext(other_context);
+       asm volatile ("mrc p15, 0, %0, c3, c0, 0" : "=r" (dacr));
+       asm volatile ("mcr p15, 0, %0, c3, c0, 0" :: "r" (0x15450FC3));
+-      ksceKernelCpuDcacheWritebackInvalidateRange((void *)vma_align, len);
+-      ksceKernelCpuIcacheAndL2WritebackInvalidateRange((void *)vma_align, len);
++      ksceKernelDcacheCleanInvalidateRange((void *)vma_align, len);
++      ksceKernelIcacheInvalidateRange((void *)vma_align, len);
+       hex_dump(vma_align, (char *)vma_align, len);
+       asm volatile ("mcr p15, 0, %0, c3, c0, 0" :: "r" (dacr));
+     }
+-    ksceKernelCpuRestoreContext(my_context);
+-    ksceKernelCpuEnableInterrupts(flags);
++    ksceKernelCpuRestoreContext(&my_context);
++    ksceKernelCpuResumeIntr(flags);
+     LOG("sceKernelSwitchVmaForPid(%d): 0x%08X\n", pid, ret);
+   }
+   asm volatile ("isb" ::: "memory");
+@@ -230,16 +230,16 @@ struct hook_args {
+ static int do_hooking(void *args) {
+   int flags;
+   int ret;
+-  int my_context[3];
+-  int *other_context;
++  SceKernelProcessContext my_context;
++  SceKernelProcessContext *other_context = NULL;
+   int dacr;
+   struct hook_args *uargs = (struct hook_args *)args;
+ 
+   if (uargs->pid == KERNEL_PID) {
+     ret = substitute_hook_functions(uargs->hook, 1, uargs->saved, SUBSTITUTE_RELAXED);
+   } else {
+-    flags = ksceKernelCpuDisableInterrupts();
+-    ksceKernelCpuSaveContext(my_context);
++    flags = ksceKernelCpuSuspendIntr();
++    ksceKernelCpuSaveContext(&my_context);
+     ret = ksceKernelGetPidContext(uargs->pid, &other_context);
+     if (ret >= 0) {
+       ksceKernelCpuRestoreContext(other_context);
+@@ -248,8 +248,8 @@ static int do_hooking(void *args) {
+       ret = substitute_hook_functions(uargs->hook, 1, uargs->saved, SUBSTITUTE_RELAXED);
+       asm volatile ("mcr p15, 0, %0, c3, c0, 0" :: "r" (dacr));
+     }
+-    ksceKernelCpuRestoreContext(my_context);
+-    ksceKernelCpuEnableInterrupts(flags);
++    ksceKernelCpuRestoreContext(&my_context);
++    ksceKernelCpuResumeIntr(flags);
+   }
+   return ret;
+ }
+@@ -342,10 +342,11 @@ static int tai_unhook_function(void *saved) {
+ static int tai_force_memcpy(SceUID dst_pid, void *dst, const void *src, size_t size) {
+   int ret;
+   if (dst_pid == KERNEL_PID) {
+-      ret = ksceKernelCpuUnrestrictedMemcpy(dst, src, size);
+-      LOG("ksceKernelCpuUnrestrictedMemcpy(%p, %p, 0x%08X): 0x%08X", dst, src, size, ret);
++      memcpy(dst, src, size);
++      ret = 0;
++      LOG("memcpy(%p, %p, 0x%08X): 0x%08X", dst, src, size, ret);
+   } else {
+-      ret = ksceKernelRxMemcpyKernelToUserForPid(dst_pid, (uintptr_t)dst, src, size);
++      ret = ksceKernelCopyToUserProc(dst_pid, dst, src, size);
+       LOG("ksceKernelRxMemcpyKernelToUserForPid(%x, %p, %p, 0x%08X): 0x%08X", dst_pid, dst, src, size, ret);
+   }
+   cache_flush(dst_pid, (uintptr_t)dst, size);
+@@ -368,7 +369,7 @@ int tai_memcpy_to_kernel(SceUID src_pid, void *dst, const char *src, size_t size
+     memcpy(dst, src, size);
+     LOG("memcpy(%p, %p, 0x%08X)", dst, src, size);
+   } else {
+-    ret = ksceKernelMemcpyUserToKernelForPid(src_pid, dst, (uintptr_t)src, size);
++    ret = ksceKernelCopyFromUserProc(src_pid, dst, src, size);
+     LOG("ksceKernelMemcpyUserToKernelForPid(%x, %p, %p, 0x%08X): 0x%08X", src_pid, dst, src, size, ret);
+   }
+   return 0;
+diff --git a/substitute b/substitute
+--- a/substitute
++++ b/substitute
+@@ -1 +1 @@
+-Subproject commit 4713452731dd489c13c9415c3c31637845f108f3
++Subproject commit 4713452731dd489c13c9415c3c31637845f108f3-dirty
+diff --git a/taihen-user.c b/taihen-user.c
+index be016a9..56341e0 100644
+--- a/taihen-user.c
++++ b/taihen-user.c
+@@ -6,7 +6,7 @@
+  * of the MIT license.  See the LICENSE file for details.
+  */
+ #include <psp2kern/types.h>
+-#include <psp2kern/sblacmgr.h>
++#include <psp2kern/kernel/acmgr.h>
+ #include <psp2kern/kernel/cpu.h>
+ #include <psp2kern/kernel/modulemgr.h>
+ #include <psp2kern/kernel/sysmem.h>
+diff --git a/taihen.c b/taihen.c
+index 3608036..0547e02 100644
+--- a/taihen.c
++++ b/taihen.c
+@@ -7,7 +7,7 @@
+  */
+ #include <psp2kern/types.h>
+ #include <psp2kern/ctrl.h>
+-#include <psp2kern/sblaimgr.h>
++#include <psp2kern/kernel/aimgr.h>
+ #include <psp2kern/kernel/modulemgr.h>
+ #include <psp2kern/kernel/threadmgr.h>
+ #include <taihen/parser.h>
+diff --git a/substitute/lib/vita/execmem.c b/substitute/lib/vita/execmem.c
+index 73c5fdc..1ffe1a9 100644
+--- a/substitute/lib/vita/execmem.c
++++ b/substitute/lib/vita/execmem.c
+@@ -131,9 +131,9 @@ int execmem_foreign_write_with_pc_patch(struct execmem_foreign_write *writes,
+         }
+         LOG("PID:%x, dst:%p, src:%p, len:%x", pid, writes[i].dst, writes[i].src, writes[i].len);
+         if (pid == KERNEL_PID) {
+-            ksceKernelCpuUnrestrictedMemcpy(writes[i].dst, writes[i].src, writes[i].len);
++            memcpy(writes[i].dst, writes[i].src, writes[i].len);
+         } else {
+-            ksceKernelRxMemcpyKernelToUserForPid(pid, (uintptr_t)writes[i].dst, writes[i].src, writes[i].len);
++            ksceKernelCopyToUserProc(pid, writes[i].dst, writes[i].src, writes[i].len);
+         }
+         cache_flush(pid, (uintptr_t)writes[i].dst, writes[i].len);
+     }

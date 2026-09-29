@@ -1,0 +1,143 @@
+Subject: [Vita] Discover registered thread stacks and use pthread-key TLS
+
+Secondary Ruby threads must initialize on their own registered stacks,
+without raising before MRI installs its exception tag. Keep MRI's 512 KiB
+machine + 512 KiB VM defaults (a 1 MiB pthread stack on ARM32). The owner's
+fiber arena floor still takes precedence over its full kernel stack bounds.
+Use pthread keys instead of compiler TLS or shared globals. Count timedwait
+attempts for the sleep diagnostic; config.site selects realtime deadlines
+because pthread-embedded ignores the requested condition-variable clock.
+
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -19,6 +19,7 @@
+  * ruby_init_stack has to know where the thread's own stack really ends.
+  * The -I is injected by vita/scripts/build-ruby-vita.sh. */
+ #include <vita_fiber_arena.h>
++#include <psp2/kernel/threadmgr.h>
+ #endif
+ 
+ #ifdef HAVE_SYS_RESOURCE_H
+@@ -575,6 +576,17 @@
+     }
+ }
+ 
++#ifdef __vita__
++/* Counts attempts, including immediate timeouts, across all Ruby threads. */
++static rb_atomic_t vita_timedwait_count;
++
++static VALUE
++rb_thread_s_vita_timedwait_count(VALUE klass)
++{
++    return UINT2NUM(RUBY_ATOMIC_FETCH_ADD(vita_timedwait_count, 0));
++}
++#endif
++
+ static int
+ native_cond_timedwait(rb_nativethread_cond_t *cond, pthread_mutex_t *mutex, const rb_hrtime_t *abs)
+ {
+@@ -589,6 +601,9 @@
+      */
+     do {
+         rb_hrtime2timespec(&ts, abs);
++#ifdef __vita__
++        RUBY_ATOMIC_INC(vita_timedwait_count);
++#endif
+         r = pthread_cond_timedwait(cond, mutex, &ts);
+     } while (r == EINTR);
+ 
+@@ -748,7 +763,9 @@
+ static rb_thread_t *register_cached_thread_and_wait(void *);
+ #endif
+ 
+-#if defined HAVE_PTHREAD_GETATTR_NP || defined HAVE_PTHREAD_ATTR_GET_NP
++#if defined(__vita__)
++#define STACKADDR_AVAILABLE 1
++#elif defined HAVE_PTHREAD_GETATTR_NP || defined HAVE_PTHREAD_ATTR_GET_NP
+ #define STACKADDR_AVAILABLE 1
+ #elif defined HAVE_PTHREAD_GET_STACKADDR_NP && defined HAVE_PTHREAD_GET_STACKSIZE_NP
+ #define STACKADDR_AVAILABLE 1
+@@ -784,7 +801,19 @@
+ {
+ #define CHECK_ERR(expr)				\
+     {int err = (expr); if (err) return err;}
+-#ifdef HAVE_PTHREAD_GETATTR_NP /* Linux */
++#if defined(__vita__)
++    SceKernelThreadInfo info;
++    uintptr_t base;
++    memset(&info, 0, sizeof(info));
++    info.size = sizeof(info);
++    CHECK_ERR(sceKernelGetThreadInfo(sceKernelGetThreadId(), &info));
++    base = (uintptr_t)info.stack;
++    if (!base || info.stackSize <= 0 ||
++        (size_t)info.stackSize > UINTPTR_MAX - base) return EINVAL;
++    /* ARM stacks grow down: MRI expects the high end, not the base. */
++    *size = (size_t)info.stackSize;
++    *addr = (void *)(base + *size);
++#elif defined HAVE_PTHREAD_GETATTR_NP /* Linux */
+     pthread_attr_t attr;
+     size_t guard = 0;
+     STACK_GROW_DIR_DETECTION;
+@@ -947,14 +976,8 @@
+     native_main_thread.id = pthread_self();
+ 
+ #ifdef __vita__
+-    /* Vita has neither getrlimit(RLIMIT_STACK) nor pthread_getattr_np, so
+-     * MAINSTACKADDR_AVAILABLE is 0 and the HAVE_GETRLIMIT block below is
+-     * compiled out: stack_maxsize stays 0. gc.c's stack_check() then computes
+-     * maximum_length = STACK_LEVEL_MAX - 2048 == SIZE_MAX-2047 and never
+-     * fires, so a runaway recursion on this thread raises nothing and simply
+-     * walks off the bottom of the stack. With the fiber arena down there
+-     * that would silently shred suspended fibers, so tell
+-     * Ruby where the thread's own stack really ends. */
++    /* The owner must stop above its fiber arena, even though get_stack()
++     * can now discover the full registered stack. */
+     {
+         uintptr_t floor = vita_fiber_arena_main_stack_floor();
+ 
+--- a/thread_pthread.h
++++ b/thread_pthread.h
+@@ -70,9 +70,9 @@
+ } rb_global_vm_lock_t;
+ 
+ 
+-#if __STDC_VERSION__ >= 201112
++#if !defined(__vita__) && __STDC_VERSION__ >= 201112
+   #define RB_THREAD_LOCAL_SPECIFIER _Thread_local
+-#elif defined(__GNUC__)
++#elif !defined(__vita__) && defined(__GNUC__)
+   /* note that ICC (linux) and Clang are covered by __GNUC__ */
+   #define RB_THREAD_LOCAL_SPECIFIER __thread
+ #else
+@@ -98,16 +98,9 @@
+ }
+ #endif
+ 
+-#if defined(__vita__)
+-/* Vita/newlib: crt0 (_start in crt0.o) does NOT initialize TPIDRURO
+-   (CP15 c13).  GCC emits `mrc p15,0,rX,c13,c0,3` for every __thread /
+-   _Thread_local access, so ruby_current_ec loads from address
+-   0 + tls_offset and dies with EXC_BAD_ACCESS (observed at 0x200114
+-   under Vita3K).  Force plain globals — Vita homebrew MRI is
+-   single-threaded, so a process-global EC pointer is correct. */
+-#undef RB_THREAD_LOCAL_SPECIFIER
+-#define RB_THREAD_LOCAL_SPECIFIER /* empty: plain global, no TLS */
+-#endif
++/* Vita uses the pthread-key path above: crt0 does not initialize the
++ * compiler TLS register, and a global EC/native-thread pointer races as
++ * soon as a second Ruby thread starts or releases the GVL. */
+ 
+ RUBY_SYMBOL_EXPORT_BEGIN
+ #ifdef RB_THREAD_LOCAL_SPECIFIER
+--- a/thread.c
++++ b/thread.c
+@@ -5457,6 +5457,9 @@
+     rb_define_singleton_method(rb_cThread, "fork", thread_start, -2);
+     rb_define_singleton_method(rb_cThread, "main", rb_thread_s_main, 0);
+     rb_define_singleton_method(rb_cThread, "current", thread_s_current, 0);
++#ifdef __vita__
++    rb_define_singleton_method(rb_cThread, "__vita_timedwait_count", rb_thread_s_vita_timedwait_count, 0);
++#endif
+     rb_define_singleton_method(rb_cThread, "stop", thread_stop, 0);
+     rb_define_singleton_method(rb_cThread, "kill", rb_thread_s_kill, 1);
+     rb_define_singleton_method(rb_cThread, "exit", rb_thread_exit, 0);

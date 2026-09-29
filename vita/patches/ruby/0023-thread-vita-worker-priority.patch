@@ -1,0 +1,62 @@
+Subject: [Vita] Ask for the creating thread's priority instead of INHERIT_SCHED
+
+pthread-embedded resolves PTHREAD_INHERIT_SCHED through the creating
+pthread's stored sched_priority and does not range-check it. A thread it did
+not start gets an implicit record holding 0, and no thread in the player is
+started by pthread_create: the kernel owns the main thread and SDL starts the
+rgss thread with sceKernelCreateThread. The first Thread.new therefore asked
+the kernel for a priority outside the user band; pthread_create reports that
+as EAGAIN and MRI raises "can't create Thread: No more processes" (seen on
+the device). Request the creating thread's own priority
+explicitly, so a worker shares the rgss thread's slice instead of outranking
+it, and clamp it to the range pthread_attr_setschedparam accepts.
+
+--- a/thread_pthread.c
++++ b/thread_pthread.c
+@@ -1416,8 +1416,34 @@
+     rb_native_mutex_unlock(&thread_cache_lock);
+ #endif
+ }
++
++#ifdef __vita__
++/* pthread-embedded resolves PTHREAD_INHERIT_SCHED to pthread_self()'s stored
++ * priority without a range check, and that is 0 for every thread it did not
++ * start itself: the kernel owns the main thread and SDL starts the rgss
++ * thread. Ask for the creating thread's own priority instead, clamped to the
++ * range pthread_attr_setschedparam accepts. */
++extern int pte_osThreadGetPriority(SceUID handle);
+ 
+ static int
++vita_attr_inherit_priority(pthread_attr_t *attr)
++{
++    struct sched_param param;
++    int low = sched_get_priority_min(SCHED_OTHER);
++    int high = sched_get_priority_max(SCHED_OTHER);
++    int priority = pte_osThreadGetPriority(sceKernelGetThreadId());
++    int err;
++
++    if (priority < low) priority = low;
++    if (priority > high) priority = high;
++    param.sched_priority = priority;
++    err = pthread_attr_setschedparam(attr, &param);
++    if (err) return err;
++    return pthread_attr_setinheritsched(attr, PTHREAD_EXPLICIT_SCHED);
++}
++#endif
++
++static int
+ native_thread_create0(rb_thread_t *th)
+ {
+     int err = 0;
+@@ -1444,7 +1470,10 @@
+         if (err) goto attr_done;
+ # endif
+ 
+-# ifdef HAVE_PTHREAD_ATTR_SETINHERITSCHED
++# ifdef __vita__
++        err = vita_attr_inherit_priority(&attr);
++        if (err) goto attr_done;
++# elif defined(HAVE_PTHREAD_ATTR_SETINHERITSCHED)
+         err = pthread_attr_setinheritsched(&attr, PTHREAD_INHERIT_SCHED);
+         if (err) goto attr_done;
+ # endif

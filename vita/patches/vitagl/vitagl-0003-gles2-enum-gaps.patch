@@ -1,0 +1,97 @@
+# vitagl-0003: accept GLES2 names vitaGL rejected with GL_INVALID_ENUM.
+# Found booting the launcher on hardware, where each
+# error failed the launcher's GL error checks:
+# - glPixelStorei(GL_UNPACK_ALIGNMENT / GL_PACK_ALIGNMENT): vitaGL handled only
+#   GL_UNPACK_ROW_LENGTH. Rows are always read and written tightly packed, which
+#   is alignment 1, the only value the engine uses (launcher upload, graphics.cpp
+#   readback); the four legal values are accepted as no-ops, others are
+#   GL_INVALID_VALUE as the spec requires.
+# - glEnable/glDisable/glIsEnabled(GL_DITHER): SceGxm has no dithering stage, so
+#   the state is only tracked (default enabled). vitaGL.h gains the GL_DITHER
+#   name, which the engine otherwise defines locally.
+diff --git a/source/textures.c b/source/textures.c
+index 7b5d704..6ac4aab 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -1733,6 +1733,13 @@ void glPixelStorei(GLenum pname, GLint param) {
+ 	case GL_UNPACK_ROW_LENGTH:
+ 		unpack_row_len = param;
+ 		break;
++	case GL_UNPACK_ALIGNMENT:
++	case GL_PACK_ALIGNMENT:
++		// Rows are always read and written tightly packed (alignment 1)
++		if (param != 1 && param != 2 && param != 4 && param != 8) {
++			SET_GL_ERROR_WITH_VALUE(GL_INVALID_VALUE, param)
++		}
++		break;
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, pname)
+ 	}
+diff --git a/source/get_info.c b/source/get_info.c
+index 6215485..4c36cc6 100644
+--- a/source/get_info.c
++++ b/source/get_info.c
+@@ -726,6 +726,8 @@ void glGetIntegerv(GLenum pname, GLint *data) {
+ 	}
+ }
+ 
++extern GLboolean dither_state;
++
+ GLboolean glIsEnabled(GLenum cap) {
+ 	GLboolean ret = GL_FALSE;
+ 	switch (cap) {
+@@ -802,6 +804,9 @@ GLboolean glIsEnabled(GLenum cap) {
+ 	case GL_FOG:
+ 		ret = fogging;
+ 		break;
++	case GL_DITHER:
++		ret = dither_state;
++		break;
+ 	default:
+ 		SET_GL_ERROR_WITH_RET_AND_VALUE(GL_INVALID_ENUM, GL_FALSE, cap)
+ 	}
+diff --git a/source/misc.c b/source/misc.c
+index 238f052..2beb655 100644
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -374,6 +374,8 @@ void glDepthRangex(GLfixed _nearVal, GLfixed _farVal) {
+ 	vglSetViewport(gxm_context, x_port, x_scale, y_port, y_scale, z_port, z_scale);
+ }
+ 
++GLboolean dither_state = GL_TRUE; // GLES2 default: enabled
++
+ void glEnable(GLenum cap) {
+ 	THREAD_SAFE()
+ 
+@@ -501,6 +503,9 @@ void glEnable(GLenum cap) {
+ 			}
+ 		}
+ 		break;
++	case GL_DITHER:
++		dither_state = GL_TRUE; // SceGxm has no dithering stage; tracked for glIsEnabled
++		break;
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, cap)
+ 	}
+@@ -635,6 +640,9 @@ void glDisable(GLenum cap) {
+ 			}
+ 		}
+ 		break;
++	case GL_DITHER:
++		dither_state = GL_FALSE;
++		break;
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, cap)
+ 	}
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index eeec610..933bf4f 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -160,6 +160,7 @@ extern "C" {
+ #define GL_BLEND_DST                                    0x0BE0
+ #define GL_BLEND_SRC                                    0x0BE1
+ #define GL_BLEND                                        0x0BE2
++#define GL_DITHER                                       0x0BD0
+ #define GL_SCISSOR_BOX                                  0x0C10
+ #define GL_SCISSOR_TEST                                 0x0C11
+ #define GL_COLOR_CLEAR_VALUE                            0x0C22

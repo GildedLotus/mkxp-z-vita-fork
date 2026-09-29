@@ -1,0 +1,247 @@
+# vitagl-0006: a failed FBO rendertarget creation no longer crashes; the draw is dropped and reported.
+# sceGxmCreateRenderTarget fails once the process holds ~48 targets (display + 47 FBOs; a count limit).
+# 0001 set GL_OUT_OF_MEMORY but scene_reset still called sceGxmBeginScene with the NULL
+# target, which faults inside SceGxm (the 48th 16x16 FBO).
+# - scene_reset: on failure it leaves NO scene open (needs_end_scene keeps its value; the retry and the
+#   frame swap skip sceGxmEndScene), sets scene_target_missing and framebuffer.rt_failed, and returns.
+#   needs_scene_reset stays set, so the next call retries the creation (self-heals once targets are freed).
+# - Every caller that draws after scene_reset (glDraw*/vglDrawObjects, glEnd, glClear, glBlitNamedFramebuffer)
+#   returns when scene_target_missing is set: sceGxmReserve*UniformBuffer and sceGxmDraw need a scene.
+# - glCheckFramebufferStatus/glCheckNamedFramebufferStatus return GL_FRAMEBUFFER_UNSUPPORTED (0x8CDD,
+#   added to vitaGL.h) while rt_failed is set; glGenFramebuffers clears it.
+# Targets are not recycled: whether eviction is safe and how the limit scales is a device question.
+# Not covered: HAVE_SHARED_RENDERTARGETS (not enabled here) only gets the NULL-target check.
+diff --git a/source/draw.c b/source/draw.c
+--- a/source/draw.c
++++ b/source/draw.c
+@@ -170,6 +170,8 @@ void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+ 	SceGxmPrimitiveType gxm_p;
+ 	gl_primitive_to_gxm(mode, gxm_p, count);
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 	GLboolean is_draw_legal = GL_TRUE;
+ 
+ 	if (cur_program != 0)
+@@ -226,6 +228,8 @@ void glMultiDrawArrays(GLenum mode, const GLint *first, const GLsizei *count, GL
+ #endif
+ 
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 	
+ 	GLint lowest = 0x7FFFFFFF;
+ 	GLsizei highest = 0, highest_count = 0;
+@@ -290,6 +294,8 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei prim
+ 	SceGxmPrimitiveType gxm_p;
+ 	gl_primitive_to_gxm(mode, gxm_p, count);
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 	GLboolean is_draw_legal = _glDrawArrays_CustomShadersIMPL(first, count, GL_TRUE);
+ 
+ #ifndef SKIP_ERROR_HANDLING
+@@ -349,6 +355,8 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *gl_in
+ 	SceGxmPrimitiveType gxm_p;
+ 	gl_primitive_to_gxm(mode, gxm_p, count);
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 	GLboolean is_draw_legal = GL_TRUE;
+ 
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+@@ -406,6 +414,8 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const GLv
+ 	SceGxmPrimitiveType gxm_p;
+ 	gl_primitive_to_gxm(mode, gxm_p, count);
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 	GLboolean is_draw_legal = GL_TRUE;
+ 
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+@@ -453,6 +463,8 @@ void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, G
+ 	SceGxmPrimitiveType gxm_p;
+ 	gl_primitive_to_gxm(mode, gxm_p, count);
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 	GLboolean is_draw_legal = GL_TRUE;
+ 
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+@@ -498,6 +510,8 @@ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsize
+ 	SceGxmPrimitiveType gxm_p;
+ 	gl_primitive_to_gxm(mode, gxm_p, count);
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 	GLboolean is_draw_legal = GL_TRUE;
+ 
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+@@ -545,6 +559,8 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
+ 	SceGxmPrimitiveType gxm_p;
+ 	gl_primitive_to_gxm(mode, gxm_p, count);
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 
+ 	vbo *gpu_buf = (vbo *)cur_vao->index_array_unit;
+ 	uint16_t *src = gpu_buf ? (uint16_t *)((uint8_t *)gpu_buf->ptr + (uint32_t)gl_indices) : (uint16_t *)gl_indices;
+@@ -582,6 +598,8 @@ void vglDrawObjects(GLenum mode, GLsizei count) {
+ 	SceGxmPrimitiveType gxm_p;
+ 	gl_primitive_to_gxm(mode, gxm_p, count);
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 
+ 	texture_unit *tex_unit = &texture_units[0];
+ 	if (cur_program != 0) {
+diff --git a/source/ffp.c b/source/ffp.c
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -2737,6 +2737,10 @@ void glEnd(void) {
+ 	phase = NONE;
+ #endif
+ 
++	// No scene is open when the framebuffer's rendertarget could not be created
++	if (scene_target_missing)
++		return;
++
+ 	// Translating primitive to sceGxm one
+ 	gl_primitive_to_gxm(ffp_mode, prim, vertex_count);
+ 
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -223,6 +223,7 @@ inline __attribute__((always_inline)) void glGenFramebuffers(GLsizei n, GLuint *
+ 			framebuffers[i].depthbuffer_ptr = NULL;
+ 			framebuffers[i].target = NULL;
+ 			framebuffers[i].tex = NULL;
++			framebuffers[i].rt_failed = GL_FALSE;
+ 		}
+ 		if (j >= n)
+ 			break;
+@@ -539,12 +540,16 @@ GLenum glCheckFramebufferStatus(GLenum target) {
+ 		SET_GL_ERROR_WITH_RET(GL_INVALID_ENUM, GL_FRAMEBUFFER_COMPLETE)
+ 	}
+ 
++	if (fb && fb->rt_failed)
++		return GL_FRAMEBUFFER_UNSUPPORTED;
+ 	return (!fb || fb->tex) ? GL_FRAMEBUFFER_COMPLETE : GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+ }
+ 
+ GLenum glCheckNamedFramebufferStatus(GLuint target, GLenum dummy) {
+ 	framebuffer *fb = (framebuffer *)target;
+ 
++	if (fb && fb->rt_failed)
++		return GL_FRAMEBUFFER_UNSUPPORTED;
+ 	return (!fb || fb->tex) ? GL_FRAMEBUFFER_COMPLETE : GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+ }
+ 
+@@ -829,6 +834,10 @@ void glBlitNamedFramebuffer(GLuint readFramebuffer, GLuint drawFramebuffer, GLin
+ 	}
+ 
+ 	scene_reset();
++	if (scene_target_missing) {
++		active_write_fb = real_write_fb;
++		return;
++	}
+ 
+ 	// Invalidating viewport and culling
+ 	invalidate_viewport();
+diff --git a/source/gxm.c b/source/gxm.c
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -63,6 +63,7 @@ static SceSharedFbInfo shared_fb_info; // In-use shared framebuffer info struct
+ framebuffer *in_use_framebuffer = NULL; // Currently in use framebuffer
+ framebuffer *old_framebuffer = NULL; // Framebuffer used in last scene
+ GLboolean dirty_framebuffer = GL_FALSE; // Flag whether current in use framebuffer is invalidated
++GLboolean scene_target_missing = GL_FALSE; // No gxm scene is open because the framebuffer's rendertarget could not be created
+ GLboolean dirty_query = GL_FALSE; // Flag whether occlusion queries needs results
+ static GLboolean needs_end_scene = GL_FALSE; // Flag for gxm end scene requirement at scene reset
+ static GLboolean needs_scene_reset = GL_TRUE; // Flag for when a scene reset is required
+@@ -590,9 +591,10 @@ void scene_reset(void) {
+ 		in_use_framebuffer = active_write_fb;
+ 		is_fbo_float = in_use_framebuffer ? in_use_framebuffer->is_float : GL_FALSE;
+ 
+-		// Ending drawing scene
++		// Ending drawing scene (none is open if the last attempt to start one failed)
+ 		if (needs_end_scene) {
+-			scene_end();
++			if (!scene_target_missing)
++				scene_end();
+ 		} else {
+ 			if (legacy_pool_size) {
+ 				legacy_pool = (float *)gpu_alloc_mapped_temp(legacy_pool_size);
+@@ -617,6 +619,7 @@ void scene_reset(void) {
+ #endif
+ 
+ 		// Starting drawing scene
++		scene_target_missing = GL_FALSE;
+ 		is_rendering_display = !active_write_fb;
+ 		if (is_rendering_display) { // Default framebuffer is used
+ 			if (system_app_mode) {
+@@ -654,6 +657,7 @@ void scene_reset(void) {
+ #else
+ 				int r = setup_render_target(&active_write_fb->target, active_write_fb->width, active_write_fb->height, gxm_fbo_rt_size);
+ 				if (r) {
++					active_write_fb->target = NULL;
+ 					vgl_error = GL_OUT_OF_MEMORY;
+ #ifdef LOG_ERRORS
+ 					vgl_log("%s:%d Failed to create a rendertarget of size %dx%d for framebuffer 0x%08X (%s).\n", __FILE__, __LINE__, active_write_fb->width, active_write_fb->height, active_write_fb, get_gxm_error_literal(r));
+@@ -670,6 +674,14 @@ void scene_reset(void) {
+ 				}
+ 			}
+ #endif
++			// sceGxmBeginScene crashes inside SceGxm on a NULL rendertarget: leave no scene open, callers skip the draw
++			if (!active_write_fb->target) {
++				active_write_fb->rt_failed = GL_TRUE;
++				scene_target_missing = GL_TRUE;
++				needs_scene_reset = GL_TRUE;
++				return;
++			}
++			active_write_fb->rt_failed = GL_FALSE;
+ #ifdef HAVE_SHARED_RENDERTARGETS
+ 			render_target *fbo_rt = (render_target *)active_write_fb->target;
+ #ifdef RECYCLE_RENDERTARGETS
+diff --git a/source/misc.c b/source/misc.c
+--- a/source/misc.c
++++ b/source/misc.c
+@@ -657,6 +657,8 @@ void glClear(GLbitfield mask) {
+ 	}
+ #endif
+ 	scene_reset();
++	if (scene_target_missing)
++		return;
+ 
+ 	// Invalidating viewport and culling
+ 	invalidate_viewport();
+diff --git a/source/shared.h b/source/shared.h
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -607,6 +607,7 @@ typedef struct {
+ 	int stride;
+ 	void *data;
+ 	texture *tex;
++	GLboolean rt_failed; // Last rendertarget creation for this framebuffer failed
+ } framebuffer;
+ 
+ // Query struct
+@@ -1184,6 +1185,7 @@ extern uint32_t uniform_array_unit; // Current in-use uniform buffer unit
+ extern GLenum orig_depth_test; // Original depth test state (used for depth test invalidation)
+ extern framebuffer *in_use_framebuffer; // Currently in use framebuffer
+ extern uint8_t dirty_framebuffer; // Flag wether current in use framebuffer is invalidated
++extern GLboolean scene_target_missing; // No gxm scene is open because the framebuffer's rendertarget could not be created
+ 
+ // Scissor test shaders
+ extern SceGxmFragmentProgram *scissor_test_fragment_program; // Scissor test fragment program
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -527,6 +527,7 @@ extern "C" {
+ #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME           0x8CD1
+ #define GL_FRAMEBUFFER_COMPLETE                         0x8CD5
+ #define GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT    0x8CD7
++#define GL_FRAMEBUFFER_UNSUPPORTED                      0x8CDD
+ #define GL_MAX_COLOR_ATTACHMENTS                        0x8CDF
+ #define GL_DEPTH_ATTACHMENT                             0x8D00
+ #define GL_STENCIL_ATTACHMENT                           0x8D20

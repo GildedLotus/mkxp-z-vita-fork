@@ -1,0 +1,56 @@
+Subject: [PATCH] Vita: reject unsupported process operations before newlib
+
+Signal zero can check the current process without entering newlib's trapping
+kill path. Other targets and signals are unsupported, not proof of absence.
+Report Process.times as ENOSYS with a platform-specific explanation; do not
+invent CPU usage from elapsed wall time. Non-Vita behavior is unchanged.
+
+diff --git a/signal.c b/signal.c
+--- a/signal.c
++++ b/signal.c
+@@ -441,6 +441,18 @@
+ 
+     if (argc <= 1) return INT2FIX(0);
+ 
++#if defined(__vita__)
++    /* newlib's kill(self, 0) traps; Vita has no POSIX signal delivery. */
++    if (sig != 0) {
++        rb_raise(rb_eNotImpError, "Process.kill only supports signal 0 on Vita");
++    }
++    for (i = 1; i < argc; i++) {
++        if (NUM2PIDT(argv[i]) != getpid()) {
++            rb_raise(rb_eNotImpError,
++                     "Process.kill only supports the current process on Vita");
++        }
++    }
++#else
+     if (sig < 0) {
+ 	sig = -sig;
+ 	for (i=1; i<argc; i++) {
+@@ -499,6 +511,7 @@
+ 	    rb_threadptr_check_signal(GET_VM()->ractor.main_thread);
+ 	}
+     }
++#endif
+     rb_thread_execute_interrupts(rb_thread_current());
+ 
+     return INT2FIX(i-1);
+diff --git a/process.c b/process.c
+--- a/process.c
++++ b/process.c
+@@ -7936,6 +7936,15 @@
+  *     [ t.utime, t.stime, t.cutime, t.cstime ]   #=> [0.0, 0.02, 0.00, 0.00]
+  */
+ 
++#endif
++
++#if defined(__vita__)
++VALUE
++rb_proc_times(VALUE obj)
++{
++    rb_syserr_fail(ENOSYS, "Process.times is unavailable on Vita (getrusage is unsupported)");
++}
++#elif defined(HAVE_TIMES)
+ VALUE
+ rb_proc_times(VALUE obj)
+ {
