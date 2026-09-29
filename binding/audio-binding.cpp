@@ -37,17 +37,19 @@
 		return Qnil; \
 	} \
 	RB_METHOD_GUARD_END \
-	RB_METHOD(audio_##entity##Stop) \
+	RB_METHOD_GUARD(audio_##entity##Stop) \
 	{ \
 		RB_UNUSED_PARAM; \
 		shState->audio().entity##Stop(); \
 		return Qnil; \
 	} \
-	RB_METHOD(audio_##entity##Pos) \
+	RB_METHOD_GUARD_END \
+	RB_METHOD_GUARD(audio_##entity##Pos) \
 	{ \
 		RB_UNUSED_PARAM; \
 		return rb_float_new(shState->audio().entity##Pos()); \
-	}
+	} \
+	RB_METHOD_GUARD_END
 
 #define DEF_PLAY_STOP(entity) \
 	RB_METHOD_GUARD(audio_##entity##Play) \
@@ -61,29 +63,32 @@
 		return Qnil; \
 	} \
 	RB_METHOD_GUARD_END \
-	RB_METHOD(audio_##entity##Stop) \
+	RB_METHOD_GUARD(audio_##entity##Stop) \
 	{ \
 		RB_UNUSED_PARAM; \
 		shState->audio().entity##Stop(); \
 		return Qnil; \
-	}
+	} \
+	RB_METHOD_GUARD_END
 
 #define DEF_FADE(entity) \
-RB_METHOD(audio_##entity##Fade) \
+RB_METHOD_GUARD(audio_##entity##Fade) \
 { \
 	RB_UNUSED_PARAM; \
 	int time; \
 	rb_get_args(argc, argv, "i", &time RB_ARG_END); \
 	shState->audio().entity##Fade(time); \
 	return Qnil; \
-}
+} \
+RB_METHOD_GUARD_END
 
 #define DEF_POS(entity) \
-	RB_METHOD(audio_##entity##Pos) \
+	RB_METHOD_GUARD(audio_##entity##Pos) \
 	{ \
 		RB_UNUSED_PARAM; \
 		return rb_float_new(shState->audio().entity##Pos()); \
-	}
+	} \
+	RB_METHOD_GUARD_END
 
 // DEF_PLAY_STOP_POS( bgm )
 
@@ -103,7 +108,23 @@ RB_METHOD_GUARD(audio_bgmPlay)
 }
 RB_METHOD_GUARD_END
 
-RB_METHOD(audio_bgmStop)
+/* Every method below that takes an explicit track index reaches
+ * AudioPrivate::getTrackByIndex (src/audio/audio.cpp), which throws
+ * Exception(MKXPError, "requested BGM track %d out of range") for any index at
+ * or above BGM.trackCount -- and that setting defaults to 1 (src/config.cpp).
+ * So Audio.bgm_stop(1), a legal call on any desktop build configured with more
+ * tracks, threw a C++ exception through an unguarded RB_METHOD with no memory
+ * pressure of any kind. On ARM EABI that is not untidy but fatal: the Ruby C
+ * frame above has no unwind information, so the unwinder returns _URC_FAILURE
+ * and std::terminate() runs. The guard translates the same throw into a Ruby
+ * MKXPError, which a script can rescue and which the top-level handler reports
+ * with a class, message and backtrace (binding-mri.cpp: showExc).
+ *
+ * Neither the default nor getTrackByIndex's semantics change: the bug is the
+ * missing guard, a higher default costs an OpenAL source per track on a
+ * kernel-object-poor platform, and silently clamping the index would turn a
+ * script's mistake into a silent no-op on the wrong track. */
+RB_METHOD_GUARD(audio_bgmStop)
 {
     RB_UNUSED_PARAM;
     VALUE track = Qnil;
@@ -111,14 +132,16 @@ RB_METHOD(audio_bgmStop)
     shState->audio().bgmStop(MAYBE_NIL_TRACK(track));
     return Qnil;
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(audio_bgmPos)
+RB_METHOD_GUARD(audio_bgmPos)
 {
     RB_UNUSED_PARAM;
     VALUE track = Qnil;
     rb_get_args(argc, argv, "|o", &track RB_ARG_END);
     return rb_float_new(shState->audio().bgmPos(MAYBE_NIL_TRACK(track)));
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD_GUARD(audio_bgmGetVolume)
 {
@@ -147,7 +170,7 @@ DEF_PLAY_STOP_POS( bgs )
 DEF_PLAY_STOP( me )
 
 //DEF_FADE( bgm )
-RB_METHOD(audio_bgmFade)
+RB_METHOD_GUARD(audio_bgmFade)
 {
     RB_UNUSED_PARAM;
     int time;
@@ -156,13 +179,21 @@ RB_METHOD(audio_bgmFade)
     shState->audio().bgmFade(time, MAYBE_NIL_TRACK(track));
     return Qnil;
 }
+RB_METHOD_GUARD_END
 
 DEF_FADE( bgs )
 DEF_FADE( me )
 
 DEF_PLAY_STOP( se )
 
-RB_METHOD(audioSetupMidi)
+/* Neither of these two indexes a track, and on this platform setup_midi
+ * returns at sharedmidistate.h's `if (!HAVE_FLUID) return;` before it can
+ * touch a synth at all -- but both are on the same side of the same boundary
+ * as everything above, and an unguarded RB_METHOD is one std::bad_alloc away
+ * from the abort described there. Guarded for uniformity: the whole file is
+ * now guarded, which is a property a test can assert and a later edit cannot
+ * silently lose. */
+RB_METHOD_GUARD(audioSetupMidi)
 {
 	RB_UNUSED_PARAM;
 
@@ -170,8 +201,9 @@ RB_METHOD(audioSetupMidi)
 
 	return Qnil;
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(audioReset)
+RB_METHOD_GUARD(audioReset)
 {
 	RB_UNUSED_PARAM;
 
@@ -179,6 +211,7 @@ RB_METHOD(audioReset)
 
 	return Qnil;
 }
+RB_METHOD_GUARD_END
 
 
 #define BIND_PLAY_STOP(entity) \

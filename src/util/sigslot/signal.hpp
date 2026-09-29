@@ -6,6 +6,9 @@
 #include <utility>
 #include <thread>
 #include <vector>
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include <sched.h>
+#endif
 
 #if defined __clang__ || (__GNUC__ > 5)
 #define SIGSLOT_MAY_ALIAS __attribute__((__may_alias__))
@@ -348,7 +351,14 @@ struct spin_mutex {
     void lock() noexcept {
         while (true) {
             while (!state.load(std::memory_order_relaxed)) {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+                // VitaSDK libstdc++ leaves _GLIBCXX_USE_SCHED_YIELD undefined,
+                // making std::this_thread::yield a no-op. The POSIX shim sleeps
+                // the contender for 1 ms so a preempted lock owner can run.
+                sched_yield();
+#else
                 std::this_thread::yield();
+#endif
             }
 
             if (try_lock()) {
@@ -1605,7 +1615,16 @@ using signal_st = signal_base<detail::null_mutex, T...>;
  *
  * Recursive signal emission and emission cycles are supported too.
  */
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+// A Vita pthread mutex consumes a kernel semaphore even for an unconnected
+// signal. RGSS databases can contain thousands of Tables/Tones; use the
+// existing yielding mutex to retain synchronization and copy-on-write without
+// exhausting kernel objects. signal_st would also remove callback-safe COW.
+template <typename... T>
+using signal = signal_base<detail::spin_mutex, T...>;
+#else
 template <typename... T>
 using signal = signal_base<std::mutex, T...>;
+#endif
 
 } // namespace sigslot

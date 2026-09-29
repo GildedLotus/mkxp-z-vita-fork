@@ -35,10 +35,10 @@ DEF_ALLOCFUNC(WindowVX);
 
 void bitmapInitProps(Bitmap *b, VALUE self);
 
-RB_METHOD(windowVXInitialize) {
-  WindowVX *w;
+RB_METHOD_GUARD(windowVXInitialize) {
+  WindowVX *w = 0;
+  VALUE viewportObj = Qnil;
 
-    GFX_LOCK;
   if (rgssVer >= 3) {
     int x, y, width, height;
     x = y = width = height = 0;
@@ -46,69 +46,80 @@ RB_METHOD(windowVXInitialize) {
     if (argc == 4)
       rb_get_args(argc, argv, "iiii", &x, &y, &width, &height RB_ARG_END);
 
-    w = new WindowVX(x, y, width, height);
+    /* bad_alloc is not an Exception; GFX_GUARD_EXC used to leave the lock. */
+    GFX_GUARD_ALL(w = new WindowVX(x, y, width, height);)
   } else {
-    w = viewportElementInitialize<WindowVX>(argc, argv, self);
+    w = viewportElementInitialize<WindowVX>(argc, argv, self, &viewportObj);
   }
 
+  /* Ruby owns w before the next call that can raise. A raise is a longjmp,
+   * so a delete after it never runs and the scene keeps the window. */
   setPrivateData(self, w);
 
-  w->initDynAttribs();
+  GFX_GUARD_ALL(w->initDynAttribs();)
+
+  if (rgssVer < 3)
+    rb_iv_set(self, "viewport", viewportObj);
+
+  /* Wrapper first, while no bitmap exists, then the handover with nothing
+   * in between that can raise. */
+  VALUE contentsObj = wrapObject((Bitmap *)0, BitmapType);
+  Bitmap *contents = 0;
+  GFX_GUARD_ALL(contents = new Bitmap(1, 1);)
+  setPrivateData(contentsObj, contents);
 
   wrapProperty(self, &w->getCursorRect(), "cursor_rect", RectType);
 
   if (rgssVer >= 3)
     wrapProperty(self, &w->getTone(), "tone", ToneType);
 
-  Bitmap *contents = new Bitmap(1, 1);
-  VALUE contentsObj = wrapObject(contents, BitmapType);
   bitmapInitProps(contents, contentsObj);
   rb_iv_set(self, "contents", contentsObj);
 
-    GFX_UNLOCK;
   return self;
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(windowVXUpdate) {
+RB_METHOD_GUARD(windowVXUpdate) {
   RB_UNUSED_PARAM;
 
   WindowVX *w = getPrivateData<WindowVX>(self);
 
-    GFX_LOCK;
-  w->update();
-    GFX_UNLOCK;
+  GFX_GUARD_ALL(w->update();)
 
   return Qnil;
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(windowVXMove) {
+RB_METHOD_GUARD(windowVXMove) {
   WindowVX *w = getPrivateData<WindowVX>(self);
 
   int x, y, width, height;
   rb_get_args(argc, argv, "iiii", &x, &y, &width, &height RB_ARG_END);
 
-    GFX_LOCK;
-  w->move(x, y, width, height);
-    GFX_UNLOCK;
-    
+  GFX_GUARD_ALL(w->move(x, y, width, height);)
+
   return Qnil;
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(windowVXIsOpen) {
+RB_METHOD_GUARD(windowVXIsOpen) {
   RB_UNUSED_PARAM;
 
   WindowVX *w = getPrivateData<WindowVX>(self);
 
   return rb_bool_new(w->isOpen());
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(windowVXIsClosed) {
+RB_METHOD_GUARD(windowVXIsClosed) {
   RB_UNUSED_PARAM;
 
   WindowVX *w = getPrivateData<WindowVX>(self);
 
   return rb_bool_new(w->isClosed());
 }
+RB_METHOD_GUARD_END
 
 DEF_GFX_PROP_OBJ_REF(WindowVX, Bitmap, Windowskin, "windowskin")
 DEF_GFX_PROP_OBJ_REF(WindowVX, Bitmap, Contents, "contents")

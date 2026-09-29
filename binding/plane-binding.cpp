@@ -31,20 +31,26 @@ DEF_TYPE(Plane);
 DEF_ALLOCFUNC(Plane);
 #endif
 
-RB_METHOD(planeInitialize) {
-  Plane *p = viewportElementInitialize<Plane>(argc, argv, self);
+RB_METHOD_GUARD(planeInitialize) {
+  VALUE viewportObj = Qnil;
+  Plane *p = viewportElementInitialize<Plane>(argc, argv, self, &viewportObj);
 
+  /* The GC owns p from here, before the first Ruby call that can raise:
+   * a raise is a longjmp, so nothing below would ever delete it. */
   setPrivateData(self, p);
 
-    GFX_LOCK;
-  p->initDynAttribs();
+  GFX_GUARD_ALL(p->initDynAttribs();)
+
+  /* Wrap property objects. None of this touches GL, so none of it runs
+   * under the lock: a raise here would never reach a GFX_UNLOCK. */
+  rb_iv_set(self, "viewport", viewportObj);
 
   wrapProperty(self, &p->getColor(), "color", ColorType);
   wrapProperty(self, &p->getTone(), "tone", ToneType);
-    GFX_UNLOCK;
 
   return self;
 }
+RB_METHOD_GUARD_END
 
 DEF_GFX_PROP_OBJ_REF(Plane, Bitmap, Bitmap, "bitmap")
 DEF_GFX_PROP_OBJ_VAL(Plane, Color, Color, "color")

@@ -34,27 +34,31 @@ DEF_TYPE_CUSTOMFREE(TilemapAutotiles, RUBY_TYPED_NEVER_FREE);
 #define TilemapAutotilesType "TilemapAutotiles"
 #endif
 
-RB_METHOD(tilemapAutotilesSet) {
+RB_METHOD_GUARD(tilemapAutotilesSet) {
     Tilemap::Autotiles *a = getPrivateDataNoRaise<Tilemap::Autotiles>(self);
-    
+
     if (!a)
         return self;
-    
+
     int i;
     VALUE bitmapObj;
-    
+
     rb_get_args(argc, argv, "io", &i, &bitmapObj RB_ARG_END);
-    
+
     Bitmap *bitmap = getPrivateDataCheck<Bitmap>(bitmapObj, BitmapType);
-    
-    GFX_LOCK;
-    a->set(i, bitmap);
-    
+
+    /* Ruby store first: the array is what keeps the bitmap alive, so the
+     * native slot must never point at one it does not hold. A failing store
+     * (negative index, frozen array) raises before set() and changes
+     * nothing. set() assigns the slot before anything in it can throw, so
+     * after a native failure the stored bitmap is the one the slot holds. */
     VALUE ary = rb_iv_get(self, "array");
     rb_ary_store(ary, i, bitmapObj);
-    GFX_UNLOCK;
+
+    GFX_GUARD_ALL(a->set(i, bitmap);)
     return self;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD(tilemapAutotilesGet) {
     int i;
@@ -74,28 +78,32 @@ DEF_TYPE(Tilemap);
 DEF_ALLOCFUNC(Tilemap);
 #endif
 
-RB_METHOD(tilemapInitialize) {
-    Tilemap *t;
-    
+RB_METHOD_GUARD(tilemapInitialize) {
+    Tilemap *t = 0;
+
     /* Get parameters */
     VALUE viewportObj = Qnil;
     Viewport *viewport = 0;
-    
+
     rb_get_args(argc, argv, "|o", &viewportObj RB_ARG_END);
-    
+
     if (!NIL_P(viewportObj))
         viewport = getPrivateDataCheck<Viewport>(viewportObj, ViewportType);
-    
-    GFX_LOCK;
+
     /* Construct object */
-    t = new Tilemap(viewport);
-    
-    rb_iv_set(self, "viewport", viewportObj);
-    
+    GFX_GUARD_ALL(t = new Tilemap(viewport);)
+
+    /* The GC owns t from here, before the first Ruby call that can raise.
+     * The "viewport" ivar used to be set first, and a raise out of it
+     * orphaned the tilemap. */
     setPrivateData(self, t);
-    
-    t->initDynAttribs();
-    
+
+    GFX_GUARD_ALL(t->initDynAttribs();)
+
+    /* Nothing below touches GL, so none of it runs under the lock: a Ruby
+     * raise is a longjmp and would never reach a GFX_UNLOCK. */
+    rb_iv_set(self, "viewport", viewportObj);
+
     /* Dispose the old autotiles if we're reinitializing.
      * See the comment in setPrivateData for more info. */
     VALUE autotilesObj = rb_iv_get(self, "autotiles");
@@ -118,10 +126,10 @@ RB_METHOD(tilemapInitialize) {
     /* Circular reference so both objects are always
      * alive at the same time */
     rb_iv_set(autotilesObj, "tilemap", self);
-    
-    GFX_UNLOCK;
+
     return self;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD(tilemapGetAutotiles) {
     RB_UNUSED_PARAM;
@@ -129,17 +137,16 @@ RB_METHOD(tilemapGetAutotiles) {
     return rb_iv_get(self, "autotiles");
 }
 
-RB_METHOD(tilemapUpdate) {
+RB_METHOD_GUARD(tilemapUpdate) {
     RB_UNUSED_PARAM;
-    
+
     Tilemap *t = getPrivateData<Tilemap>(self);
-    
-    GFX_LOCK;
-    t->update();
-    GFX_UNLOCK;
-    
+
+    GFX_GUARD_ALL(t->update();)
+
     return Qnil;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD(tilemapGetViewport) {
     RB_UNUSED_PARAM;

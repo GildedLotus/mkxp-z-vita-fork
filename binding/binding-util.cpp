@@ -70,15 +70,43 @@ const RbException excToRbExc[] = {
     MKXP    /* MKXPError   */
 };
 
-void raiseRbExc(Exception *exc) {
+/* Built during static initialisation, long before the heap can be under any
+ * pressure, and never freed: every other way of reporting an exhausted heap
+ * allocates (Exception's constructor alone does msg.resize(512)) and so fails
+ * a second time, from inside a catch block, where the failure escapes the
+ * binding method and terminates the process. Neither message contains a
+ * printf directive. */
+static Exception outOfMemoryExc(Exception::MKXPError,
+                                "out of memory (native allocation failed)");
+static Exception unknownFailureExc(Exception::MKXPError,
+                                   "unknown native failure");
+
+Exception *const gOutOfMemoryExc = &outOfMemoryExc;
+Exception *const gUnknownFailureExc = &unknownFailureExc;
+
+Exception *copyExcForRaise(const Exception &e, bool &oom) {
+  try {
+    return new Exception(e);
+  } catch (...) {
+    oom = true;
+    return 0;
+  }
+}
+
+static void raiseRbExcOwned(Exception *exc, bool owned) {
   VALUE str = rb_str_new2(exc->msg.c_str());
   RbData *data = getRbData();
   VALUE excClass = data->exc[excToRbExc[exc->type]];
 
-  delete exc;
+  if (owned)
+    delete exc;
 
   rb_exc_raise(rb_class_new_instance(1, &str, excClass));
 }
+
+void raiseRbExc(Exception *exc) { raiseRbExcOwned(exc, true); }
+
+void raiseRbExcStatic(Exception *exc) { raiseRbExcOwned(exc, false); }
 
 void raiseDisposedAccess(VALUE self) {
 #if RAPI_FULL > 187
@@ -94,8 +122,16 @@ void raiseDisposedAccess(VALUE self) {
   rb_raise(getRbData()->exc[RGSS], "disposed %s", buf);
 }
 
+/* A Ruby boundary in its own right: every binding method reaches this before
+ * it does anything else, and many of its callers are plain RB_METHODs with no
+ * guard of their own, so what leaves here reaches Ruby's frames directly.
+ * rb_float_arg, rb_int_arg and rb_bool_arg throw Exception for a wrong
+ * argument type, and Exception's constructor resizes a std::string to 512
+ * bytes -- so on an exhausted heap what a wrong argument produces is a
+ * std::bad_alloc, which the Exception-only guard this used to have did not
+ * catch. */
 int rb_get_args(int argc, VALUE *argv, const char *format, ...) {
-  Exception *exc = 0;
+  RB_GUARD_VARS
   try{
     char c;
     VALUE *arg = argv;
@@ -300,17 +336,11 @@ int rb_get_args(int argc, VALUE *argv, const char *format, ...) {
     va_end(ap);
 
     return argI;
-  } catch (const Exception &e) {
-    exc = new Exception(e);
-  }
 
-  /* This should always be true if we reach here */
-  if (exc) {
-    /* Raising here is probably fine, right?
-     * If any methods allocate something with a destructor before
-     * calling this then they can probably be fixed to not do that. */
-    raiseRbExc(exc);
-  }
+  /* Raising here is probably fine, right?
+   * If any methods allocate something with a destructor before
+   * calling this then they can probably be fixed to not do that. */
+  RB_GUARD_REPORT
 
   return 0;
 }
@@ -322,25 +352,44 @@ typedef struct gvl_guard_args {
 	Exception *exc;
 	void *(*func)(void *);
 	void *args;
+	/* Reported as a flag rather than as an object, so that nothing is
+	 * allocated inside the without-GVL frame. */
+	bool oom;
 } gvl_guard_args;
 
+/* Nothing may leave this frame either: it is called by Ruby's
+ * rb_thread_call_without_gvl (thread.c), another frame with no unwind
+ * information on ARM EABI. Every C++ type is caught here and rethrown by
+ * drop_gvl_guard on the Ruby side. */
 static void *gvl_guard(void *args) {
 	gvl_guard_args *gvl_args = (gvl_guard_args*)args;
 	try{
 		return gvl_args->func(gvl_args->args);
 	} catch (const Exception &e) {
-		gvl_args->exc = new Exception(e);
+		gvl_args->exc = copyExcForRaise(e, gvl_args->oom);
+	} catch (const std::bad_alloc &) {
+		gvl_args->oom = true;
+	} catch (...) {
+		gvl_args->exc = copyExcForRaise(*gUnknownFailureExc, gvl_args->oom);
 	}
 	return 0;
 }
 
 void *drop_gvl_guard(void *(*func)(void *), void *args,
                             rb_unblock_function_t *ubf, void *data2) {
-	gvl_guard_args gvl_args = {0, func, args};
-	
+	gvl_guard_args gvl_args = {0, func, args, false};
+
 	void *ret = rb_thread_call_without_gvl(&gvl_guard, &gvl_args, ubf, data2);
-	
+
 	Exception *&exc = gvl_args.exc;
+	if (gvl_args.oom){
+		/* Rethrown as itself rather than as an Exception, so the caller's
+		 * RB_METHOD_GUARD_END reports it without allocating. Throwing
+		 * bad_alloc needs no heap: the runtime keeps an emergency buffer for
+		 * exactly this case. */
+		delete exc;
+		throw std::bad_alloc();
+	}
 	if (exc){
 		Exception e(*exc);
 		delete exc;

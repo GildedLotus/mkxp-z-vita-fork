@@ -4,7 +4,7 @@
 
 #define MINIFFI_MAX_ARGS 16l
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__vita__) || defined(__psp2__)
     typedef unsigned long mffi_value;
     // Be sure to add more args to the below line if MINIFFI_MAX_ARGS is bumped
     // in the future.

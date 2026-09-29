@@ -34,22 +34,27 @@ DEF_TYPE(Sprite);
 DEF_ALLOCFUNC(Sprite);
 #endif
 
-RB_METHOD(spriteInitialize) {
-    GFX_LOCK;
-    Sprite *s = viewportElementInitialize<Sprite>(argc, argv, self);
-    
+RB_METHOD_GUARD(spriteInitialize) {
+    VALUE viewportObj = Qnil;
+    Sprite *s = viewportElementInitialize<Sprite>(argc, argv, self, &viewportObj);
+
+    /* The GC owns s from here, before the first Ruby call that can raise:
+     * a raise is a longjmp, so nothing below would ever delete it. */
     setPrivateData(self, s);
-    
-    /* Wrap property objects */
-    s->initDynAttribs();
-    
+
+    GFX_GUARD_ALL(s->initDynAttribs();)
+
+    /* Wrap property objects. None of this touches GL, so none of it runs
+     * under the lock: a raise here would never reach a GFX_UNLOCK. */
+    rb_iv_set(self, "viewport", viewportObj);
+
     wrapProperty(self, &s->getSrcRect(), "src_rect", RectType);
     wrapProperty(self, &s->getColor(), "color", ColorType);
     wrapProperty(self, &s->getTone(), "tone", ToneType);
-    
-    GFX_UNLOCK;
+
     return self;
 }
+RB_METHOD_GUARD_END
 
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Bitmap, "bitmap")
 DEF_GFX_PROP_OBJ_REF(Sprite, Bitmap, Pattern, "pattern")

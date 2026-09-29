@@ -38,26 +38,29 @@ DEF_ALLOCFUNC(TilemapVX);
 #define BitmapArrayType "BitmapArray"
 #endif
 
-RB_METHOD(tilemapVXInitialize) {
-    TilemapVX *t;
-    
-    GFX_LOCK;
+RB_METHOD_GUARD(tilemapVXInitialize) {
+    TilemapVX *t = 0;
+
     /* Get parameters */
     VALUE viewportObj = Qnil;
     Viewport *viewport = 0;
-    
+
     rb_get_args(argc, argv, "|o", &viewportObj RB_ARG_END);
-    
+
     if (!NIL_P(viewportObj))
         viewport = getPrivateDataCheck<Viewport>(viewportObj, ViewportType);
-    
+
     /* Construct object */
-    t = new TilemapVX(viewport);
-    
+    GFX_GUARD_ALL(t = new TilemapVX(viewport);)
+
+    /* The GC owns t from here, before the first Ruby call that can raise:
+     * a raise is a longjmp, so nothing below would ever delete it. */
     setPrivateData(self, t);
-    
+
+    /* Nothing below touches GL, so none of it runs under the lock: a Ruby
+     * raise is a longjmp and would never reach a GFX_UNLOCK. */
     rb_iv_set(self, "viewport", viewportObj);
-    
+
     /* Dispose the old bitmap array if we're reinitializing.
      * See the comment in setPrivateData for more info. */
     VALUE autotilesObj = rb_iv_get(self, "bitmap_array");
@@ -78,10 +81,10 @@ RB_METHOD(tilemapVXInitialize) {
     /* Circular reference so both objects are always
      * alive at the same time */
     rb_iv_set(autotilesObj, "tilemap", self);
-    
-    GFX_UNLOCK;
+
     return self;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD(tilemapVXGetBitmapArray) {
     RB_UNUSED_PARAM;
@@ -89,15 +92,18 @@ RB_METHOD(tilemapVXGetBitmapArray) {
     return rb_iv_get(self, "bitmap_array");
 }
 
-RB_METHOD(tilemapVXUpdate) {
+RB_METHOD_GUARD(tilemapVXUpdate) {
     RB_UNUSED_PARAM;
-    
+
     TilemapVX *t = getPrivateData<TilemapVX>(self);
-    
+
+    /* update() throws Exception from guardDisposed. No lock: this method
+     * never took one, and a Ruby raise cannot run under GFX_LOCK. */
     t->update();
-    
+
     return Qnil;
 }
+RB_METHOD_GUARD_END
 
 DEF_GFX_PROP_OBJ_REF(TilemapVX, Viewport, Viewport, "viewport")
 DEF_GFX_PROP_OBJ_REF(TilemapVX, Table, MapData, "map_data")
@@ -109,27 +115,31 @@ DEF_GFX_PROP_B(TilemapVX, Visible)
 DEF_GFX_PROP_I(TilemapVX, OX)
 DEF_GFX_PROP_I(TilemapVX, OY)
 
-RB_METHOD(tilemapVXBitmapsSet) {
+RB_METHOD_GUARD(tilemapVXBitmapsSet) {
     TilemapVX::BitmapArray *a = getPrivateDataNoRaise<TilemapVX::BitmapArray>(self);
-    
+
     if (!a)
         return self;
-    
+
     int i;
     VALUE bitmapObj;
-    
+
     rb_get_args(argc, argv, "io", &i, &bitmapObj RB_ARG_END);
-    
+
     Bitmap *bitmap = getPrivateDataCheck<Bitmap>(bitmapObj, BitmapType);
-    
-    GFX_LOCK;
-    a->set(i, bitmap);
-    
+
+    /* Ruby store first: the array is what keeps the bitmap alive, so the
+     * native slot must never point at one it does not hold. A failing store
+     * (negative index, frozen array) raises before set() and changes
+     * nothing. set() assigns the slot before anything in it can throw, so
+     * after a native failure the stored bitmap is the one the slot holds. */
     VALUE ary = rb_iv_get(self, "array");
     rb_ary_store(ary, i, bitmapObj);
-    GFX_UNLOCK;
+
+    GFX_GUARD_ALL(a->set(i, bitmap);)
     return self;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD(tilemapVXBitmapsGet) {
     int i;

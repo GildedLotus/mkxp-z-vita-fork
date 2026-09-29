@@ -30,19 +30,25 @@ DEF_TYPE(Window);
 DEF_ALLOCFUNC(Window);
 #endif
 
-RB_METHOD(windowInitialize) {
-    GFX_LOCK;
-    Window *w = viewportElementInitialize<Window>(argc, argv, self);
-    
+RB_METHOD_GUARD(windowInitialize) {
+    VALUE viewportObj = Qnil;
+    Window *w = viewportElementInitialize<Window>(argc, argv, self, &viewportObj);
+
+    /* The GC owns w from here, before the first Ruby call that can raise:
+     * a raise is a longjmp, so nothing below would ever delete it. */
     setPrivateData(self, w);
-    
-    w->initDynAttribs();
-    
+
+    GFX_GUARD_ALL(w->initDynAttribs();)
+
+    /* Wrap property objects. None of this touches GL, so none of it runs
+     * under the lock: a raise here would never reach a GFX_UNLOCK. */
+    rb_iv_set(self, "viewport", viewportObj);
+
     wrapProperty(self, &w->getCursorRect(), "cursor_rect", RectType);
-    
-    GFX_UNLOCK;
+
     return self;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD_GUARD(windowUpdate) {
     RB_UNUSED_PARAM;

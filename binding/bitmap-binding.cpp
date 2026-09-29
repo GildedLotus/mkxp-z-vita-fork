@@ -27,12 +27,56 @@
 #include "font.h"
 #include "sharedstate.h"
 #include "graphics.h"
+#include "gl-util.h"
+
+/* MRI cannot see Bitmap pixels, so a dropped Bitmap looks like a few bytes to
+ * the collector while its pixels hold the shared newlib heap. Report the net
+ * change in the engine's pixel ledger (bitmap.cpp counts every pixel buffer it
+ * allocates and frees) as malloc pressure. Only called with the GVL held;
+ * pixels freed without it are reported at the next call. */
+static void pixelPressureSync() {
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+    static uint64_t reported = 0;
+    const uint64_t live = GPUBudget::liveCpuBitmapBytes;
+
+    if (live > reported)
+        rb_gc_adjust_memory_usage((ssize_t)(live - reported));
+    else if (live < reported)
+        rb_gc_adjust_memory_usage(-(ssize_t)(reported - live));
+    reported = live;
+#endif
+}
+
+static void bitmapFree(void *inst) {
+    delete static_cast<Bitmap *>(inst);
+    pixelPressureSync();
+}
 
 #if RAPI_FULL > 187
-DEF_TYPE(Bitmap);
+DEF_TYPE_CUSTOMFREE(Bitmap, bitmapFree);
 #else
-DEF_ALLOCFUNC(Bitmap);
+DEF_ALLOCFUNC_CUSTOMFREE(Bitmap, bitmapFree);
 #endif
+
+/* Collection can still come too late: the heap may be full of dropped Bitmaps
+ * (or the script disabled GC). The constructors fail transactionally, so run
+ * GC.start -- it collects even under GC.disable and runs the deferred frees --
+ * and retry once before reporting. Ruby runs outside the lock and any catch. */
+template <class Make> static Bitmap *newBitmapCollecting(Make make) {
+    Bitmap *b = 0;
+    try {
+        GFX_GUARD_ALL(b = make();)
+        return b;
+    } catch (const std::bad_alloc &) {
+    } catch (const Exception &e) {
+        if (e.type != Exception::SDLError)
+            throw;
+    }
+    rb_funcall(rb_mGC, rb_intern("start"), 0);
+    pixelPressureSync();
+    GFX_GUARD_ALL(b = make();)
+    return b;
+}
 
 static const char *objAsStringPtr(VALUE obj) {
     VALUE str = rb_obj_as_string(obj);
@@ -40,50 +84,86 @@ static const char *objAsStringPtr(VALUE obj) {
 }
 
 void bitmapInitProps(Bitmap *b, VALUE self) {
+    /* Every Ruby-owned Bitmap passes here; the Ruby allocations below can then
+     * trigger the collection the new pixels call for. */
+    pixelPressureSync();
+
     /* Wrap properties */
     VALUE fontKlass = rb_const_get(rb_cObject, rb_intern("Font"));
     VALUE fontObj = rb_obj_alloc(fontKlass);
     rb_obj_call_init(fontObj, 0, 0);
-    
+
     Font *font = getPrivateData<Font>(fontObj);
-    
+
     rb_iv_set(self, "font", fontObj);
 
-    // Leave property as default nil if hasHires() is false.
-    GFX_GUARD_EXC(
-        if (b->hasHires()) {
-            b->assumeRubyGC();
-            wrapProperty(self, b->getHires(), "hires", BitmapType);
-        
-            VALUE hiresFontObj = rb_obj_alloc(fontKlass);
-            rb_obj_call_init(hiresFontObj, 0, 0);
-            Font *hiresFont = getPrivateData<Font>(hiresFontObj);
-            rb_iv_set(rb_iv_get(self, "hires"), "font", hiresFontObj);
-            b->getHires()->setInitFont(hiresFont);
-        }
-
-        b->setInitFont(font);
+    /* Every Ruby call in this function stays OUTSIDE the graphics lock, which
+     * is the rule viewportelement-binding.h states and this one used to break:
+     * it wrapped rb_obj_alloc, rb_obj_call_init, rb_iv_set and wrapProperty in
+     * a single guarded region. A Ruby raise is a longjmp -- it runs no catch
+     * block and no destructor -- so a GFX_UNLOCK behind one never happens, and
+     * GFX_LOCK is a live recursive kernel mutex: the process keeps it forever.
+     * Only native calls are guarded now, and by GFX_GUARD_ALL, so an escape of
+     * any C++ type releases the lock rather than just Exception. */
+    Bitmap *hires = 0;
+    GFX_GUARD_ALL(
+        if (b->hasHires())
+            hires = b->getHires();
     );
+
+    // Leave property as default nil if hasHires() is false.
+    if (hires) {
+        /* The high-res twin belongs to its parent until assumeRubyGC(), and to
+         * Ruby once it has an object. wrapProperty used to be that hand-over,
+         * but wrapProperty is rb_const_get + rb_obj_alloc + setPrivateData +
+         * rb_iv_set: three raising calls around one assignment, and the parent
+         * had already given the twin up before the first of them. Ask Ruby for
+         * the object while the parent still owns it, then hand over with
+         * nothing in between that can raise. */
+        VALUE hiresObj = wrapObject((Bitmap*)0, BitmapType);
+
+        GFX_GUARD_ALL(b->assumeRubyGC();)
+        setPrivateData(hiresObj, hires);
+        rb_iv_set(self, "hires", hiresObj);
+
+        VALUE hiresFontObj = rb_obj_alloc(fontKlass);
+        rb_obj_call_init(hiresFontObj, 0, 0);
+        Font *hiresFont = getPrivateData<Font>(hiresFontObj);
+        rb_iv_set(hiresObj, "font", hiresFontObj);
+
+        GFX_GUARD_ALL(hires->setInitFont(hiresFont);)
+    }
+
+    GFX_GUARD_ALL(b->setInitFont(font);)
 }
 
 RB_METHOD_GUARD(bitmapInitialize) {
     Bitmap *b = 0;
-    
+
     if (argc == 1) {
         char *filename;
         rb_get_args(argc, argv, "z", &filename RB_ARG_END);
-        
-        GFX_GUARD_EXC(b = new Bitmap(filename);)
+
+        /* GFX_GUARD_ALL (in newBitmapCollecting), not GFX_GUARD_EXC: the pixel
+         * out-of-memory is already an Exception (Bitmap::allocPixels throws
+         * Exception::SDLError), but
+         * new BitmapPrivate and every std::vector inside the constructor fail
+         * with std::bad_alloc, which is not an Exception. Under
+         * MKXPZ_SOFTWARE_BITMAPS a Bitmap is a CPU pixel buffer on a 16 MiB
+         * libc heap, so that is a realistic failure, not a theoretical one. */
+        b = newBitmapCollecting([&] { return new Bitmap(filename); });
     } else {
         int width, height;
         rb_get_args(argc, argv, "ii", &width, &height RB_ARG_END);
-        
-        GFX_GUARD_EXC(b = new Bitmap(width, height);)
+
+        b = newBitmapCollecting([&] { return new Bitmap(width, height); });
     }
-    
+
+    /* The GC owns it before bitmapInitProps, which raises from four places.
+     * This is the order the two methods below were fixed to copy. */
     setPrivateData(self, b);
     bitmapInitProps(b, self);
-    
+
     return self;
 }
 RB_METHOD_GUARD_END
@@ -235,9 +315,16 @@ RB_METHOD_GUARD(bitmapGetPixel) {
     else
         GFX_GUARD_EXC(value = b->getPixel(x, y););
     
-    Color *color = new Color(value);
+    /* The save-preview hot path: resolve the wrapper class
+     * once instead of rb_intern + rb_const_get per call, and fill the
+     * allocator's own Color instead of allocating a second one and freeing
+     * the pre-init one. Games do not rebind the Color constant. */
+    static VALUE colorClass = rb_const_get(rb_cObject, rb_intern("Color"));
     
-    return wrapObject(color, ColorType);
+    VALUE obj = rb_obj_alloc(colorClass);
+    *getPrivateDataNoRaise<Color>(obj) = value;
+    
+    return obj;
 }
 RB_METHOD_GUARD_END
 
@@ -798,17 +885,23 @@ RB_METHOD_GUARD(bitmapSnapToBitmap) {
     rb_scan_args(argc, argv, "01", &position);
     
     Bitmap *b = getPrivateData<Bitmap>(self);
-    
-    Bitmap *newbitmap = 0;
+
     int pos = (position == RUBY_Qnil) ? -1 : NUM2INT(position);
-    
-    GFX_GUARD_EXC(newbitmap = new Bitmap(*b, pos););
-    
+
+    /* bitmapInitialize's order -- rb_obj_alloc, then setPrivateData, then
+     * bitmapInitProps -- and for the reason that method documents: a Ruby
+     * raise is a longjmp, so nothing native may be alive across one that this
+     * frame alone owns. new Bitmap(*b, pos) is a full CPU pixel buffer (905
+     * KiB for a 544x416 screen) out of a 16 MiB heap; it used to be built
+     * first, and rb_obj_alloc and the four raising calls inside
+     * bitmapInitProps each dropped it on the floor. */
     VALUE ret = rb_obj_alloc(rb_class_of(self));
-    
-    bitmapInitProps(newbitmap, ret);
+
+    Bitmap *newbitmap = newBitmapCollecting([&] { return new Bitmap(*b, pos); });
+
     setPrivateData(ret, newbitmap);
-    
+    bitmapInitProps(newbitmap, ret);
+
     return ret;
 }
 RB_METHOD_GUARD_END
@@ -829,14 +922,17 @@ RB_METHOD_GUARD(bitmapInitializeCopy) {
         return self;
     
     Bitmap *orig = getPrivateData<Bitmap>(origObj);
-    Bitmap *b = 0;
-    
-    GFX_GUARD_EXC(b = new Bitmap(*orig););
-    
+    Bitmap *b = newBitmapCollecting([&] { return new Bitmap(*orig); });
+
+    /* Same reorder, same reason: the copy is a whole CPU pixel buffer and the
+     * GC has to own it before bitmapInitProps can raise past it. setFont still
+     * runs after bitmapInitProps -- setInitFont installs the fresh Font that
+     * bitmapInitProps just wrapped, and this copies the original's into it. */
+    setPrivateData(self, b);
+
     bitmapInitProps(b, self);
     b->setFont(orig->getFont());
-    setPrivateData(self, b);
-    
+
     return self;
 }
 RB_METHOD_GUARD_END

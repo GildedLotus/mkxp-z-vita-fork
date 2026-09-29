@@ -46,18 +46,50 @@ static void parseArgsTableSizes(int argc, VALUE *argv, int *x, int *y, int *z) {
     rb_error_arity(argc, 1, 3);
   }
 }
+
+/* Cells share the newlib heap with Bitmap pixels, so MRI is told about them.
+ * Every Table is Ruby-owned and changes size only in the methods below, which
+ * charge the difference; tableFree returns exactly the current size. */
+static ssize_t tableBytes(const Table *t) {
+  return t ? (ssize_t)((int64_t)t->xSize() * t->ySize() * t->zSize() * sizeof(int16_t)) : 0;
+}
+
+/* rb_gc_adjust_memory_usage only counts: MRI tests its malloc limit on the
+ * next xmalloc, and a Table.new loop makes none. A one-byte xmalloc runs that
+ * test now. */
+static void tableCharge(ssize_t diff) {
+  rb_gc_adjust_memory_usage(diff);
+  if (diff > 0)
+    ruby_xfree(ruby_xmalloc(1));
+}
+
+static void tableFree(void *inst) {
+  Table *t = static_cast<Table *>(inst);
+  const ssize_t bytes = tableBytes(t);
+  delete t;
+  rb_gc_adjust_memory_usage(-bytes);
+}
+
 #if RAPI_FULL > 187
-DEF_TYPE(Table);
+DEF_TYPE_CUSTOMFREE(Table, tableFree);
 #else
-DEF_ALLOCFUNC(Table);
+DEF_ALLOCFUNC_CUSTOMFREE(Table, tableFree);
 #endif
 
-RB_METHOD(tableInitialize) {
+/* The database-load path, and one of the larger allocations a script makes: a
+ * Table is a std::vector<int16_t> of x*y*z cells (src/etc/table.cpp), a stock
+ * VX Ace map is three 100x100 layers, and resize() holds the old vector and the
+ * new one at once, so the peak is twice the table. It comes out of the same
+ * SceLibc heap as every software Bitmap, so std::bad_alloc here is an ordinary
+ * outcome -- and unguarded it crossed a Ruby C frame with no unwind
+ * information, so the player terminated instead of raising. */
+RB_METHOD_GUARD(tableInitialize) {
   int x, y, z;
 
   parseArgsTableSizes(argc, argv, &x, &y, &z);
 
   Table *t = getPrivateDataNoRaise<Table>(self);
+  const ssize_t before = tableBytes(t);
   if (t) {
     t->resize(x, y, z);
   } else {
@@ -65,20 +97,35 @@ RB_METHOD(tableInitialize) {
 
     setPrivateData(self, t);
   }
+  tableCharge(tableBytes(t) - before);
 
   return self;
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(tableResize) {
+/* The other half of tableInitialize, and the one upstream left bare. It reaches
+ * the same std::vector<int16_t> allocation -- resize() holds the old vector and
+ * the new one at once, so the peak is both of them -- which makes std::bad_alloc
+ * an ordinary outcome here; and src/etc/table.cpp now also throws
+ * Exception::ArgumentError at it for a product no int can describe, which is
+ * what `t.resize(65536, 65536)` asks for. Unguarded, either one crossed a Ruby C
+ * frame with no unwind information and terminated the player. Guarded, the first
+ * is a NoMemoryError and the second an ArgumentError -- and the table still has
+ * the cells it had, because the count is computed before the new vector
+ * exists. */
+RB_METHOD_GUARD(tableResize) {
   Table *t = getPrivateData<Table>(self);
 
   int x, y, z;
   parseArgsTableSizes(argc, argv, &x, &y, &z);
 
+  const ssize_t before = tableBytes(t);
   t->resize(x, y, z);
+  tableCharge(tableBytes(t) - before);
 
   return Qnil;
 }
+RB_METHOD_GUARD_END
 
 #define TABLE_SIZE(d, D)                                                       \
   RB_METHOD(table##D##Size) {                                                  \
@@ -157,14 +204,37 @@ RB_METHOD_GUARD_END
 MARSH_LOAD_FUN(Table)
 INITCOPY_FUN(Table)
 
+/* Both generic bodies install a new Table with setPrivateData, whose dfree
+ * already returned the charge of the one it replaced. */
+static VALUE tableChargeInstalled(VALUE obj, const Table *before) {
+  const Table *t = getPrivateDataNoRaise<Table>(obj);
+  if (t != before)
+    tableCharge(tableBytes(t));
+  return obj;
+}
 
-RB_METHOD(tableInitializeDefault) {
+RB_METHOD(tableLoad) { return tableChargeInstalled(TableLoad(argc, argv, self), 0); }
+
+RB_METHOD(tableInitializeCopy) {
+  const Table *before = getPrivateDataNoRaise<Table>(self);
+  return tableChargeInstalled(TableInitializeCopy(argc, argv, self), before);
+}
+
+
+/* Reached from the allocation function, not from initialize: Ruby calls
+ * TableAllocatePreInit (CLASS_ALLOCATE_PRE_INIT below) for every Table it
+ * builds, including every one Marshal restores. Raising from an allocator is
+ * ordinary for Ruby -- it is a C function called from rb_obj_alloc, and the
+ * raise propagates like any other -- whereas letting a C++ exception out of it
+ * terminated the process. */
+RB_METHOD_GUARD(tableInitializeDefault) {
   Table *t = new Table(0, 0, 0);
 
   setPrivateData(self, t);
 
   return self;
 }
+RB_METHOD_GUARD_END
 
 CLASS_ALLOCATE_PRE_INIT(Table, tableInitializeDefault);
 
@@ -174,10 +244,10 @@ void tableBindingInit() {
 
   serializableBindingInit<Table>(klass);
 
-  rb_define_class_method(klass, "_load", TableLoad);
+  rb_define_class_method(klass, "_load", tableLoad);
 
   _rb_define_method(klass, "initialize", tableInitialize);
-  _rb_define_method(klass, "initialize_copy", TableInitializeCopy);
+  _rb_define_method(klass, "initialize_copy", tableInitializeCopy);
   _rb_define_method(klass, "resize", tableResize);
   _rb_define_method(klass, "xsize", tableXSize);
   _rb_define_method(klass, "ysize", tableYSize);

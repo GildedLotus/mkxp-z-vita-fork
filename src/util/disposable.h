@@ -58,6 +58,12 @@ public:
 		} catch (Exception &e) {
 			GFX_UNLOCK;
 			throw e;
+		} catch (...) {
+			/* wasDisposed() runs arbitrary slots, which allocate: a
+			 * std::bad_alloc is not an Exception and would leave the
+			 * graphics lock -- a live recursive kernel mutex -- pinned. */
+			GFX_UNLOCK;
+			throw;
 		}
 		GFX_UNLOCK;
 	}

@@ -203,6 +203,21 @@ RB_METHOD_GUARD(MiniFFI_call) {
     VALUE own_imports = rb_iv_get(self, "_imports");
     VALUE own_exports = rb_iv_get(self, "_exports");
     MINIFFI_FUNC ApiFunction = (MINIFFI_FUNC)RB2MVAL(func);
+    /* Never branch to address 0. MiniFFI_initialize raises when the entry
+     * point is missing, so `_func` should always be a resolved address by the
+     * time a call lands here -- but that invariant lives in another method and
+     * anything that reaches this one without it (an override that skips
+     * `super`, a re-lookup that stored a null) would otherwise call through a
+     * null pointer and take the process down with it. A Ruby error the game
+     * can rescue is the correct failure. */
+    if (!ApiFunction) {
+        VALUE libname = rb_iv_get(self, "_libname");
+        VALUE funcname = rb_iv_get(self, "_funcname");
+        throw Exception(Exception::RuntimeError,
+                 "%s:%s has no entry point on this platform",
+                 NIL_P(libname) ? "?" : RSTRING_PTR(libname),
+                 NIL_P(funcname) ? "?" : RSTRING_PTR(funcname));
+    }
     VALUE args;
     int items = rb_scan_args(argc, argv, "0*", &args);
     int nimport = RARRAY_LEN(own_imports);

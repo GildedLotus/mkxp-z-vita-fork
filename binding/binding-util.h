@@ -31,6 +31,9 @@
 
 #include "exception.h"
 
+/* std::bad_alloc, for the guard macros below */
+#include <new>
+
 #ifdef RUBY_API_VERSION_MAJOR
 #define RAPI_MAJOR RUBY_API_VERSION_MAJOR
 #define RAPI_MINOR RUBY_API_VERSION_MINOR
@@ -76,6 +79,23 @@ RbData *getRbData();
 struct Exception;
 
 void raiseRbExc(Exception *exc);
+
+/* raiseRbExc for an Exception the caller does not own: it raises the Ruby
+ * exception without deleting its argument, so the pre-built ones below
+ * survive the raise and can be used again. */
+void raiseRbExcStatic(Exception *exc);
+
+/* Pre-built during static initialisation, so reporting an exhausted heap
+ * allocates nothing itself: Exception's constructor does msg.resize(512)
+ * (util/exception.h), which on an exhausted heap throws a second bad_alloc --
+ * from inside a catch block, where it would escape the binding method. */
+extern Exception *const gOutOfMemoryExc;
+extern Exception *const gUnknownFailureExc;
+
+/* "new Exception(e)", except that it cannot throw. Returns 0 and sets oom
+ * when the copy fails, so the caller reports with gOutOfMemoryExc instead of
+ * letting a bad_alloc out of its catch block. */
+Exception *copyExcForRaise(const Exception &e, bool &oom);
 
 #if RAPI_MAJOR >= 2
 void *drop_gvl_guard(void *(*func)(void *), void *args,
@@ -362,6 +382,9 @@ static inline void _rb_define_module_function(VALUE module, const char *name,
     rb_define_module_function(module, name, RUBY_METHOD_FUNC(func), -1);
 }
 
+/* Releases the graphics lock for every C++ type. std::bad_alloc is not an
+ * Exception (util/exception.h), and GFX_LOCK is a live recursive kernel
+ * mutex: an escape pins it for the rest of the process. */
 #define GFX_GUARD_EXC(exp)                                               \
 {                                                                        \
 GFX_LOCK;                                                                \
@@ -370,6 +393,26 @@ exp                                                                      \
 } catch (const Exception &exc) {                                         \
 GFX_UNLOCK;                                                              \
 throw exc;                                                               \
+} catch (...) {                                                          \
+GFX_UNLOCK;                                                              \
+throw;                                                                   \
+}                                                                        \
+GFX_UNLOCK;                                                              \
+}
+
+/* Same catches as GFX_GUARD_EXC. Construction sites name this one so the
+ * bad_alloc path stays obvious next to the call. */
+#define GFX_GUARD_ALL(exp)                                               \
+{                                                                        \
+GFX_LOCK;                                                                \
+try {                                                                    \
+exp                                                                      \
+} catch (const Exception &exc) {                                         \
+GFX_UNLOCK;                                                              \
+throw exc;                                                               \
+} catch (...) {                                                          \
+GFX_UNLOCK;                                                              \
+throw;                                                                   \
 }                                                                        \
 GFX_UNLOCK;                                                              \
 }
@@ -481,20 +524,50 @@ static inline VALUE rb_file_open_str(VALUE filename, const char *mode) {
 (void)self;                                                                \
 }
 
+/* The state RB_GUARD_REPORT reports through, and the two arms that fill it.
+ * Spelled as their own macros because the Ruby boundary is not only the
+ * RB_METHOD_GUARD pair: rb_get_args is variadic and returns an int, and
+ * serializableDump has to return the string it built, so neither can be a
+ * guarded method -- but both are called straight from Ruby and owe it exactly
+ * the same contract. One definition, three users. */
+#define RB_GUARD_VARS                           \
+    Exception *exc = 0;                         \
+    bool oom = false;
+
+/* Closes a try block and reports whatever left it as a Ruby raise. No C++
+ * exception of any type may cross the Ruby boundary. On ARM EABI the Ruby C
+ * frame that called us carries no unwind information -- Ruby's whole VM text
+ * is one EXIDX_CANTUNWIND region -- so the unwinder returns _URC_FAILURE and
+ * std::terminate() runs. std::bad_alloc is not an Exception, hence its own
+ * arm; it reports through the pre-built gOutOfMemoryExc because the heap it
+ * would allocate a report from is the one that just ran out.
+ *
+ * Every raise here is a longjmp, so nothing after it runs and nothing with a
+ * destructor may be live at the call site. */
+#define RB_GUARD_REPORT                         \
+    } catch (const Exception &e) {              \
+        exc = copyExcForRaise(e, oom);          \
+    } catch (const std::bad_alloc &) {          \
+        exc = 0; oom = true;                    \
+    } catch (...) {                             \
+        exc = copyExcForRaise(*gUnknownFailureExc, oom); \
+    }                                           \
+    if (oom) {                                  \
+        raiseRbExcStatic(gOutOfMemoryExc);      \
+    }                                           \
+    if (exc) {                                  \
+        raiseRbExc(exc);                        \
+    }
+
 /* Calling rb_raise inside the catch block
  * leaks memory even if we catch by value */
 #define RB_METHOD_GUARD(name) RB_METHOD(name)   \
 {                                               \
-    Exception *exc = 0;                         \
+    RB_GUARD_VARS                               \
     try{                                        \
 
 #define RB_METHOD_GUARD_END                     \
-    } catch (const Exception &e) {              \
-        exc = new Exception(e);                 \
-    }                                           \
-    if (exc) {                                  \
-        raiseRbExc(exc);                        \
-    }                                           \
+    RB_GUARD_REPORT                             \
     return Qnil;                                \
 }
 

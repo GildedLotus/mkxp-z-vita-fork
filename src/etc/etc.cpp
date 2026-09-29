@@ -27,14 +27,22 @@
 #include <SDL_types.h>
 #include <SDL_pixels.h>
 
-Color::Color(double red, double green, double blue, double alpha)
-	: red(red), green(green), blue(blue), alpha(alpha)
+#include <cmath>
+
+/* Unbounded defaults preserve Color's raw render values except for NaN. */
+static double clampComponent(double value, double low = -INFINITY, double high = INFINITY)
 {
-	updateInternal();
+	return std::isnan(value) ? 0.0 : clamp<double>(value, low, high);
+}
+
+Color::Color(double red, double green, double blue, double alpha)
+{
+	set(red, green, blue, alpha);
 }
 
 Color::Color(const Vec4 &norm)
-	: norm(norm)
+	: norm(clampComponent(norm.x), clampComponent(norm.y),
+	       clampComponent(norm.z), clampComponent(norm.w))
 {
 	updateExternal();
 }
@@ -65,36 +73,40 @@ const Color &Color::operator=(const Color &o)
 
 void Color::set(double red, double green, double blue, double alpha)
 {
-	this->red   = red;
-	this->green = green;
-	this->blue  = blue;
-	this->alpha = alpha;
+	this->red   = clampComponent(red,   0, 255);
+	this->green = clampComponent(green, 0, 255);
+	this->blue  = clampComponent(blue,  0, 255);
+	this->alpha = clampComponent(alpha, 0, 255);
 
-	updateInternal();
+	/* Preserve the existing constructor/set normalization of the input. */
+	norm.x = clampComponent(red)   / 255;
+	norm.y = clampComponent(green) / 255;
+	norm.z = clampComponent(blue)  / 255;
+	norm.w = clampComponent(alpha) / 255;
 }
 
 void Color::setRed(double value)
 {
-	red = value;
-	norm.x = clamp<double>(value, 0, 255) / 255;
+	red = clampComponent(value, 0, 255);
+	norm.x = clampComponent(value, 0, 255) / 255;
 }
 
 void Color::setGreen(double value)
 {
-	green = value;
-	norm.y = clamp<double>(value, 0, 255) / 255;
+	green = clampComponent(value, 0, 255);
+	norm.y = clampComponent(value, 0, 255) / 255;
 }
 
 void Color::setBlue(double value)
 {
-	blue = value;
-	norm.z = clamp<double>(value, 0, 255) / 255;
+	blue = clampComponent(value, 0, 255);
+	norm.z = clampComponent(value, 0, 255) / 255;
 }
 
 void Color::setAlpha(double value)
 {
-	alpha = value;
-	norm.w = clamp<double>(value, 0, 255) / 255;
+	alpha = clampComponent(value, 0, 255);
+	norm.w = clampComponent(value, 0, 255) / 255;
 }
 
 /* Serializable */
@@ -118,10 +130,10 @@ Color *Color::deserialize(const char *data, int len)
 
 	Color *c = new Color();
 
-	c->red   = readDouble(&data);
-	c->green = readDouble(&data);
-	c->blue  = readDouble(&data);
-	c->alpha = readDouble(&data);
+	c->red   = clampComponent(readDouble(&data), 0, 255);
+	c->green = clampComponent(readDouble(&data), 0, 255);
+	c->blue  = clampComponent(readDouble(&data), 0, 255);
+	c->alpha = clampComponent(readDouble(&data), 0, 255);
 	c->updateInternal();
 
 	return c;
@@ -137,26 +149,29 @@ void Color::updateInternal()
 
 void Color::updateExternal()
 {
-	red   = norm.x * 255;
-	green = norm.y * 255;
-	blue  = norm.z * 255;
-	alpha = norm.w * 255;
+	red   = clampComponent(norm.x * 255, 0, 255);
+	green = clampComponent(norm.y * 255, 0, 255);
+	blue  = clampComponent(norm.z * 255, 0, 255);
+	alpha = clampComponent(norm.w * 255, 0, 255);
 }
 
 SDL_Color Color::toSDLColor() const
 {
 	SDL_Color c;
-	c.r = clamp<double>(red, 0, 255);
-	c.g = clamp<double>(green, 0, 255);
-	c.b = clamp<double>(blue, 0, 255);
-	c.a = clamp<double>(alpha, 0, 255);
+	c.r = clampComponent(red, 0, 255);
+	c.g = clampComponent(green, 0, 255);
+	c.b = clampComponent(blue, 0, 255);
+	c.a = clampComponent(alpha, 0, 255);
 
 	return c;
 }
 
 
 Tone::Tone(double red, double green, double blue, double gray)
-	: red(red), green(green), blue(blue), gray(gray)
+	: red(clampComponent(red, -255, 255)),
+	  green(clampComponent(green, -255, 255)),
+	  blue(clampComponent(blue, -255, 255)),
+	  gray(clampComponent(gray, 0, 255))
 {
 	updateInternal();
 }
@@ -174,60 +189,104 @@ bool Tone::operator==(const Tone &o) const
 	       gray  == o.gray;
 }
 
+/* Tone's valueChanged is not a cheap notification: WindowVX connects it to a
+ * whole CPU base recompose plus a whole-level texture upload. Stock VX Ace's
+ * Window_Base#update runs `self.tone.set($game_system.window_tone)` on every
+ * window on every frame, so the overwhelming majority of writes below store
+ * the value that is already stored. Rect::set has guarded on equality since
+ * upstream; every Tone mutator now does the same.
+ *
+ * Compare clamped components before notifying. Stores and normalization stay
+ * unconditional so signed zero is preserved; NaN is compared as zero. */
+
 void Tone::set(double red, double green, double blue, double gray)
 {
+	red   = clampComponent(red,   -255, 255);
+	green = clampComponent(green, -255, 255);
+	blue  = clampComponent(blue,  -255, 255);
+	gray  = clampComponent(gray,     0, 255);
+
+	const bool changed = (this->red   != red   ||
+	                      this->green != green ||
+	                      this->blue  != blue  ||
+	                      this->gray  != gray);
+
 	this->red   = red;
 	this->green = green;
 	this->blue  = blue;
 	this->gray  = gray;
 
 	updateInternal();
-	valueChanged();
+
+	if (changed)
+		valueChanged();
 }
 
 const Tone& Tone::operator=(const Tone &o)
 {
+	/* This is where `tone.set(other_tone)` lands: binding/etc-binding.cpp's
+	 * SET_FUN routes the one-argument form to *k = *other, and that is the
+	 * form RGSS3 calls sixty times a second. */
+	const bool changed = !(*this == o);
+
 	red   = o.red;
 	green = o.green;
 	blue  = o.blue;
 	gray  = o.gray;
 	norm  = o.norm;
 
-	valueChanged();
+	if (changed)
+		valueChanged();
 
 	return o;
 }
 
 void Tone::setRed(double value)
 {
-	red = value;
-	norm.x = (float) clamp<double>(value, -255, 255) / 255;
+	value = clampComponent(value, -255, 255);
+	const bool changed = (red != value);
 
-	valueChanged();
+	red = value;
+	norm.x = (float) clampComponent(value, -255, 255) / 255;
+
+	if (changed)
+		valueChanged();
 }
 
 void Tone::setGreen(double value)
 {
-	green = value;
-	norm.y = (float) clamp<double>(value, -255, 255) / 255;
+	value = clampComponent(value, -255, 255);
+	const bool changed = (green != value);
 
-	valueChanged();
+	green = value;
+	norm.y = (float) clampComponent(value, -255, 255) / 255;
+
+	if (changed)
+		valueChanged();
 }
 
 void Tone::setBlue(double value)
 {
-	blue = value;
-	norm.z = (float) clamp<double>(value, -255, 255) / 255;
+	value = clampComponent(value, -255, 255);
+	const bool changed = (blue != value);
 
-	valueChanged();
+	blue = value;
+	norm.z = (float) clampComponent(value, -255, 255) / 255;
+
+	if (changed)
+		valueChanged();
 }
 
 void Tone::setGray(double value)
 {
-	gray = value;
-	norm.w = (float) clamp<double>(value, 0, 255) / 255;
+	value = clampComponent(value, 0, 255);
+	const bool changed = (gray != value);
 
-	valueChanged();
+	gray = value;
+	norm.w = (float) clampComponent(value, 0, 255) / 255;
+
+	if (changed)
+		valueChanged();
 }
 
 /* Serializable */
@@ -251,10 +310,10 @@ Tone *Tone::deserialize(const char *data, int len)
 
 	Tone *t = new Tone();
 
-	t->red   = readDouble(&data);
-	t->green = readDouble(&data);
-	t->blue  = readDouble(&data);
-	t->gray  = readDouble(&data);
+	t->red   = clampComponent(readDouble(&data), -255, 255);
+	t->green = clampComponent(readDouble(&data), -255, 255);
+	t->blue  = clampComponent(readDouble(&data), -255, 255);
+	t->gray  = clampComponent(readDouble(&data), 0, 255);
 	t->updateInternal();
 
 	return t;
@@ -262,10 +321,10 @@ Tone *Tone::deserialize(const char *data, int len)
 
 void Tone::updateInternal()
 {
-	norm.x = (float) clamp<double>(red,   -255, 255) / 255;
-	norm.y = (float) clamp<double>(green, -255, 255) / 255;
-	norm.z = (float) clamp<double>(blue,  -255, 255) / 255;
-	norm.w = (float) clamp<double>(gray,     0, 255) / 255;
+	norm.x = (float) clampComponent(red,   -255, 255) / 255;
+	norm.y = (float) clampComponent(green, -255, 255) / 255;
+	norm.z = (float) clampComponent(blue,  -255, 255) / 255;
+	norm.w = (float) clampComponent(gray,     0, 255) / 255;
 }
 
 
@@ -317,12 +376,25 @@ void Rect::set(int x, int y, int w, int h)
 
 const Rect &Rect::operator=(const Rect &o)
 {
+	/* set(), empty() and the four component setters above all guard; this was
+	 * the one Rect write that did not. A Rect valueChanged rebuilds a window's
+	 * cursor vertices or re-derives a viewport's geometry and on-screen test,
+	 * and a write of the value already stored has no business doing either.
+	 * Expect little from it -- script code that assigns a rect usually is
+	 * changing it -- it is here because the hole is the same hole.
+	 *
+	 * The other overload, operator=(const IntRect &), has never signalled and
+	 * still does not: its one caller (Sprite::setBitmap) calls onSrcRectChange
+	 * by hand on the next line. */
+	const bool changed = !(*this == o);
+
 	x      = o.x;
 	y      = o.y;
 	width  = o.width;
 	height = o.height;
 
-	valueChanged();
+	if (changed)
+		valueChanged();
 
 	return o;
 }

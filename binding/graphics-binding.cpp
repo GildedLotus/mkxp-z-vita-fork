@@ -25,21 +25,39 @@
 #include "binding-util.h"
 #include "binding-types.h"
 #include "exception.h"
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+#include "gl-util.h"
+#endif
 
-RB_METHOD(graphicsDelta) {
+/* Every method in this file that touches the graphics lock takes it through
+ * GFX_GUARD_ALL, never by hand. Two separate things go wrong with a bare
+ * GFX_LOCK ... GFX_UNLOCK pair: a C++ exception steps over the unlock, and so
+ * does a Ruby raise, which is a longjmp and runs no catch block at all. Either
+ * one pins a live recursive kernel mutex for the rest of the process. That is
+ * why the Ruby calls that used to sit between the two -- rb_float_new here and
+ * in averageFrameRate -- are now outside it. */
+RB_METHOD_GUARD(graphicsDelta) {
     RB_UNUSED_PARAM;
-    GFX_LOCK;
-    VALUE ret = rb_float_new(shState->graphics().getDelta());
-    GFX_UNLOCK;
-    return ret;
+    double delta = 0;
+    GFX_GUARD_ALL( delta = shState->graphics().getDelta(); );
+    return rb_float_new(delta);
 }
+RB_METHOD_GUARD_END
 
+/* The guard inside the lambda is GFX_GUARD_ALL for a reason of its own: this
+ * body runs inside rb_thread_call_without_gvl, so what escapes it is caught by
+ * gvl_guard and re-thrown on the Ruby side. gvl_guard handles std::bad_alloc
+ * (binding-util.cpp), so the process no longer dies here -- but the lock is
+ * released by the guard or not at all, and GFX_GUARD_EXC released it only for
+ * Exception. Under MKXPZ_SOFTWARE_BITMAPS this path allocates for real: a
+ * window's CPU base does basePixels.assign((size_t)w*h*4, 0) inside
+ * prepare(), reached from the scene composite in Graphics::update. */
 RB_METHOD_GUARD(graphicsUpdate)
 {
     RB_UNUSED_PARAM;
 #if RAPI_MAJOR >= 2
     drop_gvl_guard([](void*) -> void* {
-        GFX_GUARD_EXC( shState->graphics().update(); );
+        GFX_GUARD_ALL( shState->graphics().update(); );
         return 0;
     }, 0, 0, 0);
 #else
@@ -49,28 +67,40 @@ RB_METHOD_GUARD(graphicsUpdate)
 }
 RB_METHOD_GUARD_END
 
-RB_METHOD(graphicsAverageFrameRate)
+RB_METHOD_GUARD(graphicsAverageFrameRate)
 {
     RB_UNUSED_PARAM;
-    GFX_LOCK;
-    VALUE ret = rb_float_new(shState->graphics().averageFrameRate());
-    GFX_UNLOCK;
-    return ret;
+    double rate = 0;
+    GFX_GUARD_ALL( rate = shState->graphics().averageFrameRate(); );
+    return rb_float_new(rate);
 }
+RB_METHOD_GUARD_END
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+// Observe the existing retirement clock; Ruby allocation stays outside the lock.
+RB_METHOD_GUARD(graphicsVitaSwapCount)
+{
+    RB_UNUSED_PARAM;
+    uint64_t count = 0;
+    GFX_GUARD_ALL( count = GPUBudget::frameCounter(); );
+    return ULL2NUM(count);
+}
+RB_METHOD_GUARD_END
+#endif
 
 RB_METHOD_GUARD(graphicsFreeze)
 {
     RB_UNUSED_PARAM;
-    
+
 #if RAPI_MAJOR >= 2
     drop_gvl_guard([](void*) -> void* {
-        GFX_GUARD_EXC( shState->graphics().freeze(); );
+        GFX_GUARD_ALL( shState->graphics().freeze(); );
         return 0;
     }, 0, 0, 0);
 #else
     shState->graphics().freeze();
 #endif
-    
+
     return Qnil;
 }
 RB_METHOD_GUARD_END
@@ -96,47 +126,50 @@ RB_METHOD_GUARD(graphicsTransition)
 #if RAPI_MAJOR >= 2
     drop_gvl_guard([](void *args) -> void* {
         TransitionArgs &a = *((TransitionArgs*)args);
-        GFX_GUARD_EXC( shState->graphics().transition(a.duration,
+        GFX_GUARD_ALL( shState->graphics().transition(a.duration,
                                                       a.filename,
                                                       a.vague
                                                      ); );
         return 0;
     }, &args, 0, 0);
 #else
-    GFX_GUARD_EXC( shState->graphics().transition(duration, filename, vague); )
+    GFX_GUARD_ALL( shState->graphics().transition(duration, filename, vague); )
 #endif
-    
+
     return Qnil;
 }
 RB_METHOD_GUARD_END
 
-RB_METHOD(graphicsFrameReset)
+RB_METHOD_GUARD(graphicsFrameReset)
 {
     RB_UNUSED_PARAM;
-    
-    GFX_LOCK;
-    shState->graphics().frameReset();
-    GFX_UNLOCK;
-    
+
+    GFX_GUARD_ALL( shState->graphics().frameReset(); );
+
     return Qnil;
 }
+RB_METHOD_GUARD_END
 
+/* The three setter macros held the lock by hand as well. Nothing they call
+ * throws today, but setBrightness reaches the scene and setScale and
+ * setFullscreen reach the event thread, so a future throw here would have been
+ * an abort with the lock pinned -- the same shape as resize_screen below, for
+ * one token less. The getters take no lock and are left as they are. */
 #define DEF_GRA_PROP_I(PropName) \
 RB_METHOD(graphics##Get##PropName) \
 { \
 RB_UNUSED_PARAM; \
 return rb_fix_new(shState->graphics().get##PropName()); \
 } \
-RB_METHOD(graphics##Set##PropName) \
+RB_METHOD_GUARD(graphics##Set##PropName) \
 { \
 RB_UNUSED_PARAM; \
 int value; \
 rb_get_args(argc, argv, "i", &value RB_ARG_END); \
-GFX_LOCK; \
-shState->graphics().set##PropName(value); \
-GFX_UNLOCK; \
+GFX_GUARD_ALL( shState->graphics().set##PropName(value); ) \
 return rb_fix_new(value); \
-}
+} \
+RB_METHOD_GUARD_END
 
 #define DEF_GRA_PROP_B(PropName) \
 RB_METHOD(graphics##Get##PropName) \
@@ -144,16 +177,15 @@ RB_METHOD(graphics##Get##PropName) \
 RB_UNUSED_PARAM; \
 return rb_bool_new(shState->graphics().get##PropName()); \
 } \
-RB_METHOD(graphics##Set##PropName) \
+RB_METHOD_GUARD(graphics##Set##PropName) \
 { \
 RB_UNUSED_PARAM; \
 bool value; \
 rb_get_args(argc, argv, "b", &value RB_ARG_END); \
-GFX_LOCK; \
-shState->graphics().set##PropName(value); \
-GFX_UNLOCK; \
+GFX_GUARD_ALL( shState->graphics().set##PropName(value); ) \
 return rb_bool_new(value); \
-}
+} \
+RB_METHOD_GUARD_END
 
 #define DEF_GRA_PROP_F(PropName) \
 RB_METHOD(graphics##Get##PropName) \
@@ -161,16 +193,15 @@ RB_METHOD(graphics##Get##PropName) \
 RB_UNUSED_PARAM; \
 return rb_float_new(shState->graphics().get##PropName()); \
 } \
-RB_METHOD(graphics##Set##PropName) \
+RB_METHOD_GUARD(graphics##Set##PropName) \
 { \
 RB_UNUSED_PARAM; \
 double value; \
 rb_get_args(argc, argv, "f", &value RB_ARG_END); \
-GFX_LOCK; \
-shState->graphics().set##PropName(value); \
-GFX_UNLOCK; \
+GFX_GUARD_ALL( shState->graphics().set##PropName(value); ) \
 return rb_float_new(value); \
-}
+} \
+RB_METHOD_GUARD_END
 
 RB_METHOD(graphicsWidth)
 {
@@ -208,7 +239,7 @@ RB_METHOD_GUARD(graphicsWait)
     rb_get_args(argc, argv, "i", &duration RB_ARG_END);
 #if RAPI_MAJOR >= 2
     drop_gvl_guard([](void* d) -> void* {
-        GFX_GUARD_EXC( shState->graphics().wait(*(int*)d); );
+        GFX_GUARD_ALL( shState->graphics().wait(*(int*)d); );
         return 0;
     }, (int*)&duration, 0, 0);
 #else
@@ -227,7 +258,7 @@ RB_METHOD_GUARD(graphicsFadeout)
     
 #if RAPI_MAJOR >= 2
     drop_gvl_guard([](void* d) -> void* {
-        GFX_GUARD_EXC( shState->graphics().fadeout(*(int*)d); );
+        GFX_GUARD_ALL( shState->graphics().fadeout(*(int*)d); );
         return 0;
     }, (int*)&duration, 0, 0);
 #else
@@ -247,7 +278,7 @@ RB_METHOD_GUARD(graphicsFadein)
     
 #if RAPI_MAJOR >= 2
     drop_gvl_guard([](void* d) -> void* {
-        GFX_GUARD_EXC( shState->graphics().fadein(*(int*)d); );
+        GFX_GUARD_ALL( shState->graphics().fadein(*(int*)d); );
         return 0;
     }, (int*)&duration, 0, 0);
 #else
@@ -263,54 +294,68 @@ void bitmapInitProps(Bitmap *b, VALUE self);
 RB_METHOD_GUARD(graphicsSnapToBitmap)
 {
     RB_UNUSED_PARAM;
-    
+
+    /* Ask Ruby for the object BEFORE the Bitmap exists. wrapObject is
+     * rb_const_get + rb_obj_alloc + setPrivateData, and the two Ruby calls
+     * raise by longjmp: whatever this frame alone owned when they ran is
+     * simply lost. snapToBitmap() allocates a whole screen-sized CPU bitmap
+     * under MKXPZ_SOFTWARE_BITMAPS -- 905 KiB of a 16 MiB heap -- so that is
+     * the leak worth closing. A Bitmap VALUE with no instance data yet is the
+     * ordinary state between rb_obj_alloc and initialize (classAllocate wraps
+     * a null pointer and freeInstance deletes null happily), and nothing can
+     * reach this one before it is filled in. */
+    VALUE obj = wrapObject((Bitmap*)0, BitmapType);
+
     Bitmap *result = 0;
-    
-    GFX_GUARD_EXC( result = shState->graphics().snapToBitmap(); );
-    
-    VALUE obj = wrapObject(result, BitmapType);
+
+    GFX_GUARD_ALL( result = shState->graphics().snapToBitmap(); );
+
+    setPrivateData(obj, result);
     bitmapInitProps(result, obj);
-    
+
     return obj;
 }
 RB_METHOD_GUARD_END
 
-RB_METHOD(graphicsResizeScreen)
+/* Graphics::resizeScreen re-specifies the screen surfaces through
+ * TEXFBO::reallocChecked, which calls surfaceFailed() -- that is, throws --
+ * when the FBO does not come back complete. Unguarded, a driver hiccup here
+ * was std::terminate() with the GL lock held. The texture code owns what
+ * reallocChecked does and when; this only changes how its failure is
+ * reported: a Ruby error the game can see instead of a dead player. */
+RB_METHOD_GUARD(graphicsResizeScreen)
 {
     RB_UNUSED_PARAM;
-    
+
     int width, height;
     rb_get_args(argc, argv, "ii", &width, &height RB_ARG_END);
-    
-    GFX_LOCK;
-    shState->graphics().resizeScreen(width, height);
-    GFX_UNLOCK;
-    
+
+    GFX_GUARD_ALL( shState->graphics().resizeScreen(width, height); );
+
     return Qnil;
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(graphicsResizeWindow)
+RB_METHOD_GUARD(graphicsResizeWindow)
 {
     RB_UNUSED_PARAM;
-    
+
     int width, height;
     bool center = false;
     rb_get_args(argc, argv, "ii|b", &width, &height, &center RB_ARG_END);
-    
-    
-    GFX_LOCK;
-    shState->graphics().resizeWindow(width, height, center);
-    GFX_UNLOCK;
-    
+
+    GFX_GUARD_ALL( shState->graphics().resizeWindow(width, height, center); );
+
     return Qnil;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD_GUARD(graphicsReset)
 {
     RB_UNUSED_PARAM;
-    
-    GFX_GUARD_EXC( shState->graphics().reset(); );
-    
+
+    GFX_GUARD_ALL( shState->graphics().reset(); );
+
     return Qnil;
 }
 RB_METHOD_GUARD_END
@@ -331,7 +376,7 @@ typedef struct {
 
 void *playMovieInternal(void *args) {
     PlayMovieArgs *a = (PlayMovieArgs*)args;
-    GFX_GUARD_EXC( shState->graphics().playMovie(a->filename, a->volume, a->skippable); );
+    GFX_GUARD_ALL( shState->graphics().playMovie(a->filename, a->volume, a->skippable); );
     
     // Signals for shutdown or reset only make playMovie quit early,
     // so check again
@@ -370,7 +415,7 @@ RB_METHOD_GUARD_END
 
 void graphicsScreenshotInternal(const char *filename)
 {
-    GFX_GUARD_EXC(shState->graphics().screenshot(filename););
+    GFX_GUARD_ALL(shState->graphics().screenshot(filename););
 }
 
 RB_METHOD_GUARD(graphicsScreenshot)
@@ -429,6 +474,9 @@ void graphicsBindingInit()
     INIT_GRA_PROP_BIND( FrameRate,  "frame_rate"  );
     INIT_GRA_PROP_BIND( FrameCount, "frame_count" );
     _rb_define_module_function(module, "average_frame_rate", graphicsAverageFrameRate);
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+    _rb_define_module_function(module, "vita_swap_count", graphicsVitaSwapCount);
+#endif
 
     _rb_define_module_function(module, "width", graphicsWidth);
     _rb_define_module_function(module, "height", graphicsHeight);

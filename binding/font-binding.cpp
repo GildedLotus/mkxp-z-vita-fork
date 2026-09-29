@@ -65,38 +65,52 @@ RB_METHOD(fontDoesExist) {
 
 RB_METHOD(FontSetName);
 
-RB_METHOD(fontInitialize) {
+RB_METHOD_GUARD(fontInitialize) {
   VALUE namesObj = Qnil;
   int size = 0;
 
   rb_get_args(argc, argv, "|oi", &namesObj, &size RB_ARG_END);
 
-  Font *f;
+  /* Construct, hand over, then write the ivar -- in that order, which is not
+   * the order upstream used. rb_iv_set is a Ruby call, and a Ruby raise is a
+   * longjmp: it runs no destructor and no catch block, so anything this frame
+   * alone owns when one crosses it is gone for good. Upstream wrote the ivar
+   * while the new Font was owned by nothing else, so a raise there (a frozen
+   * Font, NoMemoryError) leaked it; and `*orig = *f` -- FontPrivate's
+   * copy-assignment, which copies a std::string -- can throw, which leaked it
+   * again and then escaped into Ruby's frames. Assigning from a stack
+   * temporary leaves the failure path nothing to clean up, and the GC owns the
+   * object on the other path before any Ruby call can raise. */
+  Font *f = getPrivateDataNoRaise<Font>(self);
 
   if (NIL_P(namesObj)) {
     namesObj = rb_iv_get(rb_obj_class(self), "default_name");
-    f = new Font(0, size);
+
+    if (f) {
+      *f = Font(0, size);
+    } else {
+      f = new Font(0, size);
+      setPrivateData(self, f);
+    }
   } else {
+    /* The name vector dies with this block, before the rb_iv_set below: a
+     * longjmp across a live std::vector<std::string> leaks every string in it
+     * (the same hazard FontSetName carries). */
     std::vector<std::string> names;
     collectStrings(namesObj, names);
 
-    f = new Font(&names, size);
+    if (f) {
+      *f = Font(&names, size);
+    } else {
+      f = new Font(&names, size);
+      setPrivateData(self, f);
+    }
   }
 
   /* This is semantically wrong; the new Font object should take
    * a dup'ed object here in case of an array. Ditto for the setters.
    * However the same bug/behavior exists in all RM versions. */
   rb_iv_set(self, "name", namesObj);
-
-  Font *orig = getPrivateDataNoRaise<Font>(self);
-  if (orig)
-  {
-    *orig = *f;
-    delete f;
-    f = orig;
-  } else {
-    setPrivateData(self, f);
-  }
 
   /* Wrap property objects */
   f->initDynAttribs();
@@ -108,8 +122,9 @@ RB_METHOD(fontInitialize) {
 
   return self;
 }
+RB_METHOD_GUARD_END
 
-RB_METHOD(fontInitializeCopy) {
+RB_METHOD_GUARD(fontInitializeCopy) {
   VALUE origObj;
   rb_get_args(argc, argv, "o", &origObj RB_ARG_END);
 
@@ -117,6 +132,10 @@ RB_METHOD(fontInitializeCopy) {
     return self;
 
   Font *orig = getPrivateData<Font>(origObj);
+  /* new Font(*orig) copies a FontPrivate, so it allocates twice: the clone and
+   * the std::string inside it. The GC owns the result from the next statement
+   * on, and nothing before it can raise, so only the allocation itself can
+   * fail here -- which is exactly what the guard is for. */
   Font *f = new Font(*orig);
   setPrivateData(self, f);
 
@@ -130,6 +149,7 @@ RB_METHOD(fontInitializeCopy) {
 
   return self;
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD(FontGetName) {
   RB_UNUSED_PARAM;
@@ -137,19 +157,29 @@ RB_METHOD(FontGetName) {
   return rb_iv_get(self, "name");
 }
 
-RB_METHOD(FontSetName) {
+RB_METHOD_GUARD(FontSetName) {
   Font *f = getPrivateData<Font>(self);
 
   rb_check_argc(argc, 1);
 
-  std::vector<std::string> namesObj;
-  collectStrings(argv[0], namesObj);
+  {
+    /* The vector must be gone before the rb_iv_set below, which is why it has
+     * a block of its own. A Ruby raise there -- FrozenError on a frozen Font,
+     * NoMemoryError -- is a longjmp, and a longjmp runs no destructor: it
+     * skips ~vector<string> and leaks the vector's buffer and every string in
+     * it. Nothing else about this method changes; setName still sees exactly
+     * the names collectStrings collected. */
+    std::vector<std::string> namesObj;
+    collectStrings(argv[0], namesObj);
 
-  f->setName(namesObj);
+    f->setName(namesObj);
+  }
+
   rb_iv_set(self, "name", argv[0]);
 
   return argv[0];
 }
+RB_METHOD_GUARD_END
 
 template <class C> static void checkDisposed(VALUE) {}
 
@@ -206,19 +236,24 @@ RB_METHOD(FontGetDefaultName) {
   return rb_iv_get(self, "default_name");
 }
 
-RB_METHOD(FontSetDefaultName) {
+RB_METHOD_GUARD(FontSetDefaultName) {
   RB_UNUSED_PARAM;
 
   rb_check_argc(argc, 1);
 
-  std::vector<std::string> namesObj;
-  collectStrings(argv[0], namesObj);
+  {
+    /* Same longjmp-over-a-live-vector hazard as FontSetName, same block. */
+    std::vector<std::string> namesObj;
+    collectStrings(argv[0], namesObj);
 
-  Font::setDefaultName(namesObj, shState->fontState());
+    Font::setDefaultName(namesObj, shState->fontState());
+  }
+
   rb_iv_set(self, "default_name", argv[0]);
 
   return argv[0];
 }
+RB_METHOD_GUARD_END
 
 RB_METHOD(FontGetDefaultColor) {
   RB_UNUSED_PARAM;

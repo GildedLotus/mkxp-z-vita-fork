@@ -33,44 +33,44 @@ DEF_TYPE(Viewport);
 DEF_ALLOCFUNC(Viewport);
 #endif
 
-RB_METHOD(viewportInitialize) {
-    Viewport *v;
-    
+RB_METHOD_GUARD(viewportInitialize) {
+    Viewport *v = 0;
+
     if (argc == 0 && rgssVer >= 3) {
-        GFX_LOCK;
-        v = new Viewport();
+        GFX_GUARD_ALL(v = new Viewport();)
     } else if (argc == 1) {
         /* The rect arg is only used to init the viewport,
          * and does NOT replace its 'rect' property */
         VALUE rectObj;
         Rect *rect;
-        
+
         rb_get_args(argc, argv, "o", &rectObj RB_ARG_END);
-        
+
         rect = getPrivateDataCheck<Rect>(rectObj, RectType);
-        
-        GFX_LOCK;
-        v = new Viewport(rect);
+
+        GFX_GUARD_ALL(v = new Viewport(rect);)
     } else {
         int x, y, width, height;
-        
+
         rb_get_args(argc, argv, "iiii", &x, &y, &width, &height RB_ARG_END);
-        GFX_LOCK;
-        v = new Viewport(x, y, width, height);
+        GFX_GUARD_ALL(v = new Viewport(x, y, width, height);)
     }
-    
+
+    /* The GC owns v from here, before the first Ruby call that can raise:
+     * a raise is a longjmp, so nothing below would ever delete it. */
     setPrivateData(self, v);
-    
-    /* Wrap property objects */
-    v->initDynAttribs();
-    
+
+    GFX_GUARD_ALL(v->initDynAttribs();)
+
+    /* Wrap property objects. None of this touches GL, so none of it runs
+     * under the lock: a raise here would never reach a GFX_UNLOCK. */
     wrapProperty(self, &v->getRect(), "rect", RectType);
     wrapProperty(self, &v->getColor(), "color", ColorType);
     wrapProperty(self, &v->getTone(), "tone", ToneType);
-    
-    GFX_UNLOCK;
+
     return self;
 }
+RB_METHOD_GUARD_END
 
 DEF_GFX_PROP_OBJ_VAL(Viewport, Rect, Rect, "rect")
 DEF_GFX_PROP_OBJ_VAL(Viewport, Color, Color, "color")

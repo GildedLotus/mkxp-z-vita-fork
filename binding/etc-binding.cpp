@@ -97,25 +97,47 @@ EQUAL_FUN(Color)
 EQUAL_FUN(Tone)
 EQUAL_FUN(Rect)
 
+/* The database-load path: a stock RGSS3 project builds thousands of Colors and
+ * Tones before the title screen, every Color.new / Tone.new / Rect.new lands
+ * here twice (CLASS_ALLOCATE_PRE_INIT calls the initializer once with argc 0,
+ * then Ruby calls it again with the arguments), and every one of them allocates
+ * from the same SceLibc heap that every software Bitmap now comes out of. So
+ * std::bad_alloc here is an ordinary outcome, not an exotic one -- and
+ * unguarded it crossed a Ruby C frame, which on ARM EABI has no unwind
+ * information, so std::terminate() ran rather than an error being raised.
+ *
+ * Two changes besides the guard, both about what the frame owns when something
+ * throws. The re-initialize path assigns from a stack temporary instead of a
+ * heap Klass it has to remember to delete: Tone::operator= emits valueChanged,
+ * whose slots do arbitrary work (a whole CPU window recompose, under
+ * MKXPZ_SOFTWARE_BITMAPS), so the assignment genuinely can throw, and upstream
+ * leaked `k` when it did. It also saves an allocate-and-free per call on the
+ * one path that runs thousands of times. The first-initialize path hands the
+ * object to the GC in the same statement that allocates it, so there is no
+ * point at which this frame is the only owner. */
 #define INIT_FUN(Klass, param_type, param_t_s, last_param_def)                 \
-  RB_METHOD(Klass##Initialize) {                                               \
-    Klass *k;                                                                  \
+  RB_METHOD_GUARD(Klass##Initialize) {                                         \
+    Klass *k = getPrivateDataNoRaise<Klass>(self);                             \
     if (argc == 0) {                                                           \
-      k = new Klass();                                                         \
+      if (k) {                                                                 \
+        *k = Klass();                                                          \
+      } else {                                                                 \
+        k = new Klass();                                                       \
+        setPrivateData(self, k);                                               \
+      }                                                                        \
     } else {                                                                   \
       param_type p1, p2, p3, p4 = last_param_def;                              \
       rb_get_args(argc, argv, param_t_s, &p1, &p2, &p3, &p4 RB_ARG_END);       \
-      k = new Klass(p1, p2, p3, p4);                                           \
-    }                                                                          \
-    Klass *orig = getPrivateDataNoRaise<Klass>(self);                          \
-    if (orig) {                                                                \
-      *orig = *k;                                                              \
-      delete k;                                                                \
-    } else {                                                                   \
-    setPrivateData(self, k);                                                   \
+      if (k) {                                                                 \
+        *k = Klass(p1, p2, p3, p4);                                            \
+      } else {                                                                 \
+        k = new Klass(p1, p2, p3, p4);                                         \
+        setPrivateData(self, k);                                               \
+      }                                                                        \
     }                                                                          \
     return self;                                                               \
-  }
+  }                                                                            \
+  RB_METHOD_GUARD_END
 
 INIT_FUN(Color, double, "fff|f", 255)
 INIT_FUN(Tone, double, "fff|f", 0)

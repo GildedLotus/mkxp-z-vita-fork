@@ -26,8 +26,16 @@
 #include "binding-util.h"
 #include "graphics.h"
 
+/* Every .dispose in every game arrives here. Disposable::dispose
+ * (src/util/disposable.h) takes GFX_LOCK, releases the object's resources and
+ * then emits the wasDisposed signal, whose slots do arbitrary work including
+ * allocation; an earlier fix made it release the lock for every C++ type rather
+ * than for Exception alone, and this is the other half of that fix -- the frame
+ * that has to turn what dispose() rethrows into a Ruby exception instead of
+ * letting it reach Ruby's C frames, where ARM EABI has no unwind information
+ * and std::terminate() runs. */
 template<class C>
-RB_METHOD(disposableDispose)
+RB_METHOD_GUARD(disposableDispose)
 {
 	RB_UNUSED_PARAM;
 	
@@ -40,6 +48,7 @@ RB_METHOD(disposableDispose)
 
 	return Qnil;
 }
+RB_METHOD_GUARD_END
 
 template<class C>
 RB_METHOD(disposableIsDisposed)

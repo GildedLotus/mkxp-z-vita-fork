@@ -36,16 +36,15 @@ serializableDump(int, VALUE *, VALUE self)
 
 	VALUE data = rb_str_new(0, dataSize);
 
-	Exception *exc = 0;
+	/* Marshal.dump calls this directly, so it is a Ruby boundary and owes the
+	 * same contract as a guarded binding method: serialize() walks whatever
+	 * the object holds, and a std::bad_alloc out of it is not an Exception.
+	 * `data` is a Ruby string the GC already owns, so the longjmp a report
+	 * ends in loses nothing this frame allocated. */
+	RB_GUARD_VARS
 	try{
 		s->serialize(RSTRING_PTR(data));
-	} catch (const Exception &e) {
-		exc = new Exception(e);
-	}
-
-	if (exc) {
-		raiseRbExc(exc);
-	}
+	RB_GUARD_REPORT
 
 	return data;
 }
