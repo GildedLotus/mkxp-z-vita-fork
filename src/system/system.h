@@ -20,6 +20,12 @@
 #define MKXPZ_PLATFORM MKXPZ_PLATFORM_MACOS
 #elif defined __linux__
 #define MKXPZ_PLATFORM MKXPZ_PLATFORM_LINUX
+#elif defined(__vita__) || defined(__psp2__)
+/* PS Vita (VitaSDK arm-vita-eabi). newlib, not glibc; the non-Windows
+ * systemImpl paths (locale / getenv / isWine=false) are correct here.
+ * Reuse the Linux value so the rest of the tree needs no extra #ifdefs.
+ */
+#define MKXPZ_PLATFORM MKXPZ_PLATFORM_LINUX
 #else
 #error "Can't identify platform."
 #endif
