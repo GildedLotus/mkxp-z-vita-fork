@@ -21,6 +21,9 @@
 
 #include "viewport.h"
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "frameprofile.h"
+#endif
 #include "sharedstate.h"
 #include "etc.h"
 #include "util.h"
@@ -66,6 +69,9 @@ struct ViewportPrivate
 
 	void onRectChange()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::ViewportUpdate);
+#endif
 		self->geometry.rect = rect->toIntRect();
 		self->notifyGeometryChange();
 		recomputeOnScreen();
@@ -153,6 +159,9 @@ DEF_ATTR_SIMPLE(Viewport, Tone,  Tone&,  *p->tone)
 
 void Viewport::setOX(int value)
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::OperationScope profileOperation(FrameProfile::ViewportUpdate);
+#endif
 	guardDisposed();
 
 	if (geometry.orig.x == value)
@@ -164,6 +173,9 @@ void Viewport::setOX(int value)
 
 void Viewport::setOY(int value)
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::OperationScope profileOperation(FrameProfile::ViewportUpdate);
+#endif
 	guardDisposed();
 
 	if (geometry.orig.y == value)
@@ -185,6 +197,9 @@ void Viewport::initDynAttribs()
 /* Scene */
 void Viewport::composite()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::OperationScope profileOperation(FrameProfile::ViewportDraw);
+#endif
 	if (emptyFlashFlag)
 		return;
 

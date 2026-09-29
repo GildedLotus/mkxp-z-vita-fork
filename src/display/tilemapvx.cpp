@@ -19,6 +19,9 @@
 ** along with mkxp.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "frameprofile.h"
+#endif
 #include "tilemapvx.h"
 
 #include "util/debugwriter.h"
@@ -132,10 +135,30 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 	      mapViewportDirty(false),
 	      above(this, viewport)
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* A hires atlas is a second, larger atlas filled by scaled blits.
+		 * The software backend builds atlases on the CPU and
+		 * already refuses hires Bitmaps outright, so refuse here -- before
+		 * anything is allocated -- rather than build a silently wrong
+		 * atlas. */
+		if (shState->config().enableHires)
+			throw Exception(Exception::MKXPError,
+			                "software_bitmaps: high-resolution tile atlases "
+			                "are not supported");
+#endif
+
 		memset(bitmaps, 0, sizeof(bitmaps));
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		{
+			TEX::ScopedBinding binding;
+			shState->requestAtlasTex(ATLASVX_W, ATLASVX_H, atlas);
+		}
+#else
 		shState->requestAtlasTex(ATLASVX_W, ATLASVX_H, atlas);
+#endif
 
+#ifndef MKXPZ_SOFTWARE_BITMAPS
 		if (shState->config().enableHires) {
 			double scalingFactor = shState->config().atlasScalingFactor;
 			int hiresWidth = (int)lround(scalingFactor * ATLASVX_W);
@@ -143,8 +166,13 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 			shState->requestAtlasTex(hiresWidth, hiresHeight, atlasHires);
 			atlas.selfHires = &atlasHires;
 		}
+#endif
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		vbo = VBO::ID(0);
+#else
 		vbo = VBO::gen();
+#endif
 
 		GLMeta::vaoFillInVertexData<SVertex>(vao);
 		vao.vbo = vbo;
@@ -163,9 +191,11 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 		VBO::del(vbo);
 
 		shState->releaseAtlasTex(atlas);
+#ifndef MKXPZ_SOFTWARE_BITMAPS
 		if (shState->config().enableHires) {
 			shState->releaseAtlasTex(atlasHires);
 		}
+#endif
 
 		prepareCon.disconnect();
 
@@ -199,10 +229,20 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 
 	void rebuildAtlas()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::Scope profileAtlas(FrameProfile::Compose);
+#endif
 		TileAtlasVX::build(atlas, bitmaps);
 
 		if (shState->config().dumpAtlas)
 		{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+			/* Bitmap(TEXFBO&) reads its pixels back from that TEXFBO's
+			 * framebuffer. A software atlas has none -- .fbo stays 0, which
+			 * IS the screen -- so a dump here would silently save the window
+			 * instead of the atlas. Say so instead. */
+			Debug() << "dumpAtlas is not supported by the software tile atlas";
+#else
 			Debug() << "Dumping tile atlas...";
 
 			Bitmap dump(atlas);
@@ -216,11 +256,15 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 			}
 
 			Debug() << "Tile atlas dump completed.";
+#endif
 		}
 	}
 
 	void updateMapViewport()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::MapViewport);
+#endif
 		/* Note: We include one extra row at the top above
 		 * the normal map viewport to ensure the legs of table
 		 * tiles off screen are properly drawn */
@@ -256,6 +300,9 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 		if (!mapData)
 			return;
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileVertices(FrameProfile::TileVertices);
+#endif
 		groundVert.clear();
 		aboveVert.clear();
 
@@ -266,6 +313,14 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 		aboveQuads = aboveVert.size() / 4;
 		size_t totalQuads = groundQuads + aboveQuads;
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		profileVertices.stop();
+		FrameProfile::OperationScope profileBuffers(FrameProfile::TileBuffers);
+#endif
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		replaceTileQuadBuffer(vbo, groundVert, &aboveVert, 1);
+		vao.vbo = vbo;
+#else
 		VBO::bind(vbo);
 
 		if (totalQuads > allocQuads)
@@ -280,17 +335,33 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 		VBO::unbind();
 
 		shState->ensureQuadIBO(totalQuads);
+#endif
 	}
 
 	void prepare()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::VXPrepare);
+#endif
 		if (!mapData)
 			return;
 
 		if (atlasDirty)
 		{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+			try
+			{
+				TEX::ScopedBinding binding;
+				if (atlas.tex == TEX::ID(0))
+					shState->requestAtlasTex(ATLASVX_W, ATLASVX_H, atlas);
+				rebuildAtlas();
+				atlasDirty = false;
+			}
+			catch (const TEX::UploadError &) { return; }
+#else
 			rebuildAtlas();
 			atlasDirty = false;
+#endif
 		}
 
 		if (mapViewportDirty)
@@ -325,6 +396,13 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 
 	void drawGround()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::TileDraw);
+#endif
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		if (atlasDirty)
+			return;
+#endif
 		if (groundQuads == 0)
 			return;
 
@@ -365,6 +443,13 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 
 	void drawAbove()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::TileDraw);
+#endif
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		if (atlasDirty)
+			return;
+#endif
 		if (aboveQuads == 0)
 			return;
 
@@ -400,7 +485,9 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 	{
 		sceneGeo = geo;
 
-		buffersDirty = true;
+		/* Vertices are relative to mapViewp; updateMapViewport() dirties
+		 * them only when that tile rectangle moves, so a 0<->1 viewport
+		 * shake is a translation, not a VBO rebuild. */
 		mapViewportDirty = true;
 	}
 

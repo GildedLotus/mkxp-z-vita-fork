@@ -20,7 +20,14 @@
 */
 
 #include "plane.h"
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "vita_glue.h"
+#include <cstdio>
+#endif
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "frameprofile.h"
+#endif
 #include "sharedstate.h"
 #include "bitmap.h"
 #include "etc.h"
@@ -40,6 +47,42 @@ static float fwrap(float value, float range)
 {
 	float res = fmod(value, range);
 	return res < 0 ? res + range : res;
+}
+
+/* Client-array draws chunk their index ranges (gl/quadarray.h), so the index
+ * buffer no longer bounds a tiled Plane; the vertex array is the only bound.
+ * 64 Ki quads is 4 MiB of SVertex, and still covers a 1x1 bitmap tiled over
+ * 255x255. Rejected tilings draw nothing instead of aborting on allocation. */
+enum { MaxPlaneQuads = 65536 };
+
+/* Tile counts and wrapped offsets for a bitmap scaled to (sw, sh) covering a
+ * vpw x vph viewport at Plane offset (ox, oy). False when the tiling is
+ * undefined or unbounded: a zero or negative extent is never an fmod()
+ * divisor, and a non-finite count or more than MaxPlaneQuads quads cannot be
+ * drawn. */
+static bool planeTileCounts(float sw, float sh, float ox, float oy,
+                            int vpw, int vph, float &wox, float &woy,
+                            size_t &tilesX, size_t &tilesY)
+{
+	if (!(sw > 0.0f) || !(sh > 0.0f))
+		return false;
+
+	/* Plane offset wrapped by scaled bitmap dims */
+	wox = fwrap(ox, sw);
+	woy = fwrap(oy, sh);
+
+	/* Amount the scaled bitmap is tiled (repeated) */
+	float tilesXf = ceil((vpw - sw + wox) / sw) + 1;
+	float tilesYf = ceil((vph - sh + woy) / sh) + 1;
+
+	if (!(tilesXf > 0.0f) || !(tilesYf > 0.0f) ||
+	    tilesXf > MaxPlaneQuads || tilesYf > MaxPlaneQuads ||
+	    tilesXf * tilesYf > MaxPlaneQuads)
+		return false;
+
+	tilesX = size_t(tilesXf);
+	tilesY = size_t(tilesYf);
+	return true;
 }
 
 struct PlanePrivate
@@ -64,6 +107,7 @@ struct PlanePrivate
 	Scene::Geometry sceneGeo;
 
 	bool quadSourceDirty;
+	bool quadTracePending = true;
 
 	SimpleQuadArray qArray;
 
@@ -110,6 +154,10 @@ struct PlanePrivate
 
 	void updateQuadSource()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::PlaneQuad);
+#endif
+		quadTracePending = true;
 		if (gl.npot_repeat)
 		{
 			FloatRect srcRect;
@@ -131,17 +179,19 @@ struct PlanePrivate
 		float sw = bitmap->width()  * zoomX;
 		float sh = bitmap->height() * zoomY;
 
-		/* Plane offset wrapped by scaled bitmap dims */
-		float wox = fwrap(ox, sw);
-		float woy = fwrap(oy, sh);
-
-		/* Viewport dimensions */
-		int vpw = sceneGeo.rect.w;
-		int vph = sceneGeo.rect.h;
-
-		/* Amount the scaled bitmap is tiled (repeated) */
-		size_t tilesX = ceil((vpw - sw + wox) / sw) + 1;
-		size_t tilesY = ceil((vph - sh + woy) / sh) + 1;
+		/* Amount the scaled bitmap is tiled (repeated), and the wrapped
+		 * offsets the tiles are placed from. A zero extent has already hidden
+		 * the Plane; a NaN or unbounded one is refused before it sizes the
+		 * vertex array. */
+		float wox, woy;
+		size_t tilesX, tilesY;
+		if (!planeTileCounts(sw, sh, sceneGeo.orig.x + ox, sceneGeo.orig.y + oy,
+		                     sceneGeo.rect.w, sceneGeo.rect.h,
+		                     wox, woy, tilesX, tilesY))
+		{
+			qArray.clear();
+			return;
+		}
 
 		FloatRect tex = bitmap->rect();
 
@@ -151,7 +201,8 @@ struct PlanePrivate
 			for (size_t x = 0; x < tilesX; ++x)
 			{
 				SVertex *vert = &qArray.vertices[(y*tilesX + x) * 4];
-				FloatRect pos(x*sw - wox, y*sh - woy, sw, sh);
+				FloatRect pos(sceneGeo.rect.x + x*sw - wox,
+				              sceneGeo.rect.y + y*sh - woy, sw, sh);
 
 				Quad::setTexPosRect(vert, tex, pos);
 			}
@@ -161,9 +212,13 @@ struct PlanePrivate
 
 	void updateChild()
 	{
+		/* An invisible Plane has no geometry to update: returning here keeps
+		 * zero zoom out of the tiling arithmetic and zero opacity from
+		 * uploading quads the draw will skip anyway. */
 		if (!opacity || !realZoomX || !realZoomY)
 		{
 			isVisible = false;
+			return;
 		}
 		
 		if (bitmap == realBitmap)
@@ -213,6 +268,9 @@ struct PlanePrivate
 
 	void prepare()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::PlanePrepare);
+#endif
 		if (nullOrDisposed(bitmap))
 			return;
 		
@@ -262,6 +320,10 @@ void Plane::setBitmap(Bitmap *value)
 
 	p->bitmap = value;
 	p->realBitmap = value;
+
+	/* Tiling depends on the bitmap's dimensions: a replacement retiles even
+	 * when no other property changes (and a nil bitmap clears stale quads). */
+	p->quadSourceDirty = true;
 
 	p->bitmapDispCon.disconnect();
 
@@ -357,6 +419,9 @@ void Plane::initDynAttribs()
 
 void Plane::draw()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::OperationScope profileOperation(FrameProfile::PlaneDraw);
+#endif
 	if (nullOrDisposed(p->bitmap))
 		return;
 
@@ -395,6 +460,28 @@ void Plane::draw()
 
 	if (gl.npot_repeat)
 		TEX::setRepeat(true);
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	if (p->quadTracePending && vita_glue_gpu_telemetry_enabled() && vita_measure_mode != 4)
+	{
+		const unsigned long long measuredStart = vita_measure_mode ? vita_measure_plane_begin() : 0;
+		GLint wrapS = 0, wrapT = 0;
+		/* vitaGL does not export glGetTexParameteriv: the wrap
+		 * fields above stay 0 in its telemetry line. */
+		char line[320];
+		snprintf(line, sizeof(line),
+		         "vita-plane: repeat=%d bitmap=%dx%d zoom=%.6g,%.6g offset=%.6g,%.6g "
+		         "rect=%d,%d,%d,%d origin=%d,%d quads=%u wrap=%x,%x",
+		         int(gl.npot_repeat), p->bitmap->width(), p->bitmap->height(),
+		         p->zoomX, p->zoomY, p->ox, p->oy,
+		         p->sceneGeo.rect.x, p->sceneGeo.rect.y, p->sceneGeo.rect.w, p->sceneGeo.rect.h,
+		         p->sceneGeo.orig.x, p->sceneGeo.orig.y, unsigned(p->qArray.count()),
+		         unsigned(wrapS), unsigned(wrapT));
+		vita_glue_trace(line);
+		if (vita_measure_mode) vita_measure_plane_end(measuredStart);
+	}
+#endif
+	p->quadTracePending = false;
 
 	p->qArray.draw();
 

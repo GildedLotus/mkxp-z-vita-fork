@@ -19,6 +19,9 @@
 ** along with mkxp.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "frameprofile.h"
+#endif
 #include "window.h"
 
 #include "viewport.h"
@@ -35,6 +38,378 @@
 #include "glstate.h"
 
 #include "sigslot/signal.hpp"
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+/* CPU-composed window base. The base texture stops being a
+ * render target: it is composed from the windowskin's CPU pixels (the
+ * authoritative ones) and uploaded whole-level. The
+ * pipeline model itself is declared in window.h and shared with windowvx.cpp;
+ * everything below is inside #ifdef, so with the option off this file
+ * preprocesses to stock mkxp-z. */
+#include <SDL_surface.h>
+
+#include "exception.h"
+
+/* The shade-free Normal/KeepDestAlpha quads go
+ * through the swraster nearest kernel (swraster.cpp, copied in by the
+ * configure script). */
+#include "swraster.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <new>
+#include <stdexcept>
+#include <vector>
+
+namespace SoftBase
+{
+
+namespace
+{
+
+/* v / 255.0 for every byte value. The Cortex-A9's
+ * vdiv.f64 is about 25 cycles and does not pipeline, and `x / 255.0` cannot
+ * become a multiply without -ffast-math because 1/255 is not representable,
+ * so the compiler emits one divide per channel per layer. Every entry is
+ * built from the same expression it replaces, so the table is bit-identical
+ * to the division and the composed pixels do not move. The one exception is
+ * the interpolated operand in drawQuad, which cannot index a table; it pays
+ * kInv255 instead and accepts the rounding change recorded there. */
+struct ByteToUnit
+{
+	double v[256];
+
+	ByteToUnit()
+	{
+		for (int i = 0; i < 256; ++i)
+			v[i] = (double) i / 255.0;
+	}
+};
+
+const ByteToUnit unit;
+
+/* 1/255 correctly rounded once at compile time; the bilinear combine's
+ * multiply by this is the reference formulation. */
+const double kInv255 = 1.0 / 255.0;
+
+inline double clamp01(double v)
+{
+	return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+}
+
+inline uint8_t toByte(double v)
+{
+	return (uint8_t)(clamp01(v) * 255.0 + 0.5);
+}
+
+inline int clampInt(int v, int lo, int hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* One axis of the sampler, precomputed once per destination column and row.
+ * The Cortex-A9 has no hardware integer divide and no fast double divide, so
+ * nothing inside the pixel loop may divide. */
+struct Tap
+{
+	int i0, i1;
+	double w;
+};
+
+void buildTaps(std::vector<Tap> &taps, int dstFrom, int dstCount,
+               int posOrigin, int posLen, int texOrigin, int texLen,
+               int limit, bool smooth)
+{
+	const double scale = (double)texLen / (double)posLen;
+	taps.resize((size_t)dstCount);
+
+	for (int i = 0; i < dstCount; ++i)
+	{
+		/* The interpolated texture coordinate at this destination pixel's
+		 * centre, in windowskin texels: simple.vert carries texCoord in
+		 * pixels and only normalises it by texSizeInv. */
+		const double u = ((double)(dstFrom + i - posOrigin) + 0.5) * scale
+		               + (double)texOrigin;
+		Tap &tap = taps[(size_t)i];
+
+		if (!smooth)
+		{
+			/* GL_NEAREST: floor(u), clamped to the texture. */
+			tap.i0 = tap.i1 = clampInt((int)std::floor(u), 0, limit);
+			tap.w = 0.0;
+			continue;
+		}
+
+		/* GL_LINEAR: the two texels straddling u - 0.5, CLAMP_TO_EDGE. */
+		const double f = u - 0.5;
+		const int base = (int)std::floor(f);
+		tap.w = f - (double)base;
+		tap.i0 = clampInt(base, 0, limit);
+		tap.i1 = clampInt(base + 1, 0, limit);
+	}
+}
+
+/* Shade converted once per quad instead of once per pixel: float -> double is
+ * exact, so this only moves the conversions out of the pixel loop. 'identity'
+ * is the shade that provably does nothing -- adding 0.0 to a non-negative
+ * fragment and multiplying it by 1.0 are both exact -- which is every frame
+ * quad of both window types and every background quad at back opacity 255. */
+struct ShadeD
+{
+	double r, g, b, gray, opacity;
+	bool identity;
+
+	explicit ShadeD(const Shade &s)
+	    : r(s.r), g(s.g), b(s.b), gray(s.gray), opacity(s.opacity),
+	      identity(s.r == 0 && s.g == 0 && s.b == 0 &&
+	               s.gray == 0 && s.opacity == 1)
+	{}
+};
+
+/* shader/plane.frag, color.a == 0 and flash.a == 0. */
+inline void shadeFragment(double *frag, const ShadeD &shade)
+{
+	const double gray = shade.gray;
+
+	if (gray != 0.0)
+	{
+		const double luma = frag[0] * 0.299 + frag[1] * 0.587 + frag[2] * 0.114;
+
+		for (int ch = 0; ch < 3; ++ch)
+			frag[ch] = frag[ch] * (1.0 - gray) + luma * gray;
+	}
+
+	frag[0] += shade.r;
+	frag[1] += shade.g;
+	frag[2] += shade.b;
+	frag[3] *= shade.opacity;
+}
+
+} // namespace
+
+void clear(const Surface &dst)
+{
+	if (!dst.px)
+		return;
+
+	for (int y = 0; y < dst.h; ++y)
+		std::memset(dst.px + (size_t)y * (size_t)dst.stride, 0, (size_t)dst.w * 4);
+}
+
+void drawQuad(const Surface &dst, const IntRect &pos,
+              const Surface &src, const IntRect &tex,
+              const Shade &shade, Blend blend, bool smooth)
+{
+	if (!dst.px || !src.px)
+		return;
+	if (dst.w <= 0 || dst.h <= 0 || src.w <= 0 || src.h <= 0)
+		return;
+	if (pos.w <= 0 || pos.h <= 0 || tex.w <= 0 || tex.h <= 0)
+		return;
+
+	/* A 1:1 quad samples exact texel centres, where GL_LINEAR is GL_NEAREST.
+	 * Every frame, corner and tile quad of both window types is 1:1; only the
+	 * stretched background actually filters. */
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::Scope profileQuad(FrameProfile::Compose, 0, false, false);
+#endif
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	if (profileQuad.enabled()) ++FrameProfile::state.batch.quads;
+#endif
+	if (tex.w == pos.w && tex.h == pos.h)
+		smooth = false;
+
+	/* Destination pixels outside the buffer are dropped, exactly as the
+	 * viewport clips them for the GPU pass. */
+	const int x0 = std::max(pos.x, 0);
+	const int y0 = std::max(pos.y, 0);
+	const int x1 = std::min(pos.x + pos.w, dst.w);
+	const int y1 = std::min(pos.y + pos.h, dst.h);
+
+	if (x1 <= x0 || y1 <= y0)
+		return;
+
+	const ShadeD sh(shade);
+
+	/* A shade-free 1:1 quad in one of the
+	 * alpha-accumulating blends is exactly swraster's simple_blit -- the
+	 * frame/border passes of both window types, and the VX tiled
+	 * background at back opacity 255 with no tone. The kernel is
+	 * byte-identical to the generic loop below: with an identity shade the
+	 * fragment is the raw source byte, and byte operands reach no rounding
+	 * tie, so its constant-65025 round-half-up writes what this loop's
+	 * doubles write. The containment test keeps every quads' taps inside
+	 * the skin, so the loop's CLAMP_TO_EDGE behaviour stays out of scope;
+	 * anything filtered, shaded or clipped against the source edge falls
+	 * through to the generic path unchanged. */
+	if (!smooth && tex.w == pos.w && tex.h == pos.h &&
+	    sh.identity && blend != Replace)
+	{
+		const int sx0 = tex.x + (x0 - pos.x);
+		const int sy0 = tex.y + (y0 - pos.y);
+		if (sx0 >= 0 && sy0 >= 0 &&
+		    sx0 + (x1 - x0) <= src.w && sy0 + (y1 - y0) <= src.h)
+		{
+			const swraster::Surface sdst = { dst.px, dst.w, dst.h, dst.stride };
+			const swraster::Surface ssrc = { src.px, src.w, src.h, src.stride };
+			swraster::simple_blit(sdst,
+			                      swraster::Rect{x0, y0, x1 - x0, y1 - y0},
+			                      ssrc,
+			                      swraster::Rect{sx0, sy0, x1 - x0, y1 - y0},
+			                      blend == KeepDestAlpha);
+			return;
+		}
+	}
+
+	const bool plainCopy = !smooth && blend == Replace &&
+	                       shade.gray == 0 && shade.r == 0 && shade.g == 0 &&
+	                       shade.b == 0 && shade.opacity == 1;
+
+	std::vector<Tap> cols, rows;
+	buildTaps(cols, x0, x1 - x0, pos.x, pos.w, tex.x, tex.w, src.w - 1, smooth);
+	buildTaps(rows, y0, y1 - y0, pos.y, pos.h, tex.y, tex.h, src.h - 1, smooth);
+
+	/* Raw pointers, not operator[]: the production build carries
+	 * -D_GLIBCXX_ASSERTIONS, so every indexed access is a live bounds check
+	 * inside the pixel loop. */
+	const Tap *colTap = cols.data();
+	const Tap *rowTap = rows.data();
+
+	for (int y = y0; y < y1; ++y)
+	{
+		const Tap &row = rowTap[y - y0];
+		const uint8_t *srow0 = src.px + (size_t)row.i0 * (size_t)src.stride;
+		const uint8_t *srow1 = src.px + (size_t)row.i1 * (size_t)src.stride;
+		uint8_t *drow = dst.px + (size_t)y * (size_t)dst.stride;
+
+		if (plainCopy)
+		{
+			for (int x = x0; x < x1; ++x)
+				std::memcpy(drow + (size_t)x * 4,
+				            srow0 + (size_t)colTap[x - x0].i0 * 4, 4);
+			continue;
+		}
+
+		for (int x = x0; x < x1; ++x)
+		{
+			const Tap &col = colTap[x - x0];
+			double frag[4];
+
+			if (!smooth)
+			{
+				const uint8_t *s = srow0 + (size_t)col.i0 * 4;
+
+				for (int ch = 0; ch < 4; ++ch)
+					frag[ch] = unit.v[s[ch]];
+			}
+			else
+			{
+				const uint8_t *p00 = srow0 + (size_t)col.i0 * 4;
+				const uint8_t *p01 = srow0 + (size_t)col.i1 * 4;
+				const uint8_t *p10 = srow1 + (size_t)col.i0 * 4;
+				const uint8_t *p11 = srow1 + (size_t)col.i1 * 4;
+
+				/* The last division in the loop, paid as a multiply: the
+				 * operand is an interpolated double, so no table can stand
+				 * in for it, and 1/255 is not representable, so kInv255
+				 * rounds differently from / 255.0 -- by +-1 on 66 of
+				 * 8,595,840 sampled outputs.
+				 * Every byte-valued path stays bit-exact through the table
+				 * above; only this stretched-background quad, one per
+				 * window, moves. */
+				for (int ch = 0; ch < 4; ++ch)
+				{
+					const double top = (double)p00[ch] * (1.0 - col.w)
+					                 + (double)p01[ch] * col.w;
+					const double bot = (double)p10[ch] * (1.0 - col.w)
+					                 + (double)p11[ch] * col.w;
+
+					frag[ch] = (top * (1.0 - row.w) + bot * row.w) * kInv255;
+				}
+			}
+
+			if (!sh.identity)
+				shadeFragment(frag, sh);
+
+			uint8_t *d = drow + (size_t)x * 4;
+
+			if (blend == Replace)
+			{
+				/* toByte clamps, so the separate GL clamp step below would
+				 * be redundant on this path. */
+				for (int ch = 0; ch < 4; ++ch)
+					d[ch] = toByte(frag[ch]);
+
+				continue;
+			}
+
+			/* GL clamps a fragment to 0..1 before blending it into a
+			 * fixed-point colour buffer. */
+			for (int ch = 0; ch < 4; ++ch)
+				frag[ch] = clamp01(frag[ch]);
+
+			const double sa = frag[3];
+
+			/* A fully transparent fragment leaves the destination exactly
+			 * as it was: src * 0 is zero (or -0, which adds as zero) and
+			 * dst/255 * 1 round-trips to dst for all 256 byte values --
+			 * checked exhaustively. Windowskin
+			 * frames are mostly transparent, so this skips real work. */
+			if (sa == 0.0)
+				continue;
+
+			const double da = unit.v[d[3]];
+
+			for (int ch = 0; ch < 3; ++ch)
+				d[ch] = toByte(frag[ch] * sa + unit.v[d[ch]] * (1.0 - sa));
+
+			/* BlendKeepDestAlpha writes GL_ZERO, GL_ONE for alpha. */
+			if (blend == Normal)
+				d[3] = toByte(sa + da * (1.0 - sa));
+		}
+	}
+}
+
+void checkBaseSize(int w, int h)
+{
+	const int maxSize = glState.caps.maxTexSize;
+
+	if (w > maxSize || h > maxSize)
+		throw Exception(Exception::MKXPError,
+		                "Texture dimensions [%d, %d] exceed hardware capabilities",
+		                w, h);
+}
+
+void allocBase(std::vector<uint8_t> &px, int w, int h)
+{
+	checkBaseSize(w, h);
+
+	/* checkBaseSize has bounded both dimensions by GL_MAX_TEXTURE_SIZE, so
+	 * this product cannot wrap even where size_t is 32 bits. */
+	const size_t bytes = (size_t) w * (size_t) h * 4;
+
+	try
+	{
+		px.assign(bytes, 0);
+	}
+	catch (const std::bad_alloc &)
+	{
+		throw Exception(Exception::MKXPError,
+		                "Failed to allocate a %dx%d window base (%u bytes)",
+		                w, h, (unsigned) bytes);
+	}
+	catch (const std::length_error &)
+	{
+		throw Exception(Exception::MKXPError,
+		                "Failed to allocate a %dx%d window base (%u bytes)",
+		                w, h, (unsigned) bytes);
+	}
+}
+
+} // namespace SoftBase
+
+#endif
 
 template<typename T>
 struct Sides
@@ -168,6 +543,12 @@ struct QuadChunk
 
 struct WindowPrivate
 {
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* Composition is deferred while the window is hidden, so the private
+	 * needs to ask the element whether it is. */
+	Window *const owner;
+#endif
+
 	Bitmap *windowskin;
 
 	Bitmap *contents;
@@ -203,6 +584,20 @@ struct WindowPrivate
 	/* Used when opacity < 255 */
 	TEXFBO baseTex;
 	bool useBaseTex;
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* THE base pixels. baseTex keeps its width/height and its texture id --
+	 * the texture is an upload-only sampling cache -- and baseTex.fbo stays 0
+	 * forever: no render target, no TexPool. */
+	std::vector<uint8_t> basePixels;
+
+	/* Back opacity currently baked into basePixels; -1 = nothing baked yet.
+	 * updateBaseAlpha() is also what Window::setOpacity goes through, and
+	 * plain opacity is applied to baseTexQuad at draw time, so it must not
+	 * drag a CPU compose plus a whole-level upload into every frame of a
+	 * window fade. */
+	int bakedBackOpacity;
+#endif
 
 	QuadChunk backgroundVert;
 
@@ -255,8 +650,14 @@ struct WindowPrivate
 
 	bool contentsVisible;
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	WindowPrivate(Window *owner, Viewport *viewport = 0)
+	    : owner(owner),
+	      windowskin(0),
+#else
 	WindowPrivate(Viewport *viewport = 0)
 	    : windowskin(0),
+#endif
 	      contents(0),
 	      realContents(0),
 	      bgStretch(true),
@@ -269,6 +670,9 @@ struct WindowPrivate
 	      baseVertDirty(true),
 	      opacityDirty(true),
 	      baseTexDirty(true),
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	      bakedBackOpacity(-1),
+#endif
 	      controlsElement(this, viewport),
 	      cursorAniAlphaIdx(0),
 	      pauseAniAlphaIdx(0),
@@ -287,7 +691,14 @@ struct WindowPrivate
 
 	~WindowPrivate()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* The only GL object a window owns is its sampling texture, and only
+		 * if it was ever composed. Nothing to give back to a pool. */
+		if (baseTex.tex != TEX::ID(0))
+			TEX::del(baseTex.tex);
+#else
 		shState->texPool().release(baseTex);
+#endif
 		cursorRectCon.disconnect();
 		prepareCon.disconnect();
 
@@ -440,11 +851,37 @@ struct WindowPrivate
 
 		baseTexQuad.setColor(Vec4(1, 1, 1, opacity.norm));
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* Only backOpacity is baked into the base; plain opacity rides on
+		 * baseTexQuad's vertex colour and needs no recompose. */
+		if (backOpacity != bakedBackOpacity)
+			baseTexDirty = true;
+#else
 		baseTexDirty = true;
+#endif
 	}
 
 	void ensureBaseTexReady()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* Stock refused an oversized base here, inside TexPool::request; say
+		 * so at the same moment, before anything composes. */
+		SoftBase::checkBaseSize(size.x, size.y);
+
+		/* The base is a CPU buffer sized exactly to the window; there is no
+		 * pool and no pow2 rounding, because the cost that matters is the
+		 * whole-level upload (about 1 ms + 13 ns/px) and not an allocation.
+		 * The texture itself is created by the first compose. */
+		if (baseTex.width == size.x && baseTex.height == size.y)
+			return;
+
+		baseTex.width = size.x;
+		baseTex.height = size.y;
+		basePixels.clear();
+		bakedBackOpacity = -1;
+		baseTexDirty = true;
+		return;
+#else
 		/* Make sure texture is big enough */
 		int newW = baseTex.width;
 		int newH = baseTex.height;
@@ -468,10 +905,119 @@ struct WindowPrivate
 		baseTex = shState->texPool().request(newW, newH);
 
 		baseTexDirty = true;
+#endif
 	}
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* One quad of the built baseQuadArray, read back as the rects the GPU
+	 * pass would have interpolated. Quad::setPosRect writes top-left,
+	 * top-right, bottom-right, bottom-left. */
+	static IntRect quadPos(const Vertex *v)
+	{
+		return IntRect((int)v[0].pos.x, (int)v[0].pos.y,
+		               (int)(v[1].pos.x - v[0].pos.x),
+		               (int)(v[3].pos.y - v[0].pos.y));
+	}
+
+	static IntRect quadTex(const Vertex *v)
+	{
+		return IntRect((int)v[0].texPos.x, (int)v[0].texPos.y,
+		               (int)(v[1].texPos.x - v[0].texPos.x),
+		               (int)(v[3].texPos.y - v[0].texPos.y));
+	}
+
+	/* CPU twin of redrawBaseTex(): the same quads, the same shader
+	 * (simpleAlpha, whose only effect is the per-vertex alpha that carries
+	 * backOpacity), the same two blend states, composed into basePixels and
+	 * uploaded whole-level. No framebuffer is bound and no pool is touched. */
+	void composeBaseTex()
+	{
+		if (nullOrDisposed(windowskin))
+			return;
+
+		/* Below 16x16 buildBaseVert() counts border quads that TileQuads
+		 * refuses to build, which shifts every later quad; stock draws the
+		 * stale slots. Compose nothing rather than that garbage. */
+		if (size.x < 16 || size.y < 16)
+			return;
+
+		SDL_Surface *skin = windowskin->surface();
+
+		if (!skin || skin->w <= 0 || skin->h <= 0)
+			return;
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::Scope profileCompose(FrameProfile::Compose);
+#endif
+		const SoftBase::Surface src = { (uint8_t*) skin->pixels,
+		                                skin->w, skin->h, skin->pitch };
+
+		SoftBase::allocBase(basePixels, baseTex.width, baseTex.height);
+
+		const SoftBase::Surface dst = { basePixels.data(), baseTex.width,
+		                                baseTex.height, baseTex.width * 4 };
+
+		const Vertex *vert = baseQuadArray.vertices.data();
+		const size_t quads = baseQuadArray.count();
+		size_t q = 0;
+
+		/* The background is drawn with blending off so its alpha survives
+		 * unmultiplied; the frame is drawn over it with BlendNormal. */
+		for (; q < quads && q < (size_t) backgroundVert.count; ++q)
+		{
+			SoftBase::Shade shade;
+			shade.opacity = vert[q*4].color.w;
+
+			SoftBase::drawQuad(dst, quadPos(&vert[q*4]), src, quadTex(&vert[q*4]),
+			                   shade, SoftBase::Replace, true);
+		}
+
+		for (; q < quads; ++q)
+		{
+			SoftBase::Shade shade;
+			shade.opacity = vert[q*4].color.w;
+
+			SoftBase::drawQuad(dst, quadPos(&vert[q*4]), src, quadTex(&vert[q*4]),
+			                   shade, SoftBase::Normal, true);
+		}
+
+		uploadBaseTex();
+		bakedBackOpacity = backOpacity;
+	}
+
+	/* Whole-level upload into a plain texture. Never attached to a
+	 * framebuffer, so it never owns one of the driver's render surfaces. */
+	void uploadBaseTex()
+	{
+		TEX::ScopedBinding binding;
+		if (baseTex.tex == TEX::ID(0))
+		{
+			baseTex.tex = TEX::gen();
+			if (baseTex.tex == TEX::ID(0))
+				throw TEX::UploadError();
+			TEX::bind(baseTex.tex);
+			TEX::setRepeat(false);
+			TEX::setSmooth(false);
+		}
+		else
+		{
+			TEX::bind(baseTex.tex);
+		}
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::Scope profileUpload(FrameProfile::Upload, 0, false, false);
+#endif
+		if (!TEX::uploadImageChecked(baseTex.width, baseTex.height, basePixels.data(), GL_RGBA))
+			throw TEX::UploadError();
+	}
+#endif
 
 	void redrawBaseTex()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		composeBaseTex();
+		return;
+#else
 		/* Discard old buffer */
 		TEX::bind(baseTex.tex);
 		TEX::allocEmpty(baseTex.width, baseTex.height);
@@ -510,6 +1056,7 @@ struct WindowPrivate
 		glState.blendMode.pop();
 		glState.viewport.pop();
 		TEX::setSmooth(false);
+#endif
 	}
 
 	void buildControlsVert()
@@ -567,6 +1114,9 @@ struct WindowPrivate
 
 	void prepare()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::WindowPrepare);
+#endif
 		if (size.x <= 0 || size.y <= 0)
 			return;
 
@@ -601,8 +1151,29 @@ struct WindowPrivate
 
 			if (baseTexDirty)
 			{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+				/* Composing costs real CPU and a whole-level upload, so a
+				 * hidden window keeps its dirty flag and is composed on the
+				 * frame it is revealed.
+				 *
+				 * opacity == 0 is the same bargain: the
+				 * base rides on baseTexQuad's vertex alpha, so at zero not
+				 * one composed pixel can reach the screen. Custom HUDs in
+				 * both XP and Ace set `self.opacity = 0` and keep the window
+				 * around for its contents. */
+				if (owner->getVisible() && opacity > 0)
+				{
+					try
+					{
+						redrawBaseTex();
+						baseTexDirty = false;
+					}
+					catch (const TEX::UploadError &) { /* Retry next prepare. */ }
+				}
+#else
 				redrawBaseTex();
 				baseTexDirty = false;
+#endif
 			}
 		}
 	}
@@ -622,6 +1193,15 @@ struct WindowPrivate
 
 		if (useBaseTex)
 		{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+			/* Nothing composed yet (the window was hidden when prepare ran,
+			 * has opacity 0, or has no windowskin): draw no base rather than
+			 * an untextured quad, and at opacity 0 do not draw a fully
+			 * transparent one either. The controls are a separate element
+			 * and still draw. */
+			if (baseTexDirty || baseTex.tex == TEX::ID(0) || opacity == 0)
+				return;
+#endif
 			shader.setTexSize(Vec2i(baseTex.width, baseTex.height));
 
 			TEX::bind(baseTex.tex);
@@ -739,7 +1319,11 @@ struct WindowPrivate
 Window::Window(Viewport *viewport)
 	: ViewportElement(viewport)
 {
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	p = new WindowPrivate(this, viewport);
+#else
 	p = new WindowPrivate(viewport);
+#endif
 	onGeometryChange(scene->getGeometry());
 }
 
@@ -778,6 +1362,25 @@ void Window::setWindowskin(Bitmap *value)
 	guardDisposed();
 
 	p->windowskin = value;
+
+	/* The base is painted from the windowskin, so a new skin invalidates it --
+	 * on both backends. Stock dirties the base in
+	 * buildBaseVert(), updateBaseAlpha() and ensureBaseTexReady() but never
+	 * here, and got away with it because updateBaseAlpha() re-renders on every
+	 * opacity change, which a message window does 48 times per fade: the stale
+	 * base was overwritten before anybody could look at it. A game that swaps
+	 * $game_system.windowskin_name without touching opacity or size -- RMXP's
+	 * own Window_Base#update does exactly that -- keeps the old skin on screen
+	 * for as long as opacity stays below 255, because below 255 the window
+	 * draws baseTex and not the quads. WindowVX::setWindowskin has always
+	 * dirtied here; this is that line, in its XP twin.
+	 *
+	 * Under MKXPZ_SOFTWARE_BITMAPS it is load-bearing rather than merely
+	 * correct: that backend re-composes only on a *back* opacity change, so nothing else would ever pick the new skin up, and a skin
+	 * assigned after a compose that bailed for want of one would never be
+	 * composed at all. An earlier change added the line under the option; this is the
+	 * same line with the option gone. */
+	p->baseTexDirty = true;
 
 	p->windowskinDispCon.disconnect();
 
@@ -949,6 +1552,9 @@ void Window::initDynAttribs()
 
 void Window::draw()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::OperationScope profileOperation(FrameProfile::WindowDraw);
+#endif
 	p->drawBase();
 }
 

@@ -19,6 +19,9 @@
 ** along with mkxp.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "frameprofile.h"
+#endif
 #include "tilemap.h"
 
 #include "viewport.h"
@@ -371,7 +374,11 @@ struct TilemapPrivate
 		tiles.aniIdx = 0;
 
 		/* Init tile buffers */
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		tiles.vbo = VBO::ID(0);
+#else
 		tiles.vbo = VBO::gen();
+#endif
 
 		GLMeta::vaoFillInVertexData<SVertex>(tiles.vao);
 		tiles.vao.vbo = tiles.vbo;
@@ -442,6 +449,9 @@ struct TilemapPrivate
 
 	void updateAutotileInfo()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::Autotile);
+#endif
 		/* Check if and which autotiles are animated */
 		std::vector<uint8_t> &usableATs = atlas.usableATs;
 		std::vector<uint8_t> &animatedATs = atlas.animatedATs;
@@ -531,10 +541,98 @@ struct TilemapPrivate
 
 		/* Aquire atlas tex */
 		shState->releaseAtlasTex(atlas.gl);
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		TEX::ScopedBinding binding;
+#endif
 		shState->requestAtlasTex(atlas.size.x, atlas.size.y, atlas.gl);
 
 		atlasDirty = true;
 	}
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* Assembles the atlas out of CPU pixels: no render target, no FBO bind,
+	 * no blit draws, one whole-level upload at the end.
+	 * Every rectangle below is the stock one -- compare the GL builder in
+	 * buildAtlas() line for line; only the mover changes. */
+	void buildAtlasCPU(const TileAtlas::BlitVec &blits)
+	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::Scope profileAtlas(FrameProfile::Compose);
+#endif
+		/* Zero-filled: the transparent-black FBO::clear() the GL path opens
+		 * with. */
+		SoftAtlas cpu(atlas.size.x, atlas.size.y);
+
+		/* Copy autotiles */
+		for (size_t i = 0; i < atlas.usableATs.size(); ++i)
+		{
+			const uint8_t atInd = atlas.usableATs[i];
+			Bitmap *autotile = autotiles[atInd];
+			autotile->ensureNonAnimated();
+
+			int atW = autotile->width();
+			int atH = autotile->height();
+			int blitW = std::min(atW, atAreaW);
+			int blitH = std::min(atH, autotileH);
+
+			if (autotile->hasHires()) {
+				Debug() << "BUG: High-res Tilemap blit autotiles not implemented";
+			}
+
+			SDL_Surface *atSurf = autotile->surface();
+
+			if (atW <= autotileW && tiles.animated && !atlas.smallATs[atInd])
+			{
+				/* Static autotile */
+				for (int j = 0; j < atFrames; ++j)
+					softAtlasBlit(cpu, atSurf, IntRect(0, 0, blitW, blitH),
+					              Vec2i(autotileW*j, atInd*autotileH));
+			}
+			else
+			{
+				/* Animated autotile */
+				if (atlas.smallATs[atInd])
+				{
+					int frames = atW/32;
+					for (int j = 0; j < atFrames*autotileH/32; ++j)
+					{
+						softAtlasBlit(cpu, atSurf, IntRect(32*(j % frames), 0, 32, 32),
+						              Vec2i(autotileW*(j % atFrames), atInd*autotileH + 32*(j / atFrames)));
+					}
+				}
+				else
+					softAtlasBlit(cpu, atSurf, IntRect(0, 0, blitW, blitH),
+					              Vec2i(0, atInd*autotileH));
+			}
+		}
+
+		/* Copy tileset. Stock needs three routes here -- a mega surface with
+		 * and without the broken-driver subimage fix, and a render-target
+		 * blit for a regular one -- because the pixels live in different
+		 * places. A CPU builder only ever sees pixels, so there is one. */
+		SDL_Surface *tsSurf = tileset->megaSurface();
+
+		if (!tsSurf)
+		{
+			if (tileset->hasHires()) {
+				Debug() << "BUG: High-res Tilemap regular tileset not implemented";
+			}
+
+			tsSurf = tileset->surface();
+		}
+
+		for (size_t i = 0; i < blits.size(); ++i)
+		{
+			const TileAtlas::Blit &blitOp = blits[i];
+
+			softAtlasBlit(cpu, tsSurf,
+			              IntRect(blitOp.src.x, blitOp.src.y, tsLaneW, blitOp.h),
+			              blitOp.dst);
+		}
+
+		softAtlasUpload(cpu, atlas.gl.tex);
+	}
+#endif
 
 	/* Assembles atlas from tileset and autotile bitmaps */
 	void buildAtlas()
@@ -544,6 +642,9 @@ struct TilemapPrivate
 
 		TileAtlas::BlitVec blits = TileAtlas::calcBlits(atlas.efTilesetH, atlas.size);
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		buildAtlasCPU(blits);
+#else
 		/* Clear atlas */
 		FBO::bind(atlas.gl.fbo);
 		glState.clearColor.pushSet(Vec4());
@@ -679,6 +780,7 @@ struct TilemapPrivate
 
 			GLMeta::blitEnd();
 		}
+#endif
 	}
 
 	int samplePriority(int tileInd)
@@ -806,6 +908,9 @@ struct TilemapPrivate
 
 	void buildQuadArray()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::TileVertices);
+#endif
 		clearQuadArrays();
 
 		int ox = viewpPos.x;
@@ -848,6 +953,9 @@ struct TilemapPrivate
 
 	void uploadBuffers()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::TileBuffers);
+#endif
 		/* Calculate total quad count */
 		size_t groundQuadCount = groundVert.size() / 4;
 		size_t quadCount = groundQuadCount;
@@ -860,6 +968,10 @@ struct TilemapPrivate
 
 		zlayerBases[zlayersMax] = quadCount;
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		replaceTileQuadBuffer(tiles.vbo, groundVert, zlayerVert, zlayersMax);
+		tiles.vao.vbo = tiles.vbo;
+#else
 		VBO::bind(tiles.vbo);
 		VBO::allocEmpty(quadDataSize(quadCount));
 
@@ -878,6 +990,7 @@ struct TilemapPrivate
 
 		/* Ensure global IBO size */
 		shState->ensureQuadIBO(quadCount);
+#endif
 	}
 
 	void bindShader(ShaderBase *&shaderVar)
@@ -1013,6 +1126,9 @@ struct TilemapPrivate
 
 	void updateMapViewport()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::MapViewport);
+#endif
 		const Vec2i combOrigin = origin + elem.sceneGeo.orig;
 		const Vec2i mvpPos = getTilePos(combOrigin);
 
@@ -1028,6 +1144,9 @@ struct TilemapPrivate
 
 	void prepare()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::XPPrepare);
+#endif
 		if (!verifyResources())
 		{
 			if (tilemapReady)
@@ -1037,7 +1156,11 @@ struct TilemapPrivate
 			return;
 		}
 
-		if (atlasSizeDirty)
+		if (atlasSizeDirty
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		    || atlas.gl.tex == TEX::ID(0)
+#endif
+		   )
 		{
 			allocateAtlas();
 			atlasSizeDirty = false;
@@ -1045,8 +1168,17 @@ struct TilemapPrivate
 
 		if (atlasDirty)
 		{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+			try
+			{
+				buildAtlas();
+				atlasDirty = false;
+			}
+			catch (const TEX::UploadError &) { return; }
+#else
 			buildAtlas();
 			atlasDirty = false;
+#endif
 		}
 
 		if (mapViewportDirty)
@@ -1092,6 +1224,13 @@ void GroundLayer::updateVboCount()
 
 void GroundLayer::draw()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::OperationScope profileOperation(FrameProfile::TileDraw);
+#endif
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	if (p->atlasDirty)
+		return;
+#endif
 	if (p->groundVert.size() == 0)
 		return;
 
@@ -1149,6 +1288,13 @@ void ZLayer::setIndex(int value)
 
 void ZLayer::draw()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::OperationScope profileOperation(FrameProfile::TileDraw);
+#endif
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	if (p->atlasDirty)
+		return;
+#endif
 	if (batchedFlag)
 		return;
 

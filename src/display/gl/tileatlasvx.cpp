@@ -257,6 +257,7 @@ createShadowSet()
 	return surf;
 }
 
+#ifndef MKXPZ_SOFTWARE_BITMAPS
 static void doBlit(Bitmap *bm, const IntRect &src, const Vec2i &dst)
 {
 	/* Translate tile to pixel units */
@@ -269,11 +270,84 @@ static void doBlit(Bitmap *bm, const IntRect &src, const Vec2i &dst)
 
 	GLMeta::blitRectangle(_src, _dst);
 }
+#else
+/* CPU twin of doBlit(): the same tile-to-pixel translation and the same clip
+ * against the source bitmap, then one REPLACE copy. */
+static void doBlitCPU(SoftAtlas &atlas, Bitmap *bm, SDL_Surface *surf,
+                      const IntRect &src, const Vec2i &dst)
+{
+	/* Translate tile to pixel units */
+	IntRect _src(src.x*32, src.y*32, src.w*32, src.h*32);
+	Vec2i _dst(dst.x*32, dst.y*32);
+	IntRect bmr(0, 0, bm->width(), bm->height());
+
+	if (!SDL_IntersectRect(&_src, &bmr, &_src))
+		return;
+
+	softAtlasBlit(atlas, surf, _src, _dst);
+}
+
+/* Assembles the VX/Ace atlas out of CPU pixels: no render target, no blit
+ * draws, no sub-rect upload, one whole-level upload at the end. The atlas is
+ * ATLASVX_W x ATLASVX_H and every rectangle is the stock one, so the readers
+ * in readTiles() below are untouched. */
+static void buildCPU(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
+{
+	/* enableHires needs a second, larger atlas and a scaled copy of every
+	 * blit. The software backend does not implement it anywhere, so refuse rather than quietly build a wrong atlas. */
+	assert(tf.selfHires == nullptr);
+
+	/* Zero-filled: the transparent-black FBO::clear() the GL path opens
+	 * with. */
+	SoftAtlas atlas(tf.width, tf.height);
+
+	if (rgssVer >= 3)
+	{
+		SDL_Surface *shadow = createShadowSet();
+
+		softAtlasBlit(atlas, shadow, IntRect(0, 0, shadow->w, shadow->h),
+		              Vec2i(shadowArea.x*32, shadowArea.y*32));
+
+		SDL_FreeSurface(shadow);
+	}
+
+	Bitmap *bm;
+
+#define EXEC_BLITS(part) \
+	if (!nullOrDisposed(bm = bitmaps[BM_##part])) \
+	{ \
+		SDL_Surface *surf = bm->surface(); \
+		for (size_t i = 0; i < blits##part##N; ++i) \
+		{\
+			const IntRect &src = blits##part[i].src; \
+			const Vec2i &dst = blits##part[i].dst; \
+			doBlitCPU(atlas, bm, surf, src, dst); \
+		} \
+	}
+
+	EXEC_BLITS(A1);
+	EXEC_BLITS(A2);
+	EXEC_BLITS(A3);
+	EXEC_BLITS(A4);
+	EXEC_BLITS(A5);
+	EXEC_BLITS(B);
+	EXEC_BLITS(C);
+	EXEC_BLITS(D);
+	EXEC_BLITS(E);
+
+#undef EXEC_BLITS
+
+	softAtlasUpload(atlas, tf.tex);
+}
+#endif
 
 void build(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
 {
 	assert(tf.width == ATLASVX_W && tf.height == ATLASVX_H);
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	buildCPU(tf, bitmaps);
+#else
 	GLMeta::blitBegin(tf, true);
 
 	glState.clearColor.pushSet(Vec4());
@@ -338,6 +412,7 @@ void build(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
 #undef EXEC_BLITS
 
 	GLMeta::blitEnd();
+#endif
 }
 
 #define OVER_PLAYER_FLAG (1 << 4)

@@ -22,6 +22,9 @@
 #ifndef TILEMAPCOMMON_H
 #define TILEMAPCOMMON_H
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "frameprofile.h"
+#endif
 #include "table.h"
 #include "gl-util.h"
 #include "gl-meta.h"
@@ -31,6 +34,7 @@
 #include "shader.h"
 #include "vertex.h"
 #include "quad.h"
+#include "quadarray.h"
 #include "etc-internal.h"
 
 #include <stdint.h>
@@ -38,6 +42,110 @@
 #include <vector>
 
 #include "sigslot/signal.hpp"
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+#include <string.h>
+#include <SDL_surface.h>
+
+/* CPU tile atlas.
+ *
+ * Render surfaces are a small fixed budget per process, first come first
+ * served. A tile
+ * atlas is created on the first map load -- the latest possible moment, when
+ * the pool is emptiest -- so it cannot be one. With CPU-authoritative Bitmaps
+ * every atlas source already has its pixels in client memory, so
+ * the atlas is assembled here with row memcpys and handed to the driver as a
+ * single WHOLE-LEVEL upload. Never a sub-rect: a sub-rect update of a live
+ * texture stalls 16 ms on this driver, a whole level costs 1 ms + 13 ns/px.
+ *
+ * The atlas dimensions and every blit rectangle are the stock ones; only the
+ * machinery that moves the pixels changes, so the vertex/texcoord code that
+ * reads the atlas is untouched. */
+struct SoftAtlas
+{
+	/* RGBA8888, tightly packed (pitch == w*4), row 0 on top. Zero-filled on
+	 * construction, which is the transparent-black FBO::clear() that both
+	 * stock atlas builders open with. */
+	std::vector<uint8_t> px;
+	int w, h;
+
+	SoftAtlas(int width, int height)
+	    : px((size_t)(width > 0 ? width : 0) * (size_t)(height > 0 ? height : 0) * 4, 0),
+	      w(width > 0 ? width : 0),
+	      h(height > 0 ? height : 0)
+	{}
+};
+
+/* One 1:1 REPLACE copy: the CPU twin of
+ *     GLMeta::blitSource(src); GLMeta::blitRectangle(srcRect, dstPos);
+ * Both stock builders blit with blending disabled (gl-meta.cpp, blitRectangle
+ * does glState.blend.pushSet(false)), so the destination is overwritten,
+ * alpha included -- not composited.
+ *
+ * srcRect is clipped to the source surface and dstPos moves with it; the
+ * result is then clipped to the atlas. Sampling outside the source is the one
+ * place this differs from the GL path, which would clamp to the edge texel;
+ * clipping is what every caller here actually means, and no shipped tileset
+ * reaches the difference (every rect is derived from the source's own size).
+ */
+static inline void
+softAtlasBlit(SoftAtlas &dst, const SDL_Surface *src,
+              IntRect s, Vec2i d)
+{
+	if (!src || s.w <= 0 || s.h <= 0)
+		return;
+
+	assert(src->format->BytesPerPixel == 4);
+
+	/* Clip against the source; the copy is 1:1, so the destination origin
+	 * moves by exactly what the source origin lost. */
+	if (s.x < 0) { d.x -= s.x; s.w += s.x; s.x = 0; }
+	if (s.y < 0) { d.y -= s.y; s.h += s.y; s.y = 0; }
+	if (s.x + s.w > src->w) s.w = src->w - s.x;
+	if (s.y + s.h > src->h) s.h = src->h - s.y;
+
+	/* Clip against the atlas. */
+	if (d.x < 0) { s.x -= d.x; s.w += d.x; d.x = 0; }
+	if (d.y < 0) { s.y -= d.y; s.h += d.y; d.y = 0; }
+	if (d.x + s.w > dst.w) s.w = dst.w - d.x;
+	if (d.y + s.h > dst.h) s.h = dst.h - d.y;
+
+	if (s.w <= 0 || s.h <= 0)
+		return;
+
+	const uint8_t *sp = (const uint8_t *)src->pixels
+	                  + (size_t)s.y * (size_t)src->pitch + (size_t)s.x * 4;
+	uint8_t *dp = &dst.px[((size_t)d.y * (size_t)dst.w + (size_t)d.x) * 4];
+	const size_t bytes = (size_t)s.w * 4;
+
+	for (int y = 0; y < s.h; ++y)
+	{
+		memcpy(dp, sp, bytes);
+		sp += src->pitch;
+		dp += (size_t)dst.w * 4;
+	}
+}
+
+/* Hand a finished CPU atlas to the driver: one whole-level TexImage2D, and
+ * the texture binding is left exactly as it was found, because both builders
+ * run from prepareDraw, in the middle of everybody else's GL state. */
+static inline void
+softAtlasUpload(const SoftAtlas &atlas, TEX::ID tex)
+{
+	if (atlas.w <= 0 || atlas.h <= 0)
+		return;
+
+	TEX::ScopedBinding binding;
+	if (tex == TEX::ID(0))
+		throw TEX::UploadError();
+	TEX::bind(tex);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::Scope profileUpload(FrameProfile::Upload, 0, false, false);
+#endif
+	if (!TEX::uploadImageChecked(atlas.w, atlas.h, atlas.px.data(), GL_RGBA))
+		throw TEX::UploadError();
+}
+#endif /* MKXPZ_SOFTWARE_BITMAPS */
 
 static inline int
 wrap(int value, int range)
@@ -117,7 +225,11 @@ struct FlashMap
 	      data(0),
 	      allocQuads(0)
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		vao.vbo = VBO::ID(0);
+#else
 		vao.vbo = VBO::gen();
+#endif
 		vao.ibo = shState->globalIBO().ibo;
 		GLMeta::vaoFillInVertexData<CVertex>(vao);
 
@@ -222,10 +334,18 @@ private:
 
 	void rebuildBuffer()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::Flash);
+#endif
 		vertices.clear();
 
 		if (!data)
+		{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+			replaceTileQuadBuffer(vao.vbo, vertices);
+#endif
 			return;
+		}
 
 		for (int x = 0; x < viewp.w; ++x)
 			for (int y = 0; y < viewp.h; ++y)
@@ -245,6 +365,9 @@ private:
 					vertices.push_back(v[i]);
 			}
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		replaceTileQuadBuffer(vao.vbo, vertices);
+#else
 		if (vertices.size() == 0)
 			return;
 
@@ -262,6 +385,7 @@ private:
 
 		/* Ensure global IBO size */
 		shState->ensureQuadIBO(quadCount());
+#endif
 	}
 
 	bool dirty;

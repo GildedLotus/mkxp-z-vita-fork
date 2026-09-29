@@ -19,6 +19,9 @@
 ** along with mkxp.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include "frameprofile.h"
+#endif
 #include "windowvx.h"
 
 #include "bitmap.h"
@@ -35,6 +38,19 @@
 #include <limits>
 #include <algorithm>
 #include "sigslot/signal.hpp"
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+/* CPU-composed window base: base.tex stops being a render
+ * target and becomes an upload-only sampling cache for a buffer composed from
+ * the windowskin's CPU pixels. window.h carries the shared model of the
+ * fragment pipeline the two prerender passes use -- sampling, shading and
+ * blending -- so Window and WindowVX compose through one implementation. */
+#include "window.h"
+
+#include <SDL_surface.h>
+
+#include <vector>
+#endif
 
 #define DEF_Z         (rgssVer >= 3 ? 100 :   0)
 #define DEF_PADDING   (rgssVer >= 3 ?  12 :  16)
@@ -150,6 +166,12 @@ static elementsN(pauseQuad);
 
 struct WindowVXPrivate
 {
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* Composition is deferred while the window is hidden or closed, so the
+	 * private needs to ask the element whether it is. */
+	WindowVX *const owner;
+#endif
+
 	Bitmap *windowskin;
 
 	Bitmap *contents;
@@ -192,7 +214,30 @@ struct WindowVXPrivate
 
 	struct
 	{
+		/* Under MKXPZ_SOFTWARE_BITMAPS 'tex' keeps its texture id and its
+		 * width/height -- both are what draw() needs -- while tex.fbo stays 0
+		 * forever: the texture is an upload-only sampling cache for 'pixels',
+		 * never a render target and never a TexPool loan. */
 		TEXFBO tex;
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* THE base pixels, tex.width x tex.height, RGBA8888. */
+		std::vector<uint8_t> pixels;
+
+		/* The tone those pixels were composed with, and whether they were
+		 * composed at all. RGSS3's Window_Base#update
+		 * runs `self.tone.set($game_system.window_tone)` on every window on
+		 * every frame, and Tone::set / Tone::operator= fire valueChanged
+		 * unconditionally -- there is no equality check anywhere between the
+		 * script and invalidateBaseTex. Without this memo every visible open
+		 * window re-composes on the CPU and re-uploads a whole texture level
+		 * sixty times a second, which is 50-135 ms per message window on the
+		 * device. Window (XP) already memoises its one baked attribute the
+		 * same way, in bakedBackOpacity; back opacity needs no twin here
+		 * because WindowVX::setBackOpacity already compares before it
+		 * dirties. */
+		Vec4 bakedTone;
+		bool bakedValid;
+#endif
 		ColorQuadArray vert;
 		size_t bgTileQuads;
 		size_t borderQuads;
@@ -227,8 +272,14 @@ struct WindowVXPrivate
 	Vec2i sceneOffset;
 	bool contentsVisible;
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	WindowVXPrivate(WindowVX *owner, int x, int y, int w, int h)
+	    : owner(owner),
+	      windowskin(0),
+#else
 	WindowVXPrivate(int x, int y, int w, int h)
 	    : windowskin(0),
+#endif
 	      contents(0),
 	      realContents(0),
 	      cursorRect(&tmp.rect),
@@ -262,6 +313,16 @@ struct WindowVXPrivate
 		base.texSizeDirty = false;
 		base.texDirty = false;
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* Stock leaves these to rebuildBaseVert(), which every path that
+		 * gives the window a size runs first; composeBase() reads them, so
+		 * give them a defined value rather than rely on that. */
+		base.bgTileQuads = 0;
+		base.borderQuads = 0;
+
+		base.bakedValid = false;
+#endif
+
 		if (w > 0 || h > 0)
 		{
 			base.vertDirty = true;
@@ -280,7 +341,14 @@ struct WindowVXPrivate
 
 	~WindowVXPrivate()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* The only GL object a window owns is its sampling texture, and only
+		 * if it was ever composed. Nothing to give back to a pool. */
+		if (base.tex.tex != TEX::ID(0))
+			TEX::del(base.tex.tex);
+#else
 		shState->texPool().release(base.tex);
+#endif
 
 		cursorRectCon.disconnect();
 		toneCon.disconnect();
@@ -344,6 +412,19 @@ struct WindowVXPrivate
 
 	void invalidateBaseTex()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* The only subscriber of this slot is the tone's valueChanged, and
+		 * RGSS3 re-sets the tone every frame with the value it already has
+		 * Composing what is already composed costs a
+		 * whole window's worth of CPU fragments and a whole-level upload, so
+		 * ignore a signal that carries no change. This only ever declines to
+		 * *set* the flag: a dirty base stays dirty, and every other path --
+		 * geometry, skin, back opacity, a size change -- writes texDirty
+		 * directly and is unaffected. */
+		if (base.bakedValid && tone->norm == base.bakedTone)
+			return;
+#endif
+
 		base.texDirty = true;
 	}
 
@@ -359,10 +440,44 @@ struct WindowVXPrivate
 		toneCon.disconnect();
 		toneCon = tone->valueChanged.connect
 			(&WindowVXPrivate::invalidateBaseTex, this);
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* A different Tone object: whatever is baked was baked against the
+		 * old one, so the memo may no longer speak for it. */
+		base.bakedValid = false;
+#endif
 	}
 
 	void updateBaseTexSize()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* Stock refused an oversized base here, inside TexPool::request; say
+		 * so at the same moment, before anything composes. */
+		SoftBase::checkBaseSize(geo.w, geo.h);
+
+		/* The base is a CPU buffer sized exactly to the window: no pool, no
+		 * spare margin, because the cost that matters is the whole-level
+		 * upload (about 1 ms + 13 ns/px). The texture
+		 * itself is created by the first compose, so a window that is never
+		 * revealed creates no GL object at all. */
+		if (base.tex.width == geo.w && base.tex.height == geo.h)
+			return;
+
+		base.tex.width = geo.w;
+		base.tex.height = geo.h;
+		base.pixels.clear();
+		base.bakedValid = false;
+
+		if (geo.w == 0 || geo.h == 0)
+		{
+			if (base.tex.tex != TEX::ID(0))
+				TEX::del(base.tex.tex);
+
+			base.tex.tex = TEX::ID(0);
+		}
+
+		return;
+#else
 		if (base.tex.width >= geo.w && base.tex.height >= geo.h)
 			return;
 
@@ -381,6 +496,7 @@ struct WindowVXPrivate
 		base.tex = shState->texPool().request(geo.w, geo.h);
 		TEX::bind(base.tex.tex);
 		TEX::setSmooth(true);
+#endif
 	}
 
 	void rebuildBaseVert()
@@ -462,8 +578,171 @@ struct WindowVXPrivate
 		base.vert.commit();
 	}
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* One quad of the built base.vert, read back as the rects the GPU pass
+	 * would have interpolated. Quad::setPosRect writes top-left, top-right,
+	 * bottom-right, bottom-left. */
+	static IntRect quadPos(const Vertex *v)
+	{
+		return IntRect((int)v[0].pos.x, (int)v[0].pos.y,
+		               (int)(v[1].pos.x - v[0].pos.x),
+		               (int)(v[3].pos.y - v[0].pos.y));
+	}
+
+	static IntRect quadTex(const Vertex *v)
+	{
+		return IntRect((int)v[0].texPos.x, (int)v[0].texPos.y,
+		               (int)(v[1].texPos.x - v[0].texPos.x),
+		               (int)(v[3].texPos.y - v[0].texPos.y));
+	}
+
+	/* CPU twin of redrawBaseTex(): the same quads out of base.vert, the same
+	 * shader selection, the same three blend states, composed into
+	 * base.pixels and uploaded whole-level. No framebuffer is bound and no
+	 * pool is touched.
+	 *
+	 * Baked here: the windowskin, the geometry, the tone and the back
+	 * opacity -- exactly what redrawBaseTex() bakes, because both are applied
+	 * by the plane shader to the two background layers only. Applied at draw
+	 * time and therefore *not* baked: 'opacity' (base.quad's vertex colour)
+	 * and 'openness' (base.quad's position rect). */
+	void composeBase()
+	{
+		if (nullOrDisposed(windowskin))
+			return;
+
+		/* At four pixels or less rebuildBaseVert() counts background quads
+		 * that TileQuads refuses to build, which shifts every later quad;
+		 * stock draws the stale slots. Compose nothing rather than that. */
+		if (geo.w <= 4 || geo.h <= 4)
+			return;
+
+		SDL_Surface *skin = windowskin->surface();
+
+		if (!skin || skin->w <= 0 || skin->h <= 0)
+			return;
+
+		if (base.vert.count() == 0)
+			return;
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::Scope profileCompose(FrameProfile::Compose);
+#endif
+		const SoftBase::Surface src = { (uint8_t*) skin->pixels,
+		                                skin->w, skin->h, skin->pitch };
+
+		SoftBase::allocBase(base.pixels, base.tex.width, base.tex.height);
+
+		const SoftBase::Surface dst = { base.pixels.data(), base.tex.width,
+		                                base.tex.height, base.tex.width * 4 };
+
+		/* redrawBaseTex() picks the plane shader for the background layers
+		 * when either tone or back opacity has an effect, and the simple
+		 * shader otherwise; the frame is always drawn with the simple one. */
+		SoftBase::Shade shade;
+
+		if (backOpacity < 255 || tone->hasEffect())
+		{
+			shade.r = tone->norm.x;
+			shade.g = tone->norm.y;
+			shade.b = tone->norm.z;
+			shade.gray = tone->norm.w;
+			shade.opacity = backOpacity.norm;
+		}
+
+		const Vertex *vert = base.vert.vertices.data();
+		const size_t quads = base.vert.count();
+		size_t q = 0;
+
+		/* Stretched layer: blending off, so it replaces the cleared base. */
+		if (q < quads)
+		{
+			SoftBase::drawQuad(dst, quadPos(&vert[q*4]), src, quadTex(&vert[q*4]),
+			                   shade, SoftBase::Replace, true);
+			++q;
+		}
+
+		/* Tiled layer: BlendKeepDestAlpha over the stretched one. */
+		for (size_t i = 0; i < base.bgTileQuads && q < quads; ++i, ++q)
+			SoftBase::drawQuad(dst, quadPos(&vert[q*4]), src, quadTex(&vert[q*4]),
+			                   shade, SoftBase::KeepDestAlpha, true);
+
+		/* Frame: BlendNormal, and never the plane shader -- corners and edges
+		 * carry neither the tone nor the back opacity. */
+		for (size_t i = 0; i < base.borderQuads && q < quads; ++i, ++q)
+			SoftBase::drawQuad(dst, quadPos(&vert[q*4]), src, quadTex(&vert[q*4]),
+			                   SoftBase::Shade(), SoftBase::Normal, true);
+
+		uploadBase();
+
+		/* What is in the texture now, so the next no-op tone signal can be
+		 * ignored. Set only here, after a compose that
+		 * actually ran: every early return above leaves bakedValid alone, so
+		 * a base that was never composed can never be mistaken for one. */
+		base.bakedTone = tone->norm;
+		base.bakedValid = true;
+	}
+
+	/* Whole-level upload into a plain texture. Never attached to a
+	 * framebuffer, so it never owns one of the driver's render surfaces.
+	 * base.quad samples it with GL_LINEAR, as the pooled one was. */
+	void uploadBase()
+	{
+		TEX::ScopedBinding binding;
+		if (base.tex.tex == TEX::ID(0))
+		{
+			base.tex.tex = TEX::gen();
+			if (base.tex.tex == TEX::ID(0))
+				throw TEX::UploadError();
+			TEX::bind(base.tex.tex);
+			TEX::setRepeat(false);
+			TEX::setSmooth(true);
+		}
+		else
+		{
+			TEX::bind(base.tex.tex);
+		}
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::Scope profileUpload(FrameProfile::Upload, 0, false, false);
+#endif
+		if (!TEX::uploadImageChecked(base.tex.width, base.tex.height, base.pixels.data(), GL_RGBA))
+			throw TEX::UploadError();
+	}
+
+	/* Stock inlines this in draw(); here it has to tolerate a base that has
+	 * not been composed yet, and draw no base rather than an untextured quad
+	 * (the cursor, the arrows and the contents still draw). */
+	void drawBaseQuad(const Vec2i &trans, SimpleAlphaShader &shader)
+	{
+		/* Before any early return, because the scroll arrows and the pause
+		 * sign ride on this translation: stock set it for the base quad and
+		 * drew the control quads under it without setting their own, and
+		 * simpleAlpha is shared, so leaving it unset lands them wherever the
+		 * previously drawn window's contents were. With
+		 * an absent base now a routine state rather than a degenerate one --
+		 * a hidden, closed or fully transparent window -- that is every
+		 * frame of a window whose base is skipped. */
+		shader.setTranslation(trans);
+
+		/* opacity is base.quad's vertex alpha, so at zero the quad is a
+		 * no-op draw of a texture nothing can see. */
+		if (base.texDirty || base.tex.tex == TEX::ID(0) || opacity == 0)
+			return;
+
+		shader.setTexSize(Vec2i(base.tex.width, base.tex.height));
+
+		TEX::bind(base.tex.tex);
+		base.quad.draw();
+	}
+#endif
+
 	void redrawBaseTex()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		composeBase();
+		return;
+#else
 		if (nullOrDisposed(windowskin))
 			return;
 
@@ -534,6 +813,7 @@ struct WindowVXPrivate
 		glState.blendMode.pop();
 		glState.blend.pop();
 		glState.viewport.pop();
+#endif
 	}
 
 	void updateBaseQuad()
@@ -726,6 +1006,9 @@ struct WindowVXPrivate
 
 	void prepare()
 	{
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::OperationScope profileOperation(FrameProfile::WindowPrepare);
+#endif
 		if (base.vertDirty)
 		{
 			rebuildBaseVert();
@@ -742,8 +1025,31 @@ struct WindowVXPrivate
 
 		if (base.texDirty)
 		{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+			/* Composing costs real CPU and a whole-level upload, so a hidden
+			 * or fully closed window keeps its dirty flag and is composed on
+			 * the frame it is revealed. Scene_Map alone
+			 * creates several of these before the first frame.
+			 *
+			 * opacity == 0 joins them: it is base.quad's
+			 * vertex alpha, so no composed pixel can reach the screen. Stock
+			 * Ace keeps three of these permanently alive -- Window_MapName
+			 * (on every map), Window_BattleLog, and the full-screen
+			 * Window_ScrollText -- besides every custom HUD that sets
+			 * `self.opacity = 0` to keep only the contents. */
+			if (owner->getVisible() && openness > 0 && opacity > 0)
+			{
+				try
+				{
+					redrawBaseTex();
+					base.texDirty = false;
+				}
+				catch (const TEX::UploadError &) { /* Retry next prepare. */ }
+			}
+#else
 			redrawBaseTex();
 			base.texDirty = false;
+#endif
 		}
 
 		if (clipRectDirty)
@@ -783,8 +1089,17 @@ struct WindowVXPrivate
 
 	void draw()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* Stock uses "no base texture" to mean "zero-size window". Here the
+		 * texture is also absent until the first compose, which is deferred
+		 * while the window is hidden or closed, so ask about the geometry
+		 * directly and let the contents draw either way. */
+		if (geo.w == 0 || geo.h == 0)
+			return;
+#else
 		if (base.tex.tex == TEX::ID(0))
 			return;
+#endif
 
 		bool windowskinValid = !nullOrDisposed(windowskin);
 		bool contentsValid = !nullOrDisposed(contents) && contentsVisible;
@@ -797,11 +1112,15 @@ struct WindowVXPrivate
 
 		if (windowskinValid)
 		{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+			drawBaseQuad(trans, shader);
+#else
 			shader.setTranslation(trans);
 			shader.setTexSize(Vec2i(base.tex.width, base.tex.height));
 
 			TEX::bind(base.tex.tex);
 			base.quad.draw();
+#endif
 
 			if (openness < 255)
 				return;
@@ -876,14 +1195,22 @@ struct WindowVXPrivate
 WindowVX::WindowVX(Viewport *viewport)
     : ViewportElement(viewport, DEF_Z, DEF_SPRITE_Y)
 {
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	p = new WindowVXPrivate(this, 0, 0, 0, 0);
+#else
 	p = new WindowVXPrivate(0, 0, 0, 0);
+#endif
 	onGeometryChange(scene->getGeometry());
 }
 
 WindowVX::WindowVX(int x, int y, int width, int height)
     : ViewportElement(0, DEF_Z, DEF_SPRITE_Y)
 {
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	p = new WindowVXPrivate(this, x, y, width, height);
+#else
 	p = new WindowVXPrivate(x, y, width, height);
+#endif
 	onGeometryChange(scene->getGeometry());
 }
 
@@ -1187,6 +1514,9 @@ void WindowVX::initDynAttribs()
 
 void WindowVX::draw()
 {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+	FrameProfile::OperationScope profileOperation(FrameProfile::WindowDraw);
+#endif
 	p->draw();
 }
 
