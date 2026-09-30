@@ -457,7 +457,7 @@ is the one the Vita build changes, and the row says so; the
 | `postloadScript` | array of string | `[]` | — |
 | `RTP` | array of string | `[]` | — |
 | `patches` | array of string | `[]` | — |
-| `fontSub` | array of string | `[]` | the four fallback maps |
+| `fontSub` | array of string | `[]` | `[]` (the player's built-in fallback table applies) |
 | `fontScale` | float | `0.0` | — |
 | `fontKerning` | bool | `true` | `true` |
 | `fontHinting` | int | `3` | — |

@@ -28,7 +28,7 @@ checked, is in [COMPATIBILITY.md](COMPATIBILITY.md).
 | A PS Vita running homebrew | Only ever run on a **retail PS Vita**. No firmware version is recorded and no PS TV run has been made: treat both as untested. |
 | VitaShell | Installs the VPK and, in USB mode, copies game files (see [§6](#6-copying-files-use-vitashell-usb-not-ftp)). |
 | libshacccg (optional) | The VPK ships precompiled shader binaries, so a player needs nothing else. A shader that is not in the shipped set (a modified build) is compiled on the device and needs Sony's `libshacccg.suprx`, which is not distributed here. |
-| Free space on `ux0:` | About 45 MB installed (the VPK itself is about 12 MB). Games and RTPs come on top. |
+| Free space on `ux0:` | About 23 MB installed (the 1.0.0 VPK is 12.6 MB and unpacks to 23.2 MB). Games and RTPs come on top. |
 | A host computer | To build the player and to extract an RTP (macOS or Linux with VitaSDK). |
 
 ## 2. Build and install the player
@@ -151,13 +151,16 @@ like an engine bug. FTP is fine for pulling logs off the device afterwards.
   re-saves through the desktop build, structurally identical both ways. A round
   trip through the original Windows RGSS runtime is still open.
 - **Standby/resume.** The system posts no notification on suspend, so the engine
-  detects it from clock gaps and repairs timers, audio, file descriptors and the
-  stdio streams. Verified on hardware on this vitaGL build with two consecutive
-  standbys: the log, the BGM and BGS streams and stdout recover, and a map load
-  and a save both work after waking. The storage tested was an SD2Vita adapter
-  (the card mounted as `ux0:` through StorageMgr), which remounts on wake and
-  leaves every file handle held across the standby stale; the player reopens
-  them. The official Sony memory card was not re-tested on this build.
+  detects it from clock gaps and repairs timers, audio, and the handles it opens
+  itself: the log, the stdio streams and its PhysFS read handles (music streams,
+  fonts, archive entries). Verified on hardware on this vitaGL build with two
+  consecutive standbys: the log, the BGM and BGS streams and stdout recover, and
+  a map load and a save both work after waking. The storage tested was an SD2Vita
+  adapter (the card mounted as `ux0:` through StorageMgr), which remounts on wake
+  and leaves every file handle held across the standby stale (writes fail with
+  ENODEV). **Ruby `File` handles a game keeps open across a standby are not
+  repaired**; a script that holds one must reopen it after waking. The official
+  Sony memory card was not re-tested on this build.
 - **Performance.** Title, map and menu scenes hold 16.7 ms (VX, VX Ace) and 25 ms
   (XP) frame budgets on the games profiled so far; the visible costs are scene
   transitions such as loading a save. Script-heavy games are expected to be slower:
@@ -193,7 +196,9 @@ Default controls, over the Vita pad:
 | L / R | L / R |
 | D-pad, left stick | directions |
 
-Start (or F1) opens an in-game binding menu. A stored binding file under
+Start (or F1) opens an in-game binding menu, and Select toggles the FPS counter.
+Holding Start and Select together for two seconds quits the game cleanly (back to
+the launcher when it was started from there). A stored binding file under
 `ux0:/data/mkxp-z/mkxp-z/` silently overrides these defaults; delete it if a
 control does not match the table above.
 
@@ -236,7 +241,7 @@ Use a macOS or Unix host with VitaSDK and its port libraries installed
 (`vita/scripts/vita-env.sh` finds `$HOME/vitasdk` or `/usr/local/vitasdk`;
 otherwise set `VITASDK`). Host tools: a native C/C++ compiler, Git, Make, GNU
 Bison 3+, Autoconf, CMake, Meson, Ninja, Python 3, pkg-config, curl, patch,
-tar, unzip and xxd. Install these VitaSDK packages first with `vdpm install`:
+shasum, tar, unzip and xxd. Install these VitaSDK packages first with `vdpm install`:
 `sdl2` (the stock package; the build links its own vitaGL-backed SDL2 instead),
 `sdl2_image`, `sdl2_ttf`, `freetype`, `libpng`, `zlib`, `physfs`, `libogg` and
 `libvorbis`. `sdl2_image` and `sdl2_ttf` pull in libjpeg-turbo, libwebp,

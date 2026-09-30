@@ -266,8 +266,8 @@ The two `vita-gpu:` lines are the sync-object gate. A launcher-started boot has
 to report the same numbers as a pinned direct boot of the *same ELF*: the port
 reserves its render surfaces at boot, and a hand-over must leave the same
 budget.
-The headroom line only exists when `ux0:/data/mkxp-z/gpu-telemetry.enabled`
-is on the card.
+The headroom line only exists when `ux0:/data/mkxp-z/gpu-headroom.enabled` is
+on the card; that is a separate marker, and `gpu-telemetry.enabled` does not turn it on.
 
 ## Preflight sidecar
 
