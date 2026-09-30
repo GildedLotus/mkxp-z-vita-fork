@@ -77,9 +77,16 @@ mode_t umask(mode_t mask) { (void)mask; return 0; }
 
 /* dup2: Vita newlib has dup/close/open/fcntl but not dup2. MRI uses dup2
  * unconditionally in ruby_sysinit/pipe paths even when configure says no.
- * F_DUPFD cannot land on an occupied slot, so newfd has to be closed; oldfd
- * is duplicated first, which proves it valid (a bad oldfd fails with newfd
- * untouched, as POSIX requires) and keeps the file open across the close. */
+ * F_DUPFD returns exactly newfd when that slot is free, which is the common
+ * case and needs no close at all, so it cannot race. Only replacing an
+ * OCCUPIED newfd is a close followed by a duplicate, and newlib offers no
+ * lock that makes the pair atomic: that path is for MRI's single-threaded
+ * startup and redirection, where the caller owns newfd. If another thread
+ * takes the slot in between, the shim fails with EBUSY (an error POSIX
+ * allows dup2) and never claims a neighbouring descriptor. oldfd is
+ * duplicated first, which proves it valid (a bad oldfd fails with newfd
+ * untouched, as POSIX requires) and keeps the file open across the close.
+ * An out-of-range newfd is EBADF, as for dup2, not F_DUPFD's EINVAL. */
 int dup2(int oldfd, int newfd) {
   int held, r, err;
   if (newfd < 0) {
@@ -94,17 +101,30 @@ int dup2(int oldfd, int newfd) {
       close(held);
     return newfd;
   }
+  r = fcntl(held, F_DUPFD, newfd);
+  err = errno;
+  if (r == newfd) {
+    close(held);
+    return newfd;
+  }
+  if (r >= 0) {
+    close(r);
+  } else if (err != EMFILE) {
+    close(held);
+    errno = err == EINVAL ? EBADF : err;
+    return -1;
+  }
   close(newfd);
   r = fcntl(held, F_DUPFD, newfd);
   err = errno;
   close(held);
   if (r < 0) {
-    errno = err;
+    errno = err == EINVAL ? EBADF : err;
     return -1;
   }
   if (r != newfd) {
     close(r);
-    errno = EBADF;
+    errno = EBUSY;
     return -1;
   }
   return r;

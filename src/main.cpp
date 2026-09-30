@@ -67,7 +67,6 @@
  * lifecycle callbacks; no registered stacks or device exits are modelled.
  */
 #include "vita_fatal.h"
-#include "vita_publish.h"
 /* std::exception, for the boundary around mkxp_main() at the bottom of this
  * file: an exception that leaves main() is std::terminate, and on this device
  * that is a process kill with nothing in the log. */
@@ -363,46 +362,62 @@ static int vitaShutdownReport(SceSize, void *) {
   }
   /* This worker may block on the card. The exit enforcer never joins it on
    * abort; the running marker remains evidence if any operation stalls. The
-   * report is completed at a temporary name (an earlier diagnosis copied in
-   * front of the watchdog note) and only then published through
-   * vita_publish, so cutting this thread short cannot tear last-error.txt. */
+   * report is completed at a temporary name (a whole earlier diagnosis copied
+   * in front of the watchdog note) and only then published through
+   * vitaFatalPublish, so cutting this thread short cannot tear
+   * last-error.txt, and a damaged active report is quarantined instead of
+   * copied or rotated over a good backup. */
   static const char tmpPath[] = VITA_FATAL_DIR "/last-error.stuck.tmp";
   static const char finalPath[] = VITA_FATAL_DIR "/" VITA_FATAL_NAME;
   static const char backupPath[] = VITA_FATAL_DIR "/" VITA_FATAL_NAME ".bak";
+  static const char rubyNote[] =
+      "\nphase: ruby\nShutdown watchdog: Ruby shutdown exceeded 60 seconds.\n"
+      "The player exited without returning to the launcher.\n";
+  static const char nativeNote[] =
+      "\nShutdown watchdog: native cleanup stalled or failed.\n"
+      "The player exited without returning to the launcher.\n";
+  const char *note = state == VitaShutdownRubyAborted ? rubyNote : nativeNote;
+  const unsigned long long noteLen = strlen(note);
+  /* Only a whole report that declares its length can be extended and have
+   * that length patched; anything else is left for the commit to set aside. */
+  VitaFatalReport previousReport;
+  const bool extend = vitaFatalReportInspect(finalPath, false, &previousReport) &&
+      previousReport.declared;
   SceUID fd = sceIoOpen(tmpPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
   if (fd >= 0) {
-    const char *header = VITA_FATAL_MAGIC "\nkind: stuck\ntitle: mkxp-z\n---\n";
     char chunk[512];
     bool written = true;
-    bool hadReport = false;
-    SceUID previous = sceIoOpen(finalPath, SCE_O_RDONLY, 0);
-    if (previous >= 0) {
-      for (;;) {
+    if (extend) {
+      SceUID previous = sceIoOpen(finalPath, SCE_O_RDONLY, 0);
+      written = previous >= 0;
+      for (; written;) {
         int got = sceIoRead(previous, chunk, sizeof(chunk));
         if (got == 0)
           break;
         // An unreadable report is never replaced; abandon keeps a diagnosis.
-        if (got < 0 || state == VitaShutdownAbandoned || !vitaShutdownWrite(fd, chunk, got)) {
+        if (got < 0 || state == VitaShutdownAbandoned || !vitaShutdownWrite(fd, chunk, got))
           written = false;
-          break;
-        }
-        hadReport = true;
       }
-      sceIoClose(previous);
+      if (previous >= 0)
+        sceIoClose(previous);
+    } else {
+      size_t headerLen = vitaFatalFormatHeader(chunk, sizeof(chunk),
+                                               VITA_FATAL_KIND_STUCK, "mkxp-z", noteLen);
+      written = headerLen > 0 && vitaShutdownWrite(fd, chunk, headerLen);
     }
-    if (written) {
-      written = (hadReport || vitaShutdownAppend(fd, header)) &&
-          vitaShutdownAppend(fd,
-          state == VitaShutdownRubyAborted
-              ? "\nphase: ruby\nShutdown watchdog: Ruby shutdown exceeded 60 seconds.\n"
-                "The player exited without returning to the launcher.\n"
-              : "\nShutdown watchdog: native cleanup stalled or failed.\n"
-                "The player exited without returning to the launcher.\n");
+    written = written && vitaShutdownAppend(fd, note);
+    if (written && extend) {
+      // The copied header still declares the old length; patch it in place.
+      vitaFatalLengthDigits(chunk, previousReport.bodyLength + noteLen);
+      written = sceIoLseek(fd, (SceOff)previousReport.lengthOffset, SCE_SEEK_SET) ==
+                    (SceOff)previousReport.lengthOffset &&
+          vitaShutdownWrite(fd, chunk, VITA_FATAL_LENGTH_DIGITS);
     }
     int synced = sceIoSyncByFd(fd, 0);
     int closed = sceIoClose(fd);
     bool published = written && synced >= 0 && closed >= 0 &&
-        vita_publish_commit(tmpPath, finalPath, backupPath) == 0;
+        vitaFatalReportInspect(tmpPath, true, nullptr) &&
+        vitaFatalPublish(tmpPath, finalPath, backupPath);
     // Retire the Ruby timeout breadcrumb only after its report is complete.
     if (state == VitaShutdownRubyAborted && vitaShutdownOwnsMarker && published)
       vita_boot_clear_running();

@@ -43,8 +43,13 @@
  *     mkxp-z-last-error v1\n
  *     kind: <script-error|init-error|stuck>\n
  *     title: <one line>\n
+ *     bytes: <ten digits>\n
  *     ---\n
  *     <text, any length, newline-terminated>
+ *
+ * `bytes:` is the exact length of the text after the separator. A report that
+ * declares one and does not match it was torn or damaged and is not shown;
+ * reports from before the field existed carry none and are read as before.
  *
  * The magic, the separator and the kinds are duplicated below because this
  * module must not include an engine header. Keep them in step with the
@@ -65,6 +70,8 @@ extern "C" {
 
 #define LAST_ERROR_MAGIC      "mkxp-z-last-error v1"
 #define LAST_ERROR_SEPARATOR  "---"
+#define LAST_ERROR_LENGTH_KEY "bytes:"
+#define LAST_ERROR_LENGTH_DIGITS 10
 #define LAST_ERROR_NAME       "last-error.txt"
 #define LAST_ERROR_PREV_NAME  "last-error.prev.txt"
 

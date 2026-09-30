@@ -38,6 +38,9 @@
 struct MiniFFIData {
     void *lib;
     void *func;
+    /* Calls running outside the GVL. Only touched with the GVL held, so a
+     * reinitialize can refuse to unload code that is executing. */
+    int active;
 };
 
 static void MiniFFIFree(void *p) {
@@ -67,33 +70,16 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
     rb_scan_args(argc, argv, "22", &libname, &func, &imports, &exports);
     SafeStringValue(libname);
     SafeStringValue(func);
-#ifdef __APPLE__
-    void *hlib = SDL_LoadObject(mkxp_fs::normalizePath(RSTRING_PTR(libname), 1, 1).c_str());
-#else
-    void *hlib = SDL_LoadObject(RSTRING_PTR(libname));
-#endif
-    MiniFFIData *data = new (std::nothrow) MiniFFIData{hlib, 0};
-    if (!data) {
-        if (hlib)
-            SDL_UnloadObject(hlib);
-        throw std::bad_alloc();
-    }
-    setPrivateData(self, data);
-    void *hfunc = MiniFFI_GetFunctionHandle(hlib, RSTRING_PTR(func));
-#ifdef __WIN32__
-    if (hlib && !hfunc) {
-        VALUE func_a = rb_str_new3(func);
-        func_a = rb_str_cat(func_a, "A", 1);
-        hfunc = SDL_LoadFunction(hlib, RSTRING_PTR(func_a));
-    }
-#endif
-    if (!hfunc)
-        throw Exception(Exception::RuntimeError, "%s", SDL_GetError());
-    
-    data->func = hfunc;
-    rb_iv_set(self, "_funcname", func);
-    rb_iv_set(self, "_libname", libname);
-    
+    /* Reinitializing replaces the object's whole state or none of it: every
+     * check that can raise into Ruby runs before anything is loaded or
+     * changed, and the new state is published last. */
+    if (OBJ_FROZEN(self))
+        rb_error_frozen("MiniFFI");
+    MiniFFIData *previous = getPrivateDataNoRaise<MiniFFIData>(self);
+    if (previous && previous->active)
+        throw Exception(Exception::RuntimeError,
+                 "MiniFFI function is running; it cannot be reinitialized");
+
     VALUE ary_imports = rb_ary_new();
     VALUE *entry;
     switch (TYPE(imports)) {
@@ -163,8 +149,7 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
         throw Exception(Exception::RuntimeError, "too many parameters: %ld/%ld\n",
                  RARRAY_LEN(ary_imports), MINIFFI_MAX_ARGS);
     
-    rb_iv_set(self, "_imports", ary_imports);
-    int ex;
+    int ex = _T_VOID;
     if (NIL_P(exports)) {
         ex = _T_VOID;
     } else {
@@ -198,7 +183,40 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
                 break;
         }
     }
+
+    /* From here only C++ exceptions can leave, so a half-acquired library or
+     * state record is released by hand and the object is still untouched. */
+    MiniFFIData *data = new (std::nothrow) MiniFFIData{0, 0, 0};
+    if (!data)
+        throw std::bad_alloc();
+#ifdef __APPLE__
+    void *hlib = SDL_LoadObject(mkxp_fs::normalizePath(RSTRING_PTR(libname), 1, 1).c_str());
+#else
+    void *hlib = SDL_LoadObject(RSTRING_PTR(libname));
+#endif
+    void *hfunc = MiniFFI_GetFunctionHandle(hlib, RSTRING_PTR(func));
+#ifdef __WIN32__
+    if (hlib && !hfunc) {
+        VALUE func_a = rb_str_new3(func);
+        func_a = rb_str_cat(func_a, "A", 1);
+        hfunc = SDL_LoadFunction(hlib, RSTRING_PTR(func_a));
+    }
+#endif
+    if (!hfunc) {
+        Exception failure(Exception::RuntimeError, "%s", SDL_GetError());
+        if (hlib)
+            SDL_UnloadObject(hlib);
+        delete data;
+        throw failure;
+    }
+    data->lib = hlib;
+    data->func = hfunc;
+
+    rb_iv_set(self, "_funcname", func);
+    rb_iv_set(self, "_libname", libname);
+    rb_iv_set(self, "_imports", ary_imports);
     rb_iv_set(self, "_exports", INT2FIX(ex));
+    setPrivateData(self, data);
     if (rb_block_given_p())
         rb_yield(self);
     return Qnil;
@@ -286,7 +304,9 @@ RB_METHOD_GUARD(MiniFFI_call) {
     }
 #if RAPI_MAJOR >= 2
     MFFICallCBArgs cb_args {ApiFunction, &param, nimport};
+    ++funcData->active;
     mffi_value ret = (mffi_value)rb_thread_call_without_gvl(miniffi_call_cb, &cb_args, 0, 0);
+    --funcData->active;
 #else
     mffi_value ret = miniffi_call_intern(ApiFunction, &param, nimport);
 #endif

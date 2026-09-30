@@ -1876,6 +1876,10 @@ struct GraphicsPrivate {
     int frameRate;
     int frameCount;
     int brightness;
+
+    /* Consecutive Graphics.update frames skipped for a refused upload. */
+    unsigned uploadSkips = 0;
+    static const unsigned uploadSkipLimit = 120;
     
     double last_update;
     
@@ -2572,16 +2576,26 @@ struct GraphicsPrivate {
      * retires the deferred queue and retries once; a second one skips the
      * frame (the CPU pixels are intact and the next update draws the scene
      * again) instead of raising into the script, like freeze and transition.
-     * A skipped frame presents nothing but still counts and paces. */
+     * A skipped frame presents nothing but still counts and paces. A refusal
+     * that outlasts uploadSkipLimit consecutive frames is not transient (a
+     * leaked pool, a scene too big for the card): it is raised so the normal
+     * error report runs instead of a frozen screen that never explains itself. */
     bool compositeOrSkip() {
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
             try {
                 screen.composite();
+                uploadSkips = 0;
                 return true;
             } catch (const TEX::UploadError &) {
                 if (attempt == 0)
                     GPUBudget::deferDrain("frame-retry", true);
             }
+        }
+        if (++uploadSkips >= uploadSkipLimit) {
+            uploadSkips = 0;
+            std::fputs("vita-gpu: Graphics.update upload failed on every frame "
+                       "for too long; raising\n", stderr);
+            throw TEX::UploadError();
         }
         static Uint32 lastSkip = 0;
         static bool skipLogged = false;
@@ -2598,7 +2612,9 @@ struct GraphicsPrivate {
     }
 #endif
 
-    void redrawScreen() {
+    /* False when the frame was skipped: it is already counted and paced, so
+     * the caller must do nothing more for it. */
+    bool redrawScreen() {
         GLStateGuard state(glState);
         resetTargetCounters();
 #if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) && VITA_GLUE_FRAME_TRACE
@@ -2606,7 +2622,7 @@ struct GraphicsPrivate {
 #endif
 #ifdef MKXPZ_SOFTWARE_BITMAPS
         if (!compositeOrSkip())
-            return;
+            return false;
 #else
         screen.composite();
 #endif
@@ -2645,7 +2661,7 @@ struct GraphicsPrivate {
             swapGLBuffer();
             updateAvgFPS();
             state.release();
-            return;
+            return true;
         }
         
         if (integerScaleStepApplicable())
@@ -2729,6 +2745,7 @@ struct GraphicsPrivate {
 
         updateAvgFPS();
         state.release();
+        return true;
     }
     
     void checkSyncLock() {
@@ -2876,7 +2893,12 @@ void Graphics::update(bool checkForShutdown) {
 #if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) && VITA_GLUE_FRAME_TRACE
     vita_glue_trace("trace: Graphics::update redrawScreen next");
 #endif
-    p->redrawScreen();
+    if (!p->redrawScreen()) {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        profileFrame.skipped = true;
+#endif
+        return;
+    }
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     // Only a normal, non-skipped frame can enter; movie/internal updates defer.
     VitaSettingsInput initial;

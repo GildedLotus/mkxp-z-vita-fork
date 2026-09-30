@@ -169,29 +169,130 @@ static bool vitaFatalWriteAll(int fd, const char *data, size_t len)
     return true;
 }
 
-static bool vitaFatalPublish(const char *tmpPath, const char *finalPath,
-                             const char *backupPath)
+static int vitaFatalUsable(const char *path)
 {
-    // The publication policy (move-aside, publish, failure recoverability)
-    // lives in vita_publish, shared by every generation-preserving writer.
-    return vita_publish_commit(tmpPath, finalPath, backupPath) == 0;
+    if (vitaFatalReportInspect(path, false, NULL))
+        return 1;
+    vitaLogMessage("fatal-report: ",
+                   "the active report is damaged; moving it aside");
+    return 0;
 }
 
-/* A retained .tmp is only worth publishing when the write that made it ran to
- * the end: the magic line, a complete header ending in the separator line,
- * and a final newline (the writer always terminates the text). Anything else
- * is a torn write and must not replace a good report. */
-static bool vitaFatalReportComplete(const char *path)
+bool vitaFatalPublish(const char *tmpPath, const char *finalPath,
+                      const char *backupPath)
 {
-    static const char magic[] = VITA_FATAL_MAGIC "\n";
-    static const char sep[] = "\n" VITA_FATAL_SEPARATOR "\n";
+    char corrupt[VITA_FATAL_PATH_MAX];
+    size_t n = 0;
+
+    // The publication policy (move-aside, publish, failure recoverability)
+    // lives in vita_publish, shared by every generation-preserving writer.
+    // A damaged active report is quarantined, so it can never displace a
+    // valid backup.
+    if (!vitaFatalAppend(corrupt, sizeof(corrupt), &n, finalPath) ||
+        !vitaFatalAppend(corrupt, sizeof(corrupt), &n,
+                         VITA_FATAL_CORRUPT_SUFFIX))
+        return false;
+    corrupt[n] = '\0';
+    return vita_publish_commit_checked(tmpPath, finalPath, backupPath, corrupt,
+                                       vitaFatalUsable) == 0;
+}
+
+void vitaFatalLengthDigits(char *out, unsigned long long bodyLen)
+{
+    for (int i = VITA_FATAL_LENGTH_DIGITS - 1; i >= 0; --i) {
+        out[i] = (char)('0' + (int)(bodyLen % 10u));
+        bodyLen /= 10u;
+    }
+}
+
+size_t vitaFatalFormatHeader(char *buf, size_t cap, const char *kind,
+                             const char *title, unsigned long long bodyLen)
+{
+    static const char kBytes[] = "\n" VITA_FATAL_LENGTH_KEY " ";
+    static const char kTail[] = "\n" VITA_FATAL_SEPARATOR "\n";
+    const size_t reserve = (sizeof(kBytes) - 1) + VITA_FATAL_LENGTH_DIGITS +
+                           (sizeof(kTail) - 1);
+    size_t len = 0;
+    size_t fieldCap;
+
+    // Reserve the length field and separator up front so an absurd title
+    // truncates itself instead of pushing the "---" out of the file.
+    if (cap <= reserve + sizeof(VITA_FATAL_MAGIC "\nkind: \ntitle: "))
+        return 0;
+    fieldCap = cap - reserve;
+    (void)vitaFatalAppend(buf, fieldCap, &len, VITA_FATAL_MAGIC "\nkind: ");
+    (void)vitaFatalAppendField(buf, fieldCap, &len, kind);
+    (void)vitaFatalAppend(buf, fieldCap, &len, "\ntitle: ");
+    (void)vitaFatalAppendField(buf, fieldCap, &len, title);
+    (void)vitaFatalAppend(buf, cap, &len, kBytes);
+    vitaFatalLengthDigits(buf + len, bodyLen);
+    len += VITA_FATAL_LENGTH_DIGITS;
+    (void)vitaFatalAppend(buf, cap, &len, kTail);
+    return len;
+}
+
+/* One streaming pass, no heap: the header lines (only the first
+ * VITA_FATAL_LINE_CAP bytes of each are kept: every fixed-size line fits, and
+ * a long kind or title is recognised by its prefix), then a count of the body
+ * and its final byte. */
+#define VITA_FATAL_LINE_CAP   32u
+#define VITA_FATAL_HEADER_LINES 9u
+
+static bool vitaFatalHeaderLine(const char *line, size_t len, unsigned index,
+                                unsigned *seen, unsigned long long offset,
+                                VitaFatalReport *rep, unsigned long long *declared)
+{
+    static const char magic[] = VITA_FATAL_MAGIC;
+    static const char lengthKey[] = VITA_FATAL_LENGTH_KEY " ";
+    const size_t keyLen = sizeof(lengthKey) - 1;
+
+    if (index == 0)
+        return len == sizeof(magic) - 1 && memcmp(line, magic, len) == 0;
+    if (len == sizeof(VITA_FATAL_SEPARATOR) - 1 &&
+        memcmp(line, VITA_FATAL_SEPARATOR, len) == 0) {
+        *seen |= 4u;
+        return (*seen & 3u) == 3u;
+    }
+    if (len >= 5 && memcmp(line, "kind:", 5) == 0)
+        *seen |= 1u;
+    else if (len >= 6 && memcmp(line, "title:", 6) == 0)
+        *seen |= 2u;
+    else if (len >= keyLen - 1 &&
+             memcmp(line, VITA_FATAL_LENGTH_KEY, keyLen - 1) == 0) {
+        unsigned long long value = 0;
+
+        if (rep->declared || len != keyLen + VITA_FATAL_LENGTH_DIGITS ||
+            memcmp(line, lengthKey, keyLen) != 0)
+            return false;
+        for (size_t i = keyLen; i < len; ++i) {
+            if (line[i] < '0' || line[i] > '9')
+                return false;
+            value = value * 10u + (unsigned)(line[i] - '0');
+        }
+        rep->declared = true;
+        rep->lengthOffset = offset + keyLen;
+        *declared = value;
+    }
+    return true;
+}
+
+bool vitaFatalReportInspect(const char *path, bool requireLength,
+                            VitaFatalReport *info)
+{
     char chunk[256];
-    size_t seen = 0;
-    size_t matched = 0;
-    bool separated = false;
+    char line[VITA_FATAL_LINE_CAP];
+    size_t lineLen = 0;
+    unsigned index = 0;
+    unsigned seen = 0;
+    unsigned long long pos = 0;
+    unsigned long long lineStart = 0;
+    unsigned long long declared = 0;
+    VitaFatalReport rep;
+    bool body = false;
     char last = '\0';
     const int fd = open(path, O_RDONLY, 0);
 
+    memset(&rep, 0, sizeof(rep));
     if (fd < 0)
         return false;
     for (;;) {
@@ -201,26 +302,52 @@ static bool vitaFatalReportComplete(const char *path)
             continue;
         if (got <= 0) {
             (void)close(fd);
-            return got == 0 && separated && last == '\n';
+            if (got < 0 || !body)
+                return false;
+            rep.bodyLength = pos - rep.bodyOffset;
+            if (rep.bodyLength == 0 || last != '\n' ||
+                (rep.declared && rep.bodyLength != declared) ||
+                (requireLength && !rep.declared))
+                return false;
+            if (info)
+                *info = rep;
+            return true;
         }
-        for (ssize_t i = 0; i < got; ++i) {
+        for (ssize_t i = 0; i < got; ++i, ++pos) {
             const char c = chunk[i];
 
-            if (seen < sizeof(magic) - 1 && c != magic[seen]) {
-                (void)close(fd);
-                return false;
+            if (body) {
+                last = c;
+            } else if (c != '\n') {
+                if (lineLen < sizeof(line))
+                    line[lineLen] = c;
+                ++lineLen;
+            } else {
+                if (index >= VITA_FATAL_HEADER_LINES ||
+                    !vitaFatalHeaderLine(line, lineLen, index, &seen,
+                                         lineStart, &rep, &declared)) {
+                    (void)close(fd);
+                    return false;
+                }
+                if (seen & 4u) {
+                    body = true;
+                    rep.bodyOffset = pos + 1;
+                }
+                ++index;
+                lineLen = 0;
+                lineStart = pos + 1;
             }
-            ++seen;
-            if (!separated) {
-                if (c == sep[matched])
-                    ++matched;
-                else
-                    matched = (c == sep[0]) ? 1 : 0;
-                separated = matched == sizeof(sep) - 1;
-            }
-            last = c;
         }
     }
+}
+
+/* A retained .tmp is only worth publishing when the write that made it ran to
+ * the end: a whole envelope whose body is exactly the length it declares
+ * (this writer always declares one). Anything else is a torn write and must
+ * not replace a good report. */
+static bool vitaFatalReportComplete(const char *path)
+{
+    return vitaFatalReportInspect(path, true, NULL);
 }
 
 bool vitaWriteLastErrorTo(const char *dir, const char *kind, const char *title,
@@ -231,12 +358,11 @@ bool vitaWriteLastErrorTo(const char *dir, const char *kind, const char *title,
      * run before it exists -- and two simultaneous writers would already be
      * racing for the same .tmp file, which the rename cannot fix. */
     static char header[VITA_FATAL_HEADER_MAX];
-    static const char kTail[] = "\n" VITA_FATAL_SEPARATOR "\n";
 
     char tmpPath[VITA_FATAL_PATH_MAX];
     char finalPath[VITA_FATAL_PATH_MAX];
     char backupPath[VITA_FATAL_PATH_MAX];
-    size_t len = 0;
+    size_t len;
     size_t textLen;
     bool ok;
     int fd;
@@ -255,15 +381,15 @@ bool vitaWriteLastErrorTo(const char *dir, const char *kind, const char *title,
         !vitaFatalPath(backupPath, sizeof(backupPath), dir, VITA_FATAL_NAME ".bak"))
         return false;
 
-    /* Reserve the separator up front so an absurd title truncates itself
-     * instead of pushing the "---" out of the file. */
-    const size_t fieldCap = sizeof(header) - (sizeof(kTail) - 1);
-
-    (void)vitaFatalAppend(header, fieldCap, &len, VITA_FATAL_MAGIC "\nkind: ");
-    (void)vitaFatalAppendField(header, fieldCap, &len, kind);
-    (void)vitaFatalAppend(header, fieldCap, &len, "\ntitle: ");
-    (void)vitaFatalAppendField(header, fieldCap, &len, title);
-    (void)vitaFatalAppend(header, sizeof(header), &len, kTail);
+    // The text is always newline-terminated, so a reader's last getline() is a
+    // whole line and a shell `cat` does not swallow the prompt. The header
+    // declares the exact byte count that results.
+    textLen = strlen(text);
+    const bool addNewline = textLen == 0 || text[textLen - 1] != '\n';
+    const unsigned long long bodyLen = (unsigned long long)textLen + (addNewline ? 1u : 0u);
+    len = vitaFatalFormatHeader(header, sizeof(header), kind, title, bodyLen);
+    if (len == 0 || bodyLen >= 10000000000ull)
+        return false;
 
     // A retained report must leave .tmp before another write can truncate it;
     // a torn one is discarded, never promoted over the last good report.
@@ -283,13 +409,10 @@ bool vitaWriteLastErrorTo(const char *dir, const char *kind, const char *title,
     if (fd < 0)
         return false;
 
-    textLen = strlen(text);
     ok = vitaFatalWriteAll(fd, header, len);
     if (ok && textLen > 0)
         ok = vitaFatalWriteAll(fd, text, textLen);
-    /* Always newline-terminated, so a reader's last getline() is a whole line
-     * and a shell `cat` does not swallow the prompt. */
-    if (ok && (textLen == 0 || text[textLen - 1] != '\n'))
+    if (ok && addNewline)
         ok = vitaFatalWriteAll(fd, "\n", 1);
     const bool complete = ok;
     if (ok && fsync(fd) != 0) {

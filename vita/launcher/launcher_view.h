@@ -80,9 +80,16 @@ enum {
     LAUNCHER_CELL_COUNT
 };
 
+/* A row that still misses a cell after this many builds is kept with the
+ * hole: a cell that cannot be drawn is not going to be drawn by trying again
+ * on every frame. */
+#define LAUNCHER_ROW_ATTEMPTS_MAX 3
+
 typedef struct LauncherRowCache {
     SDL_Surface *cell[LAUNCHER_CELL_COUNT];
     int built;
+    unsigned char resolved;  /* cells drawn, or settled as undrawable */
+    unsigned char attempts;  /* builds that left a transient miss */
 } LauncherRowCache;
 
 /* Ceiling on live cached-row bytes. A row is at most about 120 KB (full

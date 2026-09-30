@@ -73,6 +73,29 @@ int vita_publish_move(const char *from, const char *to)
     return rename(from, to) == 0 ? 0 : -1;
 }
 
+int vita_publish_commit_checked(const char *tmp, const char *final,
+                                const char *backup, const char *quarantine,
+                                int (*usable)(const char *path))
+{
+    if (!tmp || !final || !backup || !quarantine || !usable)
+        return -1;
+    if (access(final, F_OK) == 0) {
+        /* Only a generation that is itself whole may displace the backup;
+         * damage goes to the disposable quarantine slot and the backup, the
+         * last good copy, is never touched. A failed move leaves everything
+         * in place, like a failed rotation. */
+        if (usable(final)) {
+            if (rename(final, backup) != 0)
+                return -1;
+        } else if (vita_publish_move(final, quarantine) != 0) {
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+    return rename(tmp, final) == 0 ? 0 : -1;
+}
+
 int vita_publish_shift(const char *from, const char *to)
 {
     struct stat st;

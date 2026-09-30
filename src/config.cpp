@@ -378,7 +378,9 @@ static void vitaStripLauncherArgs(std::vector<std::string> &args)
 /* Keys the device owns. A game's mkxp.json was written for a desktop: its
  * window, renderer, JIT and data-path choices are wrong here by construction,
  * and gameFolder would send the player somewhere else entirely. A game that
- * really has something to say about them says it in mkxp-vita.json. */
+ * really has something to say about them says it in mkxp-vita.json, except
+ * gameFolder, maxTextureSize and enableHires: those stay with the device
+ * (see the erases where the mkxp-vita.json layer is merged). */
 static void vitaFilterGameLayer(json::value &layer)
 {
     static const char *const denied[] = {

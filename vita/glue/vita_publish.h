@@ -44,6 +44,16 @@ int vita_publish_finalize(FILE *f);
  * `tmp`. -1 on failure. */
 int vita_publish_commit(const char *tmp, const char *final, const char *backup);
 
+/* vita_publish_commit() for a writer that can judge a generation: the
+ * current `final` is rotated into `backup` only when `usable(final)` returns
+ * nonzero. An unusable one is moved to `quarantine` (as for vita_publish_move:
+ * an occupied quarantine slot is removed first, so a failure can lose it) and
+ * `backup` is left alone, so damage can never displace the last good
+ * generation. -1 on failure, with every surviving file left in place. */
+int vita_publish_commit_checked(const char *tmp, const char *final,
+                                const char *backup, const char *quarantine,
+                                int (*usable)(const char *path));
+
 /* Plain rename, for moves whose destination is disposable (quarantines,
  * retained-evidence rotations). An occupied `to` is removed
  * first, so a failure can lose it. `from` == `to` is refused. -1 on

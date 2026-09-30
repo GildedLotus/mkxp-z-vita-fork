@@ -371,9 +371,10 @@ void drawQuad(const Surface &dst, const IntRect &pos,
 	}
 }
 
-/* The GPU limit is 4096 and a game's mkxp-vita.json can raise caps.maxTexSize
- * past it; the base is a CPU buffer plus a texture, so its pixels are bounded
- * too, in 64 bits so the product cannot wrap. */
+/* The GPU limit is 4096 and only the device's own config can set
+ * caps.maxTexSize past it (a game cannot); the base is a CPU buffer plus a
+ * texture, so its pixels are bounded too, in 64 bits so the product cannot
+ * wrap. */
 static const int kMaxBaseDim = 4096;
 static const long long kMaxBaseBytes = 16LL * 1024 * 1024;
 

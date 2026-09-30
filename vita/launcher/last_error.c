@@ -228,13 +228,20 @@ static void rotate(const char *path, const char *prev_path,
 }
 
 /* Validate the envelope separately from the deliberately tolerant renderer.
- * One byte after the separator is required even for the writer's empty body. */
-static int complete_header(const char *raw, size_t n)
+ * One byte after the separator is required even for the writer's empty body.
+ * `*body` receives the offset of the first byte after the separator and
+ * `*declared` the body length the header promises, or -1 for a report that
+ * predates the field. A `bytes:` line that is not exactly the writer's shape
+ * is damage, not an old report. */
+static int complete_header(const char *raw, size_t n, size_t *body,
+                           long long *declared)
 {
     const char *p = raw, *end = raw + n, *next;
     size_t magic = strlen(LAST_ERROR_MAGIC);
+    size_t key = strlen(LAST_ERROR_LENGTH_KEY);
     int fields = 0, header;
 
+    *declared = -1;
     if (n <= magic || memcmp(raw, LAST_ERROR_MAGIC, magic) != 0 ||
         line_at(p, end, &next) != magic)
         return 0;
@@ -242,12 +249,28 @@ static int complete_header(const char *raw, size_t n)
     for (header = 0; p < end && header < HEADER_LINES_MAX; header++) {
         size_t len = line_at(p, end, &next);
         if (len == strlen(LAST_ERROR_SEPARATOR) &&
-            memcmp(p, LAST_ERROR_SEPARATOR, len) == 0)
+            memcmp(p, LAST_ERROR_SEPARATOR, len) == 0) {
+            *body = (size_t)(next - raw);
             return fields == 3 && next < end;
+        }
         if (len >= 5 && memcmp(p, "kind:", 5) == 0)
             fields |= 1;
         if (len >= 6 && memcmp(p, "title:", 6) == 0)
             fields |= 2;
+        if (len >= key && memcmp(p, LAST_ERROR_LENGTH_KEY, key) == 0) {
+            long long value = 0;
+            size_t i;
+
+            if (*declared >= 0 || len != key + 1 + LAST_ERROR_LENGTH_DIGITS ||
+                p[key] != ' ')
+                return 0;
+            for (i = key + 1; i < len; i++) {
+                if (p[i] < '0' || p[i] > '9')
+                    return 0;
+                value = value * 10 + (p[i] - '0');
+            }
+            *declared = value;
+        }
         p = next;
     }
     return 0;
@@ -257,7 +280,9 @@ int last_error_read(const char *path, LastErrorReport *out)
 {
     char raw[LAST_ERROR_HEADER_MAX + 1];
     FILE *f;
-    size_t n;
+    size_t n, body = 0;
+    long long declared = -1;
+    long total = 0;
     int got, failed, more = 0, terminated;
 
     if (!out)
@@ -278,10 +303,15 @@ int last_error_read(const char *path, LastErrorReport *out)
         failed = ferror(f) || (!more && !feof(f));
     }
     terminated = n > 0 && raw[n - 1] == '\n';
+    total = (long)n;
     if (!failed && more) {
         /* The preview cap is not an interrupted write. Check the actual tail
          * without streaming an unbounded backtrace through the launcher. */
-        failed = fseek(f, -1, SEEK_END) != 0;
+        failed = fseek(f, 0, SEEK_END) != 0;
+        if (!failed) {
+            total = ftell(f);
+            failed = total < 1 || fseek(f, -1, SEEK_END) != 0;
+        }
         if (!failed) {
             int tail = fgetc(f);
             failed = tail == EOF || ferror(f);
@@ -295,7 +325,11 @@ int last_error_read(const char *path, LastErrorReport *out)
         return -1;
     }
 
-    if (!terminated || memchr(raw, '\0', n) || !complete_header(raw, n))
+    if (!terminated || memchr(raw, '\0', n) ||
+        !complete_header(raw, n, &body, &declared))
+        return 0;
+    /* A report that declares its length must have exactly that much text. */
+    if (declared >= 0 && (long long)total - (long long)body != declared)
         return 0;
     got = last_error_parse(raw, n, out);
     if (more || n > LAST_ERROR_READ_MAX)

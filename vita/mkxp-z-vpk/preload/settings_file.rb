@@ -7,8 +7,10 @@
 # The only file handled here is ours and regenerable: settings at userConfPath.
 # Each successful publish rotates the previous valid generation into <path>.bak,
 # so recovery restores the last settings the player kept; an invalid active
-# file is quarantined as <path>.corrupt, never rotated over the backup, and a
-# write interrupted before the final rename leaves the previous file intact.
+# file is quarantined as <path>.corrupt (two copies at most), never rotated
+# over the backup, bytes that would not read back are refused before they are
+# published, and a write interrupted before the final rename leaves the
+# previous file intact.
 module VitaSettingsFile
   OPEN = File.method(:open)
   ACTIVE = {}
@@ -76,11 +78,15 @@ module VitaSettingsFile
   # file within the config size bound that parses to a JSON object -- shared
   # with the boot-time selection and the CFG[] reader.
 
+  # Two quarantine slots at most (<destination> and <destination>.1): the first
+  # is the evidence of the original fault, and a later one replaces the newest
+  # copy, so a game that keeps writing bad data cannot fill the card.
+  QUARANTINE_SLOTS = 2
+
   def self.retain(path, destination)
     kept = destination
-    index = 0
-    while File.exist?(kept)
-      index += 1
+    (1...QUARANTINE_SLOTS).each do |index|
+      break unless File.exist?(kept)
       kept = destination + ".#{index}"
     end
     File.rename(path, kept)
@@ -147,6 +153,17 @@ module VitaSettingsFile
         with_file(path + '.tmp', 'wb') do |file|
           raise IOError, 'short settings write' unless file.write(bytes) == bytes.bytesize
           sync(file)
+        end
+        # The same rule the reader applies: bytes that would not be read back
+        # are refused here, so the last valid generation stays active instead
+        # of being rotated into .bak behind an unreadable file.
+        unless valid?(path + '.tmp')
+          begin
+            File.delete(path + '.tmp')
+          rescue SystemCallError
+            nil
+          end
+          raise IOError, 'settings are too large or malformed to be read back'
         end
         publish(path)
       ensure

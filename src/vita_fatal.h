@@ -34,6 +34,7 @@
 #ifndef VITA_FATAL_H
 #define VITA_FATAL_H
 
+#include <stddef.h>
 #ifndef __cplusplus
 #include <stdbool.h>
 #endif
@@ -59,15 +60,24 @@ extern "C" {
  *   mkxp-z-last-error v1\n
  *   kind: <script-error|init-error|stuck>\n
  *   title: <one line>\n
+ *   bytes: <ten digits>\n
  *   ---\n
  *   <text, any length, always newline-terminated>
  *
- * Everything before the separator is a single line, so a reader can parse the
- * header with three getline()s and treat the rest as opaque text. kind and
- * title have their control bytes folded to spaces on the way in; they cannot
- * forge a header line. */
+ * Everything before the separator is a single line, and fields are matched by
+ * name. kind and title have their control bytes folded to spaces on the way
+ * in; they cannot forge a header line. `bytes:` is the exact length of the
+ * text after the separator, zero-padded to a fixed width so a writer that
+ * appends to a copy can patch it in place: a report whose text is shorter or
+ * longer than it declares was torn or damaged and is not a report. Reports
+ * from before the field existed carry none and are accepted as complete when
+ * their envelope is whole. */
 #define VITA_FATAL_MAGIC     "mkxp-z-last-error v1"
 #define VITA_FATAL_SEPARATOR "---"
+#define VITA_FATAL_LENGTH_KEY    "bytes:"
+#define VITA_FATAL_LENGTH_DIGITS 10
+/* An active report that fails validation is moved here, never into .bak. */
+#define VITA_FATAL_CORRUPT_SUFFIX ".corrupt"
 
 #define VITA_FATAL_KIND_SCRIPT "script-error"
 #define VITA_FATAL_KIND_INIT   "init-error"
@@ -97,6 +107,14 @@ extern "C" {
 #define VITA_FATAL_PATH_MAX   256u
 
 /* ---- API --------------------------------------------------------------- */
+
+/* What vitaFatalReportInspect() learned about a report file. */
+typedef struct VitaFatalReport {
+    bool declared;                        /* the header carries `bytes:` */
+    unsigned long long bodyOffset;        /* first byte after the separator */
+    unsigned long long bodyLength;        /* bytes from there to the end */
+    unsigned long long lengthOffset;      /* where the `bytes:` digits start */
+} VitaFatalReport;
 
 /*
  * Log `utf8` one source line at a time, `prefix` (may be NULL) on every line.
@@ -130,6 +148,34 @@ bool vitaWriteLastErrorTo(const char *dir, const char *kind, const char *title,
 
 /* vitaWriteLastErrorTo(VITA_FATAL_DIR, ...). */
 bool vitaWriteLastError(const char *kind, const char *title, const char *text);
+
+/*
+ * True when `path` is a whole report: the magic line, kind and title fields, a
+ * separator line, a body that ends in a newline and, when the header declares
+ * a length, exactly that many body bytes. `requireLength` also refuses a
+ * report with no `bytes:` field (what this writer always emits), which is how
+ * a retained .tmp is judged; an active report from an older build passes
+ * without it. `info` (may be NULL) is filled for a valid report. No heap.
+ */
+bool vitaFatalReportInspect(const char *path, bool requireLength,
+                            VitaFatalReport *info);
+
+/* The header for a report whose text is `bodyLen` bytes: fields folded as in
+ * vitaWriteLastErrorTo, always ending with the separator line. Returns its
+ * length, or 0 when it does not fit in `cap`. */
+size_t vitaFatalFormatHeader(char *buf, size_t cap, const char *kind,
+                             const char *title, unsigned long long bodyLen);
+
+/* The VITA_FATAL_LENGTH_DIGITS characters of a `bytes:` field. */
+void vitaFatalLengthDigits(char *out, unsigned long long bodyLen);
+
+/*
+ * Publish the finished `tmp` as the new report. A whole active report moves to
+ * `backup`; a damaged one is moved aside to "<final>.corrupt" instead, so a
+ * valid backup is never replaced by damage. False when a rename failed; every
+ * surviving file stays where it was.
+ */
+bool vitaFatalPublish(const char *tmp, const char *final, const char *backup);
 
 #ifdef __cplusplus
 }

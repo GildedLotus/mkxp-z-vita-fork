@@ -35,6 +35,7 @@
 
 #include "eventthread.h"
 #include "sharedstate.h"
+#include "vita_fatal.h"
 
 #include <physfs.h>
 
@@ -128,8 +129,10 @@ static PHYSFS_Io *createSDLRWIo(const char *filename) {
 
   try {
     ctx = new SDLRWIoContext(filename);
-  } catch (const Exception &e) {
-    Debug() << "Failed mounting" << filename;
+  } catch (const Exception &) {
+    // PhysFS calls SDLRWIoDuplicate, so this handler runs in its C frames
+    // and must not allocate: Debug() builds a stringstream.
+    vitaLogMessage("Failed mounting ", filename);
     return 0;
   } catch (...) {
     return 0;  // PhysFS calls SDLRWIoDuplicate: nothing may unwind into it

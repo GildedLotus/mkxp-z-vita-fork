@@ -161,14 +161,20 @@ static const char *ellipsis_for(TTF_Font *font)
 /*
  * Render `text` in `font`, shortened with an ellipsis to fit `max_w`.
  * Returns a new surface the caller owns, or NULL (empty text, or SDL_ttf
- * failed — a row with one missing cell is still a usable row).
+ * failed — a row with one missing cell is still a usable row). `*transient`
+ * says whether another try could work: text that cannot be drawn at all (it
+ * measures zero wide, or cannot be measured) never will be, while a refused
+ * render may be a momentary out-of-memory.
  */
-static SDL_Surface *render_fitted(TTF_Font *font, const char *text, int max_w,
-                                  SDL_Color colour)
+static SDL_Surface *render_fitted_ex(TTF_Font *font, const char *text,
+                                     int max_w, SDL_Color colour,
+                                     int *transient)
 {
     char cut[GAME_SCAN_TITLE_MAX + 8];
     MeasureCtx ctx;
+    SDL_Surface *surface;
 
+    *transient = 0;
     if (!font || !text || !text[0] || max_w <= 0)
         return NULL;
 
@@ -176,9 +182,19 @@ static SDL_Surface *render_fitted(TTF_Font *font, const char *text, int max_w,
     if (utf8_truncate_to_width(text, max_w, measure_utf8, &ctx,
                                ellipsis_for(font), cut, sizeof(cut)) < 0)
         return NULL;
-    if (!cut[0])
+    if (!cut[0] || measure_utf8(cut, &ctx) <= 0)
         return NULL;
-    return TTF_RenderUTF8_Blended(font, cut, colour);
+    surface = TTF_RenderUTF8_Blended(font, cut, colour);
+    *transient = surface == NULL;
+    return surface;
+}
+
+static SDL_Surface *render_fitted(TTF_Font *font, const char *text, int max_w,
+                                  SDL_Color colour)
+{
+    int transient;
+
+    return render_fitted_ex(font, text, max_w, colour, &transient);
 }
 
 static const char *engine_tag(int rgss_version)
@@ -499,6 +515,12 @@ static int row_bytes_of(const LauncherRowCache *row)
     return total;
 }
 
+/* A row holds something to free: it is built, or a build left cells behind. */
+static int row_held(const LauncherRowCache *row)
+{
+    return row->built || row->resolved || row->attempts;
+}
+
 static void free_row(LauncherView *v, int i)
 {
     LauncherRowCache *row = &v->rows[i];
@@ -512,6 +534,8 @@ static void free_row(LauncherView *v, int i)
         }
     }
     row->built = 0;
+    row->resolved = 0;
+    row->attempts = 0;
 }
 
 void launcher_view_drop_rows(LauncherView *v)
@@ -552,50 +576,60 @@ const void *launcher_view_pixels(const LauncherView *v)
 
 /* ---- rows -------------------------------------------------------------- */
 
+/* Draw one cell of a row, once. A cell that renders is kept and charged to
+ * v->row_bytes at once; one that cannot be drawn at all is settled as a hole;
+ * only a transient refusal leaves it open for the next build. */
+static void build_cell(LauncherView *v, LauncherRowCache *row, int cell,
+                       TTF_Font *font, const char *text, int max_w,
+                       SDL_Color colour)
+{
+    int transient = 0;
+    SDL_Surface *surface;
+
+    if (row->resolved & (1u << cell))
+        return;
+    surface = render_fitted_ex(font, text, max_w, colour, &transient);
+    if (surface) {
+        row->cell[cell] = surface;
+        v->row_bytes += surface_bytes(surface);
+    }
+    if (!transient)
+        row->resolved |= (unsigned char)(1u << cell);
+}
+
 /*
- * Build the four text surfaces of one entry, once. Everything here is CPU
+ * Build the four text surfaces of one entry. Everything here is CPU
  * memory: four small ARGB surfaces per visible entry, charged to
  * v->row_bytes as they are built, trimmed away by launcher_view_trim_rows
  * once the page turns, dropped wholesale by launcher_view_drop_rows when a
  * rescan makes them lies.
+ *
+ * A row is built once every cell is drawn or settled. A transient miss (a
+ * refused render) keeps the cells that did draw and retries only the missing
+ * ones on the next draw, up to LAUNCHER_ROW_ATTEMPTS_MAX builds; then the row
+ * is kept with the hole rather than re-rendering on every frame.
  */
 static void build_row(LauncherView *v, int index, const GameEntry *e,
                       int rtp_missing)
 {
     LauncherRowCache *row = &v->rows[index];
-    const char *tag = engine_tag(e->rgss_version);
-    int c;
+    const unsigned all = (1u << LAUNCHER_CELL_COUNT) - 1u;
 
     if (row->built)
         return;
 
-    row->cell[LAUNCHER_CELL_TITLE] =
-        render_fitted(v->font, e->title, COL_TITLE_W, kTextBright);
-    row->cell[LAUNCHER_CELL_TAG] =
-        render_fitted(v->font_small, tag, COL_TAG_W, kTextDim);
-    row->cell[LAUNCHER_CELL_FOLDER] =
-        render_fitted(v->font_small, e->folder, COL_FOLDER_W, kTextDim);
-    row->cell[LAUNCHER_CELL_RTP] =
-        rtp_missing ? render_fitted(v->font_small, "RTP missing", COL_RTP_W,
-                                    kTextWarn)
-                    : NULL;
-    /* A cell that should have text but has no surface failed to render (out of
-     * memory); leave the row unbuilt so the next draw retries instead of
-     * caching the hole for good. */
-    if ((e->title[0] && !row->cell[LAUNCHER_CELL_TITLE]) ||
-        (tag && tag[0] && !row->cell[LAUNCHER_CELL_TAG]) ||
-        (e->folder[0] && !row->cell[LAUNCHER_CELL_FOLDER]) ||
-        (rtp_missing && !row->cell[LAUNCHER_CELL_RTP])) {
-        for (c = 0; c < LAUNCHER_CELL_COUNT; c++) {
-            if (row->cell[c]) {
-                SDL_FreeSurface(row->cell[c]);
-                row->cell[c] = NULL;
-            }
-        }
+    build_cell(v, row, LAUNCHER_CELL_TITLE, v->font, e->title, COL_TITLE_W,
+               kTextBright);
+    build_cell(v, row, LAUNCHER_CELL_TAG, v->font_small,
+               engine_tag(e->rgss_version), COL_TAG_W, kTextDim);
+    build_cell(v, row, LAUNCHER_CELL_FOLDER, v->font_small, e->folder,
+               COL_FOLDER_W, kTextDim);
+    build_cell(v, row, LAUNCHER_CELL_RTP, v->font_small,
+               rtp_missing ? "RTP missing" : NULL, COL_RTP_W, kTextWarn);
+    if ((row->resolved & all) != all &&
+        ++row->attempts < LAUNCHER_ROW_ATTEMPTS_MAX)
         return;
-    }
     row->built = 1;
-    v->row_bytes += row_bytes_of(row);
 }
 
 /*
@@ -630,10 +664,10 @@ void launcher_view_trim_rows(LauncherView *v, int top, int count)
         keep_hi = count;
 
     for (i = 0; i < keep_lo; i++)
-        if (v->rows[i].built)
+        if (row_held(&v->rows[i]))
             free_row(v, i);
     for (i = keep_hi; i < GAME_SCAN_MAX_ENTRIES; i++)
-        if (v->rows[i].built)
+        if (row_held(&v->rows[i]))
             free_row(v, i);
 
     while (v->row_bytes > LAUNCHER_VIEW_ROW_CACHE_MAX_BYTES) {
@@ -643,7 +677,7 @@ void launcher_view_trim_rows(LauncherView *v, int top, int count)
         for (i = 0; i < count; i++) {
             int dist;
 
-            if (!v->rows[i].built ||
+            if (!row_held(&v->rows[i]) ||
                 (i >= top && i < top + LAUNCHER_VIEW_ROWS))
                 continue;
             dist = i > centre ? i - centre : centre - i;
