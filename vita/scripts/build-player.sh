@@ -74,7 +74,7 @@ if [[ -z ${BASERUBY:-} ]]; then
   if [[ ! -x "$BASERUBY" ]] ||
      ! grep -qx "ref=$RUBY_PIN" "$HOST_PREFIX/mkxpz-host-ruby-buildinfo.txt" 2>/dev/null; then
     # Separate host source: build-host-ruby configures in-tree and cleans it.
-    SRC="$ROOT/build/host-ruby-src" PREFIX="$HOST_PREFIX" \
+    MKXPZ_HOST_RUBY_SRC="$ROOT/build/host-ruby-src" MKXPZ_HOST_RUBY_PREFIX="$HOST_PREFIX" \
       RUBY_REPO="$RUBY_URL" RUBY_REF="$RUBY_PIN" RUBY_BRANCH=mkxp-z-3.1.3 \
       "$ROOT/vita/scripts/build-host-ruby.sh"
   fi
@@ -100,7 +100,7 @@ git -C "$RUBY_SRC" clean -fdx --quiet
 # A changed patch, compiler or config must not inherit an old archive or objects.
 # Dependencies retain their own builder caches; MRI is deliberately rebuilt.
 rm -rf "$RUBY_BUILD" "$RUBY_PREFIX"
-SRC="$RUBY_SRC" BUILD="$RUBY_BUILD" PREFIX="$RUBY_PREFIX" \
+MKXPZ_RUBY_SRC="$RUBY_SRC" MKXPZ_RUBY_BUILD="$RUBY_BUILD" MKXPZ_RUBY_PREFIX="$RUBY_PREFIX" \
   "$ROOT/vita/scripts/build-ruby-vita.sh" build
 RUBY_PREFIX="$RUBY_PREFIX" MRI_INCLUDES="$RUBY_PREFIX/include/ruby-3.1.0" \
   MRI_LIBPATH="$RUBY_PREFIX/lib" MRI_LIBRARY=ruby-static \

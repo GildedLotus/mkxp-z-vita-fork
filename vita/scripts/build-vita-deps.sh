@@ -8,6 +8,7 @@
 #   vita/scripts/build-vita-deps.sh sdl2_sound
 #   vita/scripts/build-vita-deps.sh pixman
 #   vita/scripts/build-vita-deps.sh openal
+#   vita/scripts/build-vita-deps.sh pthread-embedded   # fetch the pinned source only (release source archive)
 #   vita/scripts/build-vita-deps.sh wrapper      # (re)write pkg-config wrapper only
 #   vita/scripts/build-vita-deps.sh status       # what is installed in the side prefix
 #   vita/scripts/build-vita-deps.sh clean        # wipe build/vita-deps (sources + prefix)
@@ -25,9 +26,15 @@
 #     points meson at the wrapper above; nothing is copied into VitaSDK.
 #
 # Pins (match mkxp-z linux/Makefile where possible):
+#   Every download is pinned in vita/scripts/dep-pins.json (SHA-256 for tarballs, a full
+#   commit for git sources) and refused when it does not match. A fetched tarball tree is
+#   sealed with a content digest and re-verified before every build and before archiving,
+#   so a tree edited or built in place is rejected; nothing is built inside a source tree.
 #   theora     libtheora-1.1.1 tarball (pregenerated configure; no automake needed)
-#   uchardet   freedesktop/uchardet v0.0.8
+#   uchardet   freedesktop/uchardet v0.0.8, checked against its pinned commit
 #   SDL_sound  mkxp-z/SDL_sound @ cfb2533eb3bac3700015cbd87cc623bea1467239
+#   pthread-embedded  fetched for the source archive only (the VitaSDK libpthread is linked
+#              from the toolchain, not built here)
 #   pixman     0.42.2 release tarball — the exact Version in the vdpm sysroot's
 #              pixman-1.pc (the vdpm recipe itself is not recoverable offline).
 #              The sysroot archive is a debug-goal build ("Aggressive Debug"),
@@ -65,26 +72,45 @@ BIN="$DEPS_ROOT/bin"
 SYSROOT="$VITASDK/arm-vita-eabi"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
 
-THEORA_URL="https://downloads.xiph.org/releases/theora/libtheora-1.1.1.tar.gz"
+DIST="$DEPS_ROOT/dist"
 THEORA_DIR="$SRC/theora"
-UCHARDET_URL="https://gitlab.freedesktop.org/uchardet/uchardet"
-UCHARDET_TAG="v0.0.8"
 UCHARDET_DIR="$SRC/uchardet"
+PTHREAD_DIR="$SRC/pthread-embedded"
 SDLSOUND_URL="https://github.com/mkxp-z/SDL_sound"
 SDLSOUND_PIN="cfb2533eb3bac3700015cbd87cc623bea1467239"
 SDLSOUND_DIR="$SRC/sdl_sound"
-PIXMAN_VERSION="0.42.2"
-PIXMAN_URL="https://cairographics.org/releases/pixman-$PIXMAN_VERSION.tar.gz"
 PIXMAN_DIR="$SRC/pixman"
-OPENAL_VERSION="1.19.1"
-OPENAL_URL="https://github.com/kcat/openal-soft/archive/refs/tags/openal-soft-$OPENAL_VERSION.tar.gz"
-OPENAL_SHA256="9f3536ab2bb7781dbafabc6a61e0b34b17edd16bd6c2eaf2ae71bc63078f98c7"
-OPENAL_VITA_PATCH_URL="https://raw.githubusercontent.com/isage/openal-soft/master/openal-soft-$OPENAL_VERSION-vita-1.patch"
-OPENAL_VITA_PATCH_SHA256="a31ebc39966298e31d2d77d43e9ac4352bd1b0a0f6d9f0f0e372a849bca349bf"
-OPENAL_DIR="$SRC/openal-soft-openal-soft-$OPENAL_VERSION"
 
 die() { echo "error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "missing host tool: $1"; }
+
+# shellcheck source=/dev/null
+. "$ROOT/vita/scripts/dep-pins.sh"
+THEORA_VERSION=$(dep_pin theora version)
+THEORA_URL=$(dep_pin theora url)
+THEORA_SHA256=$(dep_pin theora sha256)
+UCHARDET_URL=$(dep_pin uchardet repo)
+UCHARDET_TAG=$(dep_pin uchardet tag)
+UCHARDET_COMMIT=$(dep_pin uchardet commit)
+PIXMAN_VERSION=$(dep_pin pixman version)
+PIXMAN_URL=$(dep_pin pixman url)
+PIXMAN_SHA256=$(dep_pin pixman sha256)
+OPENAL_VERSION=$(dep_pin openal version)
+OPENAL_URL=$(dep_pin openal url)
+OPENAL_SHA256=$(dep_pin openal sha256)
+OPENAL_VITA_PATCH_URL=$(dep_pin openal patchUrl)
+OPENAL_VITA_PATCH_SHA256=$(dep_pin openal patchSha256)
+OPENAL_DIR="$SRC/openal-soft-openal-soft-$OPENAL_VERSION"
+PTHREAD_URL=$(dep_pin pthreadEmbedded repo)
+PTHREAD_COMMIT=$(dep_pin pthreadEmbedded commit)
+
+# verify_git_checkout <dir> <commit>: the managed checkout is at the pinned commit with no tracked edits.
+verify_git_checkout() {
+  local dir=$1 commit=$2
+  [[ "$(git -C "$dir" rev-parse HEAD)" == "$commit" ]] || die "$dir is not at pinned commit $commit; remove it and rebuild"
+  git -C "$dir" diff --quiet && git -C "$dir" diff --cached --quiet ||
+    die "$dir has tracked edits; remove it and rebuild"
+}
 
 # Vita compile flags shared with vita/meson/vita-cross.ini.
 VITA_CPU_FLAGS=(-mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard)
@@ -148,35 +174,53 @@ flatten_sdlsound_header() {
 }
 
 fetch_theora() {
-  if [[ -x "$THEORA_DIR/configure" ]]; then
+  local tar="$DIST/libtheora-$THEORA_VERSION.tar.gz"
+  need curl
+  fetch_verified "$THEORA_URL" "$THEORA_SHA256" "$tar"
+  if [[ -x "$THEORA_DIR/configure" && -f "$THEORA_DIR/.mkxpz-tree-sha256" ]]; then
+    verify_tree "$THEORA_DIR"
     return 0
   fi
-  echo "==> fetching theora (libtheora-1.1.1 tarball)"
+  echo "==> unpacking theora $THEORA_VERSION (sha256 verified)"
   mkdir -p "$SRC"
-  local tar="$SRC/libtheora-1.1.1.tar.gz"
-  curl -fsSL --retry 3 -o "$tar" "$THEORA_URL"
-  rm -rf "$SRC/libtheora-1.1.1" "$THEORA_DIR"
+  rm -rf "$SRC/libtheora-$THEORA_VERSION" "$THEORA_DIR"
   tar -C "$SRC" -xzf "$tar"
-  mv "$SRC/libtheora-1.1.1" "$THEORA_DIR"
-  rm -f "$tar"
+  mv "$SRC/libtheora-$THEORA_VERSION" "$THEORA_DIR"
+  seal_tree "$THEORA_DIR"
+}
+
+# One -ffile-prefix-map per local root, general prefix first (GCC applies the last match): DWARF and
+# __FILE__ carry no build-machine path. Whitespace paths are skipped rather than split into broken flags.
+deps_path_maps() {
+  local lines="" pair from to
+  for pair in "${HOME:-}|/mkxpz-home" "$ROOT|/mkxp-z-vita" "$DEPS_ROOT|/vita-deps"; do
+    from=${pair%%|*}
+    to=${pair#*|}
+    [[ -n "$from" && "$from" != "/" ]] || continue
+    case "$from" in *[[:space:]]*) continue ;; esac
+    lines="$lines${#from} -ffile-prefix-map=$from=$to
+"
+  done
+  printf '%s' "$lines" | sort -u -n -k1,1 | cut -d' ' -f2-
 }
 
 build_theora() {
   need curl
   fetch_theora
+  # Out of tree: configure and make never write into the pristine, sealed source
+  # (their config.log, config.status and Makefiles carry the builder's paths).
+  rm -rf "$BDIR/theora"
   mkdir -p "$BDIR/theora"
-  echo "==> configure theora 1.1.1 -> $PREFIX"
+  echo "==> configure theora $THEORA_VERSION -> $PREFIX"
   (
-    cd "$THEORA_DIR"
-    # distclean if a previous configure exists
-    if [[ -f Makefile ]]; then make distclean >/dev/null 2>&1 || true; fi
+    cd "$BDIR/theora"
     CC=arm-vita-eabi-gcc \
-    CPPFLAGS="-I$SYSROOT/include" \
+    CPPFLAGS="-I$SYSROOT/include $(deps_path_maps | tr '\n' ' ')" \
     LDFLAGS="-L$SYSROOT/lib" \
-    ./configure --host=arm-vita-eabi \
+    "$THEORA_DIR/configure" --host=arm-vita-eabi \
       --prefix="$PREFIX" \
       --disable-shared --enable-static \
-      --disable-examples --disable-oggtest --disable-asm \
+      --disable-examples --disable-oggtest --disable-asm --disable-spec \
       --with-ogg="$SYSROOT" \
       > "$BDIR/theora/configure.log" 2>&1 \
       || { tail -40 "$BDIR/theora/configure.log" >&2; die "theora configure failed (log: $BDIR/theora/configure.log)"; }
@@ -185,6 +229,7 @@ build_theora() {
     make install > "$BDIR/theora/install.log" 2>&1 \
       || { tail -20 "$BDIR/theora/install.log" >&2; die "theora install failed"; }
   )
+  verify_tree "$THEORA_DIR"
   # Drop theora docs from the prefix (large, unused).
   rm -rf "$PREFIX/share/doc/libtheora-"*
   [[ -f "$PREFIX/lib/libtheora.a" ]] || die "theora: libtheora.a missing after install"
@@ -193,12 +238,13 @@ build_theora() {
 }
 
 fetch_uchardet() {
-  if [[ -d "$UCHARDET_DIR/.git" ]]; then
-    return 0
+  if [[ ! -d "$UCHARDET_DIR/.git" ]]; then
+    echo "==> fetching uchardet $UCHARDET_TAG"
+    mkdir -p "$SRC"
+    git clone --quiet --depth 1 --branch "$UCHARDET_TAG" "$UCHARDET_URL" "$UCHARDET_DIR"
   fi
-  echo "==> fetching uchardet $UCHARDET_TAG"
-  mkdir -p "$SRC"
-  git clone --quiet --depth 1 --branch "$UCHARDET_TAG" "$UCHARDET_URL" "$UCHARDET_DIR"
+  # The tag is movable: the pinned commit is the identity, checked on a fresh clone and on a cached one.
+  verify_git_checkout "$UCHARDET_DIR" "$UCHARDET_COMMIT"
 }
 
 build_uchardet() {
@@ -225,6 +271,7 @@ build_uchardet() {
     || die "uchardet install failed"
   [[ -f "$PREFIX/lib/libuchardet.a" ]] || die "uchardet: libuchardet.a missing after install"
   [[ -f "$PREFIX/lib/pkgconfig/uchardet.pc" ]] || die "uchardet: uchardet.pc missing after install"
+  verify_git_checkout "$UCHARDET_DIR" "$UCHARDET_COMMIT"
   echo "    libuchardet.a  uchardet.pc  (Cflags -Iinclude/uchardet for <uchardet.h>)"
 }
 
@@ -283,17 +330,18 @@ build_sdlsound() {
 }
 
 fetch_pixman() {
-  if [[ -f "$PIXMAN_DIR/meson.build" ]]; then
+  local tar="$DIST/pixman-$PIXMAN_VERSION.tar.gz"
+  need curl
+  fetch_verified "$PIXMAN_URL" "$PIXMAN_SHA256" "$tar"
+  if [[ -f "$PIXMAN_DIR/meson.build" && -f "$PIXMAN_DIR/.mkxpz-tree-sha256" ]]; then
+    verify_tree "$PIXMAN_DIR"
     return 0
   fi
-  echo "==> fetching pixman $PIXMAN_VERSION tarball"
+  echo "==> unpacking pixman $PIXMAN_VERSION (sha256 verified)"
   mkdir -p "$SRC"
-  local tar="$SRC/pixman-$PIXMAN_VERSION.tar.gz"
-  curl -fsSL --retry 3 -o "$tar" "$PIXMAN_URL"
   rm -rf "$SRC/pixman-$PIXMAN_VERSION" "$PIXMAN_DIR"
   tar -C "$SRC" -xzf "$tar"
   mv "$SRC/pixman-$PIXMAN_VERSION" "$PIXMAN_DIR"
-  rm -f "$tar"
   # VitaSDK binutils 2.46 rejects the leading-zero numeric local labels in
   # pixman-arm-simd-asm.S. Upstream commit 865e6ce0 ("pixman: Adjust arm
   # assembly for binutils change", 2024-07-12) strips the leading zeros in
@@ -303,6 +351,7 @@ fetch_pixman() {
   sed -i.bak -E 's/^([[:space:]]*)0([0-9]):/\1\2:/; s/(^|[[:space:]])0([0-9])([fb])/\1\2\3/g' \
     "$PIXMAN_DIR/pixman/pixman-arm-simd-asm.S"
   rm -f "$PIXMAN_DIR/pixman/pixman-arm-simd-asm.S.bak"
+  seal_tree "$PIXMAN_DIR"
 }
 
 build_pixman() {
@@ -379,36 +428,28 @@ EOF
     || { tail -40 "$BDIR/pixman/install.log" >&2; die "pixman install failed"; }
   [[ -f "$PREFIX/lib/libpixman-1.a" ]] || die "pixman: libpixman-1.a missing after install"
   [[ -f "$PREFIX/lib/pkgconfig/pixman-1.pc" ]] || die "pixman: pixman-1.pc missing after install"
+  verify_tree "$PIXMAN_DIR"
   echo "    libpixman-1.a  pixman-1.pc  (release -O2, function/data sections)"
 }
 
-verify_sha256() {
-  local file=$1 expect=$2 got
-  got="$(shasum -a 256 "$file" | cut -d' ' -f1)"
-  [[ "$got" == "$expect" ]] || die "sha256 mismatch: $file (got $got, want $expect)"
-}
-
 fetch_openal() {
-  if [[ -f "$OPENAL_DIR/OpenAL32/Include/alMain.h" ]]; then
-    return 0
-  fi
   need curl
   need shasum
   need patch
+  local tar="$DIST/openal-soft-$OPENAL_VERSION.tar.gz"
+  local vita_patch="$DIST/openal-soft-$OPENAL_VERSION-vita-1.patch"
+  fetch_verified "$OPENAL_URL" "$OPENAL_SHA256" "$tar"
+  fetch_verified "$OPENAL_VITA_PATCH_URL" "$OPENAL_VITA_PATCH_SHA256" "$vita_patch"
+  if [[ -f "$OPENAL_DIR/OpenAL32/Include/alMain.h" && -f "$OPENAL_DIR/.mkxpz-tree-sha256" ]]; then
+    verify_tree "$OPENAL_DIR"
+    return 0
+  fi
+  echo "==> unpacking openal-soft $OPENAL_VERSION + Vita backend patch (sha256 verified)"
   mkdir -p "$SRC"
-  local tar="$SRC/openal-soft-$OPENAL_VERSION.tar.gz"
-  local vita_patch="$SRC/openal-soft-$OPENAL_VERSION-vita-1.patch"
-  echo "==> fetching openal-soft $OPENAL_VERSION + Vita backend patch"
-  curl -fsSL --retry 3 -o "$tar" "$OPENAL_URL"
-  verify_sha256 "$tar" "$OPENAL_SHA256"
-  curl -fsSL --retry 3 -o "$vita_patch" "$OPENAL_VITA_PATCH_URL"
-  verify_sha256 "$vita_patch" "$OPENAL_VITA_PATCH_SHA256"
-  rm -rf "$SRC/openal-soft-openal-soft-$OPENAL_VERSION" "$OPENAL_DIR"
+  rm -rf "$OPENAL_DIR"
   tar -C "$SRC" -xzf "$tar"
-  rm -f "$tar"
   patch -d "$OPENAL_DIR" -p1 < "$vita_patch" \
     || { echo "patch output above" >&2; die "openal: Vita backend patch failed"; }
-  rm -f "$vita_patch"
   # Vita newlib printf does not honour %zu: it prints the literal letters and
   # does not consume the size_t, so the next conversion reads the wrong slot
   # (device data abort in strlen from _vfprintf_r). alMain.h
@@ -420,6 +461,7 @@ fetch_openal() {
   rm -f "$OPENAL_DIR/OpenAL32/Include/alMain.h.bak"
   grep -q '^#define SZFMT "%u"$' "$OPENAL_DIR/OpenAL32/Include/alMain.h" \
     || die "openal: SZFMT substitution did not land"
+  seal_tree "$OPENAL_DIR"
 }
 
 build_openal() {
@@ -471,7 +513,24 @@ build_openal() {
   fi
   grep -q 'Freed %u context property object%s' <<< "$openal_strings" \
     || die "openal: SZFMT %u did not reach the archive strings"
+  verify_tree "$OPENAL_DIR"
   echo "    libopenal.a  openal.pc  (SZFMT -> %u; vita/null/wave/loopback backends, NEON on)"
+}
+
+# Source only: the VitaSDK libpthread that the player links is a toolchain binary; the pinned
+# source is fetched so the release source archive can carry it.
+fetch_pthread_embedded() {
+  need git
+  if [[ ! -d "$PTHREAD_DIR/.git" ]]; then
+    echo "==> fetching pthread-embedded $PTHREAD_COMMIT"
+    mkdir -p "$SRC"
+    git clone --quiet --no-checkout "$PTHREAD_URL" "$PTHREAD_DIR"
+  fi
+  if ! git -C "$PTHREAD_DIR" cat-file -e "$PTHREAD_COMMIT^{commit}" 2>/dev/null; then
+    git -C "$PTHREAD_DIR" fetch --quiet origin "$PTHREAD_COMMIT"
+  fi
+  git -C "$PTHREAD_DIR" checkout --quiet --force --detach "$PTHREAD_COMMIT"
+  verify_git_checkout "$PTHREAD_DIR" "$PTHREAD_COMMIT"
 }
 
 status() {
@@ -523,6 +582,7 @@ case "$MODE" in
     build_sdlsound
     build_pixman
     build_openal
+    fetch_pthread_embedded
     write_wrapper
     echo
     status
@@ -552,6 +612,9 @@ case "$MODE" in
     build_openal
     write_wrapper
     ;;
+  pthread-embedded)
+    fetch_pthread_embedded
+    ;;
   wrapper)
     write_wrapper
     ;;
@@ -563,6 +626,6 @@ case "$MODE" in
     rm -rf "$DEPS_ROOT"
     ;;
   *)
-    die "unknown mode: $MODE (all|theora|uchardet|sdl2_sound|pixman|openal|wrapper|status|clean)"
+    die "unknown mode: $MODE (all|theora|uchardet|sdl2_sound|pixman|openal|pthread-embedded|wrapper|status|clean)"
     ;;
 esac

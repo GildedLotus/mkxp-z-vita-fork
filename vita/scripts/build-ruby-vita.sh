@@ -34,9 +34,11 @@ MODE="${1:-configure}"
 export PATH="$VITASDK/bin:$PATH"
 
 BASERUBY="${BASERUBY:-$HOME/.local/ruby-3.1.3-mkxpz/bin/ruby}"
-SRC="${SRC:-$ROOT/build/ruby-src}"
-BUILD="${BUILD:-$ROOT/build/ruby-vita}"
-PREFIX="${PREFIX:-$ROOT/build/ruby-vita-prefix}"
+# Project-specific names: a generic SRC or PREFIX in the caller's environment must never select
+# a directory this script resets or empties. All three must lie inside $ROOT/build.
+SRC="${MKXPZ_RUBY_SRC:-$ROOT/build/ruby-src}"
+BUILD="${MKXPZ_RUBY_BUILD:-$ROOT/build/ruby-vita}"
+PREFIX="${MKXPZ_RUBY_PREFIX:-$ROOT/build/ruby-vita-prefix}"
 CONFIG_SITE="$ROOT/vita/ruby/config.site"
 export CONFIG_SITE
 
@@ -54,6 +56,11 @@ export BASERUBY CONFIGURE_PREFIX
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
 
 die() { echo "error: $*" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$ROOT/vita/scripts/dep-pins.sh"
+require_under_build MKXPZ_RUBY_SRC "$SRC"
+require_under_build MKXPZ_RUBY_BUILD "$BUILD"
+require_under_build MKXPZ_RUBY_PREFIX "$PREFIX"
 provenance() {
   python3 "$ROOT/vita/scripts/ruby-provenance.py" "$1" \
     --src "$SRC" --build "$BUILD" --prefix "$PREFIX"
@@ -190,26 +197,9 @@ fi
 [[ -d "$SRC" ]] || die "missing ruby source at $SRC (clone mkxp-z/ruby @ 4d85560c)"
 [[ "$(git -C "$SRC" rev-parse HEAD)" == 4d85560cf65938d7883a323bf553acad1faf5eae ]] || die "Ruby source does not match the pinned revision"
 
-# config.guess / config.sub are not in the git tree
-mkdir -p "$SRC/tool"
-fetch_config_aux() {
-  local name=$1 dest=$2
-  [[ -f "$dest" ]] && return 0
-  local url
-  for url in \
-    "https://raw.githubusercontent.com/gcc-mirror/gcc/master/$name" \
-    "https://git.savannah.gnu.org/cgit/config.git/plain/$name"
-  do
-    if curl -fsSL --max-time 30 -o "$dest" "$url"; then
-      chmod +x "$dest"
-      return 0
-    fi
-  done
-  echo "error: could not fetch $name" >&2
-  return 1
-}
-fetch_config_aux config.guess "$SRC/tool/config.guess"
-fetch_config_aux config.sub "$SRC/tool/config.sub"
+# config.guess / config.sub are not in the git tree: the pinned gcc-mirror commits of vita/scripts/dep-pins.json,
+# digest-checked, never whatever a branch holds today. The release source archive carries them.
+fetch_gnu_config "$SRC/tool" "$ROOT/build/vita-deps/dist"
 
 # Apply in-repo MRI patches (never edit the clone in place by hand).
 PATCH_DIR="$ROOT/vita/patches/ruby"

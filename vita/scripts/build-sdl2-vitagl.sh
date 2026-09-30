@@ -164,6 +164,8 @@ if [[ -z ${SDL2_VITAGL_SRC:-} ]]; then
   echo "==> fetch SDL2-$SDL2_VER (verified) -> $SRC"
   sdl2_fetch_src "$SRC" die
   apply_backend_patch
+  # The release source archive takes this tree as it is: seal it now, verify it after the build.
+  python3 -B "$ROOT/vita/scripts/treedigest.py" seal "$SRC"
 fi
 
 echo "==> cmake (VIDEO_VITA_VGL=ON) -> $PREFIX"
@@ -191,6 +193,9 @@ for lib in vitaGL vitashark mathneon; do
   grep -q -- "-l$lib" "$pc" || die "$pc no longer links -l$lib"
 done
 
+if [[ -z ${SDL2_VITAGL_SRC:-} ]]; then
+  python3 -B "$ROOT/vita/scripts/treedigest.py" verify "$SRC" || die "the SDL2 source tree changed during the build (built in tree?)"
+fi
 receipt write
 receipt check || die "installed payload does not match its receipt"
 grep 'VITA_VGL' "$PREFIX/include/SDL2/SDL_config.h"

@@ -1,0 +1,42 @@
+{
+  "theora": {
+    "version": "1.1.1",
+    "url": "https://downloads.xiph.org/releases/theora/libtheora-1.1.1.tar.gz",
+    "sha256": "40952956c47811928d1e7922cda3bc1f427eb75680c3c37249c91e949054916b",
+    "upstream": "https://downloads.xiph.org/releases/theora/"
+  },
+  "pixman": {
+    "version": "0.42.2",
+    "url": "https://cairographics.org/releases/pixman-0.42.2.tar.gz",
+    "sha256": "ea1480efada2fd948bc75366f7c349e1c96d3297d09a3fe62626e38e234a625e",
+    "upstream": "https://cairographics.org/releases/"
+  },
+  "openal": {
+    "version": "1.19.1",
+    "url": "https://github.com/kcat/openal-soft/archive/refs/tags/openal-soft-1.19.1.tar.gz",
+    "sha256": "9f3536ab2bb7781dbafabc6a61e0b34b17edd16bd6c2eaf2ae71bc63078f98c7",
+    "patchUrl": "https://raw.githubusercontent.com/isage/openal-soft/master/openal-soft-1.19.1-vita-1.patch",
+    "patchSha256": "a31ebc39966298e31d2d77d43e9ac4352bd1b0a0f6d9f0f0e372a849bca349bf",
+    "upstream": "https://github.com/kcat/openal-soft"
+  },
+  "uchardet": {
+    "repo": "https://gitlab.freedesktop.org/uchardet/uchardet",
+    "tag": "v0.0.8",
+    "commit": "ae6302a016088ad07177f86d417b20010053632b"
+  },
+  "pthreadEmbedded": {
+    "repo": "https://github.com/vitasdk/pthread-embedded",
+    "commit": "11d2e5722d98c86f33c908fc47b2cf6e55205db5"
+  },
+  "gnuConfig": {
+    "upstream": "https://github.com/gcc-mirror/gcc",
+    "config.guess": {
+      "commit": "74af13c174714dd3b9f1ded4b39955f003c16361",
+      "sha256": "7d1e3c79b86de601c3a0457855ab854dffd15163f53c91edac54a7be2e9c931b"
+    },
+    "config.sub": {
+      "commit": "6fad101f3063d722e3348d07dc93cf737f8709e4",
+      "sha256": "71b8d73e46e0c31b1dc91ba5306f5ef0af009273b3bb283f31d8dad69666fa9e"
+    }
+  }
+}

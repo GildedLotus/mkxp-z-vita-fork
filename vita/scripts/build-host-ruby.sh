@@ -8,11 +8,11 @@
 #
 # Usage:
 #   vita/scripts/build-host-ruby.sh
-#   PREFIX=/path/to/prefix JOBS=8 vita/scripts/build-host-ruby.sh
+#   MKXPZ_HOST_RUBY_PREFIX=/path/to/prefix JOBS=8 vita/scripts/build-host-ruby.sh
 #
 # Defaults:
-#   PREFIX  $HOME/.local/ruby-3.1.3-mkxpz
-#   SRC     <repo>/build/ruby-src          (gitignored)
+#   MKXPZ_HOST_RUBY_PREFIX  $HOME/.local/ruby-3.1.3-mkxpz
+#   MKXPZ_HOST_RUBY_SRC     <repo>/build/ruby-src          (gitignored; must be inside <repo>/build)
 #   pin     mkxp-z/ruby @ 4d85560cf65938d7883a323bf553acad1faf5eae
 #           (branch mkxp-z-3.1.3)
 set -euo pipefail
@@ -22,8 +22,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 RUBY_REPO="${RUBY_REPO:-https://github.com/mkxp-z/ruby.git}"
 RUBY_BRANCH="${RUBY_BRANCH:-mkxp-z-3.1.3}"
 RUBY_REF="${RUBY_REF:-4d85560cf65938d7883a323bf553acad1faf5eae}"
-SRC="${SRC:-$ROOT/build/ruby-src}"
-PREFIX="${PREFIX:-${MKXPZ_HOST_RUBY_PREFIX:-$HOME/.local/ruby-3.1.3-mkxpz}}"
+SRC="${MKXPZ_HOST_RUBY_SRC:-$ROOT/build/ruby-src}"
+PREFIX="${MKXPZ_HOST_RUBY_PREFIX:-$HOME/.local/ruby-3.1.3-mkxpz}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
 
 # Bootstrap ruby used only to generate files *while building* this host ruby.
@@ -37,6 +37,10 @@ if [[ -z "${BOOTSTRAP_RUBY:-}" ]]; then
 fi
 
 die() { echo "error: $*" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$ROOT/vita/scripts/dep-pins.sh"
+# The source directory is reset (clean -fdx) or deleted below.
+require_under_build MKXPZ_HOST_RUBY_SRC "$SRC"
 
 case "$PREFIX" in
   /usr|/usr/local|/usr/local/*|/opt/homebrew|/opt/homebrew/*)
@@ -89,22 +93,8 @@ autoconf
 [[ -f configure ]] || die "autoconf did not produce ./configure"
 
 # AC_CONFIG_AUX_DIR(tool) looks for these *before* configure.ac's downloader
-# runs, so fetch them up front. Prefer MRI's downloader; curl is the fallback.
-fetch_gnu_aux() {
-  local f dest="$SRC/tool"
-  for f in config.guess config.sub; do
-    [[ -f "$dest/$f" ]] && continue
-    if ! "$BOOTSTRAP_RUBY" -C "$SRC" tool/downloader.rb -d tool -e gnu "$f"; then
-      echo "downloader.rb failed for $f; trying curl" >&2
-      curl -fsSL "https://raw.githubusercontent.com/gcc-mirror/gcc/master/$f" -o "$dest/$f" \
-        || curl -fsSL "https://git.savannah.gnu.org/cgit/config.git/plain/$f" -o "$dest/$f" \
-        || die "failed to download tool/$f"
-    fi
-    [[ -f "$dest/$f" ]] || die "missing tool/$f after download"
-    chmod +x "$dest/$f"
-  done
-}
-fetch_gnu_aux
+# runs, so put them in place up front: the pinned, digest-checked copies.
+fetch_gnu_config "$SRC/tool" "$ROOT/build/vita-deps/dist"
 
 # Static-friendly enough to serve as baseruby: static libruby is still
 # installed, extensions are folded in. --enable-shared is required on
