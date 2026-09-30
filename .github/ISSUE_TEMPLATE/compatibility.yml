@@ -1,0 +1,90 @@
+name: Game compatibility report
+description: A specific RPG Maker XP, VX or VX Ace game doesn't work, or works differently than on PC.
+title: "[Compat] <game name>: <what goes wrong>"
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing a game. Before filing, check [COMPATIBILITY.md](https://github.com/GildedLotus/mkxp-z-vita-fork/blob/vita/vita/COMPATIBILITY.md) (the game may already be listed, and its known engine limits apply to every game) and the [player guide](https://github.com/GildedLotus/mkxp-z-vita-fork/blob/vita/vita/README.md). Games copied over FTP often fail with missing files; use VitaShell's USB mode.
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: Name, and where it can be downloaded if it's free.
+      placeholder: "Blank Dream (itch.io)"
+    validations:
+      required: true
+  - type: input
+    id: game-version
+    attributes:
+      label: Game version
+      description: The release you copied, as shown by the game or its download page.
+      placeholder: "1.05"
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: "From the `Scripts=` line of `Game.ini`: `.rxdata` is XP, `.rvdata` VX, `.rvdata2` VX Ace."
+      options:
+        - XP (RGSS1)
+        - VX (RGSS2)
+        - VX Ace (RGSS3)
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: player-version
+    attributes:
+      label: mkxp-z for PS Vita version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: rtp
+    attributes:
+      label: RTP installed
+      description: Which RTP folders exist under ux0:/data/mkxp-z/rtp/?
+      multiple: true
+      options:
+        - None
+        - XP
+        - VX
+        - VXAce
+    validations:
+      required: true
+  - type: dropdown
+    id: how-far
+    attributes:
+      label: How far does it get?
+      options:
+        - Doesn't appear in the game list
+        - Crashes or returns to the list/LiveArea before the title screen
+        - Title screen, then fails
+        - In game, then fails at a specific point
+        - Runs, but something looks, sounds or plays wrong
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did right before the problem, what you expected, and what you saw or heard instead. Screenshots or photos help.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: |
+        Attach `ux0:/data/mkxp-z/logs/mkxp-z.log` from the failing run (the previous run is `mkxp-z.1.log`), and `ux0:/data/mkxp-z/last-error.txt` if it exists. Drag the file into this box.
+        **Do not attach `.psp2dmp` crash dumps**: they contain a copy of the process's memory.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Custom config (config.json or the game's mkxp.json), fan translations or mods applied, SD2Vita or official memory card, whether it works in desktop mkxp-z.

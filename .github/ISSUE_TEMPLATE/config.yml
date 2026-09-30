@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Player guide (installing, adding games, RTPs, SoundFonts, controls)
+    url: https://github.com/GildedLotus/mkxp-z-vita-fork/blob/vita/vita/README.md
+    about: Most setup questions are answered here.
+  - name: Desktop mkxp-z (Windows, Linux, macOS)
+    url: https://github.com/mkxp-z/mkxp-z
+    about: This repository is the PS Vita port only; report desktop problems upstream.
