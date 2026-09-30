@@ -369,7 +369,7 @@ def label(item):
         if changes:
             what = "patched tree of %s (already applied: %s)" % (what, ", ".join(changes))
         return "%s; tree sha256 %s" % (what, item["treeSha256"])
-    return "files pinned by sha256 in dep-pins.json: " + ", ".join(sorted(item["files"]))
+    return "files, each pinned by sha256: " + ", ".join(sorted(item["files"]))
 
 
 def record_text():
