@@ -247,8 +247,8 @@ bool shrinkRects(int &sourcePos, int &sourceLen, const int &sBitmapLen,
  * three (Cortex-A9 has no hardware divide; only a / by a runtime value is
  * an __aeabi_uidiv library call -- a constant divisor is a shift or a
  * reciprocal multiply), both bit-identical to the generic formula
- * The third divides once per pixel instead of three times
- */
+ * The third takes a table-seeded reciprocal once per pixel and multiplies:
+ * no divide at all. */
 
 /* da == 0: A = c1*255 divides N = c1*s*255 exactly, so out.rgb = src.rgb
  * and out.a = round(c1/255). c1 == 0 is the A == 0 case, and the same
@@ -275,52 +275,64 @@ SWR_INLINE void blendOpaqueDst(uint8_t *d, const uint8_t *s, uint32_t c1)
     d[2] = (uint8_t)((c1 * s[2] + inv * d[2] + 32512) / 65025);
 }
 
-/* n / A for a runtime A, from a reciprocal the caller computed once
- * recip is 0xFFFFFFFF / A, the single __aeabi_uidiv the
- * translucent class still pays; every quotient after that is a umull plus
- * a correction step.
- *
- * Exact for every A and n the caller below can produce, i.e. for
- * 65279 <= A <= 16581375 and 0 <= n <= 255*A + A/2. Write
- * 0xFFFFFFFF = recip*A + r with 0 <= r <= A-1, and q = n / A. Then
- *
- *   est = (n*recip) >> 32 = floor( (n/A) * (1 - (1+r)/2^32) )
- *
- * which is at most floor(n/A) == q, and is more than n/A - 1 >= q - 1
- * because (n/A)*(1+r)/2^32 <= 255.5 * 16581375 / 2^32 == 0.9865 < 1.
- * So est is q or q-1, and n - est*A is q's remainder or that remainder
- * plus A: one compare-and-add finishes it. Nothing overflows --
- * n <= 255.5*A < 2^32, est*A <= 255*A < 2^32, n*recip <= 255.5*2^32 < 2^64.
- *
- * The bound was checked for
- * every reachable A exhaustively (it is the one step the algebra above
- * cannot be read off by eye) and the quotient itself at every boundary of
- * a dense A sample; reciprocal_contract() asserts this file still spells
- * the reciprocal the way that proof assumes. */
-SWR_INLINE uint32_t divByRecip(uint32_t n, uint32_t A, uint32_t recip)
+/* 2^47 / A for a runtime A, division-free, never above the true value and
+ * within 1/257 + 2^-22 of it (relative). A is normalised to a in
+ * [2^31, 2^32) by its leading zeros (8..16 for the reachable A), and its top
+ * nine bits pick the entry floor(2^40 / (257+i)), the reciprocal of the
+ * upper end of a's bin, so the estimate is low by less than one bin. */
+struct RecipSeed {
+    uint32_t v[256];
+    constexpr RecipSeed() : v()
+    {
+        for (uint32_t i = 0; i < 256; ++i)
+            v[i] = (uint32_t)((uint64_t(1) << 40) / (257 + i));
+    }
+};
+constexpr RecipSeed kRecipSeed;
+
+SWR_INLINE uint32_t reciprocal47(uint32_t A)
 {
-    const uint32_t est = (uint32_t)(((uint64_t)n * recip) >> 32);
+    const int s = __builtin_clz(A);
+    return kRecipSeed.v[((A << s) >> 23) - 256] >> (16 - s);
+}
+
+/* n / A for a runtime A from R = reciprocal47(A). Exact for every A and n
+ * the caller below can produce, i.e. for 65279 <= A <= 16581375 and
+ * 0 <= n <= 255*A + A/2. With q = n / A and R <= 2^47/A,
+ *
+ *   est = (n*R) >> 47 <= q, and q - est <= 1 because
+ *   n/A - n*R/2^47 = n*E/(A*2^47) < 1 for E = 2^47 - A*R,
+ *
+ * so n - est*A is q's remainder or that remainder plus A: one
+ * compare-and-add finishes it. Nothing overflows: R < 2^32 (A >= 65279),
+ * n*R < 255.5*2^47, est*A <= n < 2^32.
+ *
+ * The condition n_max*E < A*2^47 is the one step that cannot be read off by
+ * eye; it was checked for EVERY A in the range, together with mutations of
+ * the seed, the shift and the correction to prove the check bites, which
+ * with the argument above proves the quotient exact for every pixel input. */
+SWR_INLINE uint32_t divByRecip(uint32_t n, uint32_t A, uint32_t R)
+{
+    const uint32_t est = (uint32_t)(((uint64_t)n * R) >> 47);
     return est + (uint32_t)((n - est * A) >= A);
 }
 
-/* 0 < da < 255, c1 > 0: the generic formula, and the only path that
- * really divides by a runtime value. The three channels share one divisor,
- * so it divides once into a reciprocal and multiplies three times
- * -- one __aeabi_uidiv per pixel instead of three on a Cortex-A9, which
- * has no hardware divide. Bit-identical to the pre-kernel division:
- * divByRecip. The other two / below have compile-time divisors -- a shift
- * and a reciprocal multiply -- and cost no call at all. */
+/* 0 < da < 255, c1 > 0: the generic formula. The three channels share one
+ * divisor, so it is turned into a reciprocal once per pixel without a
+ * divide (Cortex-A9 has no hardware divide: a runtime / is an
+ * __aeabi_uidiv call). Bit-identical to the original three-division
+ * kernel: see divByRecip. The other / below have compile-time divisors. */
 SWR_INLINE void blendTranslucentDst(uint8_t *d, const uint8_t *s, uint32_t c1,
                                     uint32_t da)
 {
     const uint32_t k = da * (65025 - c1);
     const uint32_t A = c1 * 255 + k;
     const uint32_t half = A / 2;
-    const uint32_t recip = 0xFFFFFFFFu / A;
+    const uint32_t R = reciprocal47(A);
     d[3] = (uint8_t)((A + 32512) / 65025);
-    d[0] = (uint8_t)divByRecip(c1 * s[0] * 255 + k * d[0] + half, A, recip);
-    d[1] = (uint8_t)divByRecip(c1 * s[1] * 255 + k * d[1] + half, A, recip);
-    d[2] = (uint8_t)divByRecip(c1 * s[2] * 255 + k * d[2] + half, A, recip);
+    d[0] = (uint8_t)divByRecip(c1 * s[0] * 255 + k * d[0] + half, A, R);
+    d[1] = (uint8_t)divByRecip(c1 * s[1] * 255 + k * d[1] + half, A, R);
+    d[2] = (uint8_t)divByRecip(c1 * s[2] * 255 + k * d[2] + half, A, R);
 }
 
 /* One pixel, any class. Same results as the pre-blendOver.
@@ -328,7 +340,7 @@ SWR_INLINE void blendTranslucentDst(uint8_t *d, const uint8_t *s, uint32_t c1,
  * blendTranslucentDst: k == 0, A == 255*65025, so each channel is
  * (s*A + A/2)/A == s and alpha (A + 32512)/65025 == 255 -- so it is a
  * copy. The forward row kernel already copies such runs; this spares the
- * mirrored and stretched loops the reciprocal division. */
+ * mirrored and stretched loops the reciprocal. */
 SWR_INLINE void blendOver(uint8_t *d, const uint8_t *s, uint32_t op)
 {
     const uint32_t da = d[3];
@@ -612,8 +624,10 @@ void simpleRowForward(uint8_t *SWR_RESTRICT d, const uint8_t *SWR_RESTRICT s,
     }
 }
 
-/* Shipped double blend: retained unchanged for smooth fallback pixels. */
-void blendOverD(uint8_t *d, const double *s, uint32_t op)
+/* Shipped double blend, verbatim: the reference for blendOverD below and
+ * its fallback for pixels that fast path cannot certify. */
+__attribute__((noinline))
+void blendOverDExact(uint8_t *d, const double *s, uint32_t op)
 {
     double co1 = (s[3] * (double)op) / 65025.0;
     double co2 = ((double)d[3] / 255.0) * (1.0 - co1);
@@ -633,6 +647,50 @@ void blendOverD(uint8_t *d, const double *s, uint32_t op)
     }
 }
 
+/* True when t = v + 0.5 lies at least 2^-20 inside one integer bin, so
+ * (int)t == floor(t) is the same byte for any evaluation of v within 2^-20. */
+SWR_INLINE bool binCertified(double t)
+{
+    return std::fabs(t - (double)(int)t - 0.5) < 0.5 - 1.0 / 1048576.0;
+}
+
+/* blendOverDExact without its per-pixel divides and floor() calls:
+ * the two constant divisors become multiplies by their reciprocals and the
+ * three channel quotients share one reciprocal of outa. Every quantity is
+ * >= 0 up to a cancellation in 1 - co1 that only appears where outa ~ 1,
+ * so this and the exact path are each within ~2^-38 of the real-number
+ * result, four orders below the 2^-20 bin margin. A pixel whose four results
+ * are all inside a bin therefore rounds to the same bytes in both; any pixel
+ * near a rounding boundary, which includes every exact tie the shipped
+ * double math resolves one way or the other, takes the exact path.
+ * outa == 0 needs no division to detect: co1 is zero only for
+ * s[3]*op == 0, and then co2 is zero only for d[3] == 0. */
+void blendOverD(uint8_t *d, const double *s, uint32_t op)
+{
+    const double sop = s[3] * (double)op;
+    if (sop == 0.0 && d[3] == 0) {
+        blendOverDExact(d, s, op);
+        return;
+    }
+    const double co1 = sop * (1.0 / 65025.0);
+    const double co2 = ((double)d[3] * (1.0 / 255.0)) * (1.0 - co1);
+    const double outa = co1 + co2;
+    const double inv = 1.0 / outa;
+    double t[4];
+    t[3] = outa * 255.0 + 0.5;
+    bool ok = binCertified(t[3]);
+    for (int ch = 0; ch < 3; ++ch) {
+        t[ch] = (co1 * s[ch] + co2 * (double)d[ch]) * inv + 0.5;
+        ok &= binCertified(t[ch]);
+    }
+    if (!ok) {
+        blendOverDExact(d, s, op);
+        return;
+    }
+    for (int ch = 0; ch < 4; ++ch)
+        d[ch] = (uint8_t)(int)t[ch];
+}
+
 struct SmoothTap {
     int lo, hi;
     uint32_t weight;
@@ -640,27 +698,67 @@ struct SmoothTap {
     double legacyWeight;
 };
 
-/* Both maps are built once per axis, before the pixel loop. Keep the
- * shipped double coordinates as well: exact rational ties can land on
- * either side of a half-byte after the legacy floating-point blend. */
-SmoothTap makeSmoothTap(int i, int src, int dst)
+/* Taps 0..n-1 of an axis of n destination samples over `src` texels, in
+ * ascending order. Both maps are built once per axis, before
+ * the pixel loop. Keep the shipped double coordinates as well: exact
+ * rational ties can land on either side of a half-byte after the legacy
+ * floating-point blend. The integer map is the shipped one, per tap
+ *   N = clamp((2i+1)*src - n, 0, 2n(src-1)), lo = N / 2n,
+ *   weight = ((N % 2n)*65536 + n) / 2n,
+ * but N advances by a constant 2*src per tap, so the quotients and
+ * remainders are carried along and the only divisions are the three of the
+ * setup. */
+void makeSmoothTaps(SmoothTap *out, int n, int src)
 {
-    SmoothTap t{};
-    double f = ((double)i + 0.5) * ((double)src / (double)dst) - 0.5;
-    if (f < 0.0) f = 0.0;
-    if (f > (double)(src - 1)) f = (double)(src - 1);
-    t.legacyLo = (int)f; // Clamped nonnegative: truncation is the shipped floor.
-    t.legacyHi = t.legacyLo + 1 < src ? t.legacyLo + 1 : src - 1;
-    t.legacyWeight = f - (double)t.legacyLo;
+    const double ratio = (double)src / (double)n;
 #if SWR_NEON
-    const int64_t den = 2 * (int64_t)dst;
-    int64_t n = (2 * (int64_t)i + 1) * src - dst;
-    n = std::max<int64_t>(0, std::min(n, den * (src - 1)));
-    t.lo = (int)(n / den);
-    t.hi = t.lo + 1 < src ? t.lo + 1 : src - 1;
-    t.weight = (uint32_t)(((n % den) * 65536 + den / 2) / den);
+    const int64_t den = 2 * (int64_t)n, step = 2 * (int64_t)src;
+    const int64_t stepQ = step / den, stepR = step % den;
+    const int64_t stepW = stepR * 65536 / den, stepWR = stepR * 65536 % den;
+    int64_t q, r = (int64_t)src - n;
+    if (r >= 0) {
+        q = r / den;
+        r %= den;
+    } else {
+        q = -1;
+        r += den;
+    }
+    int64_t W = (r * 65536 + den / 2) / den, WR = (r * 65536 + den / 2) % den;
 #endif
-    return t;
+    for (int i = 0; i < n; ++i) {
+        SmoothTap &t = out[i];
+        t = SmoothTap{};
+        double f = ((double)i + 0.5) * ratio - 0.5;
+        if (f < 0.0) f = 0.0;
+        if (f > (double)(src - 1)) f = (double)(src - 1);
+        t.legacyLo = (int)f; // Clamped nonnegative: truncation is the shipped floor.
+        t.legacyHi = t.legacyLo + 1 < src ? t.legacyLo + 1 : src - 1;
+        t.legacyWeight = f - (double)t.legacyLo;
+#if SWR_NEON
+        if (q < 0) {
+            t.lo = 0;
+        } else if (q >= src - 1) {
+            t.lo = src - 1;
+        } else {
+            t.lo = (int)q;
+            t.weight = (uint32_t)W;
+        }
+        t.hi = t.lo + 1 < src ? t.lo + 1 : src - 1;
+        q += stepQ;
+        r += stepR;
+        W += stepW;
+        WR += stepWR;
+        if (WR >= den) {
+            WR -= den;
+            ++W;
+        }
+        if (r >= den) {
+            r -= den;
+            ++q;
+            W -= 65536;
+        }
+#endif
+    }
 }
 
 /* DELIBERATE legacy fallback for 0 < da < 255: that blend can amplify
@@ -948,7 +1046,7 @@ void blit(const Surface &dst, Rect dstRect, const Surface &src, Rect srcRect,
      * would corrupt pixels. */
     SourceView view;
     std::vector<int> sxLUT;
-    std::vector<SmoothTap> smoothX;
+    std::vector<SmoothTap> smoothX, smoothY;
     try {
         takeSourceView(view, src, srcRect, dst);
 
@@ -969,8 +1067,11 @@ void blit(const Surface &dst, Rect dstRect, const Surface &src, Rect srcRect,
         }
         if (smooth) {
             smoothX.resize((size_t)dw);
-            for (int dx = 0; dx < dw; ++dx)
-                smoothX[(size_t)dx] = makeSmoothTap(flipW ? dw - 1 - dx : dx, sw, dw);
+            makeSmoothTaps(smoothX.data(), dw, sw);
+            if (flipW)
+                std::reverse(smoothX.begin(), smoothX.end());
+            smoothY.resize((size_t)dh);
+            makeSmoothTaps(smoothY.data(), dh, sh);
         }
     } catch (...) {
         return;
@@ -1020,7 +1121,7 @@ void blit(const Surface &dst, Rect dstRect, const Surface &src, Rect srcRect,
                     blendOver(d, srow + (size_t)lut[dx] * 4, op);
             }
         } else {
-            const SmoothTap y = makeSmoothTap(iy, sh, dh);
+            const SmoothTap &y = smoothY[(size_t)iy];
             const uint8_t *base = srcBase + (size_t)soy * (size_t)srcStride +
                                   (size_t)sox * 4;
             blendSmoothRow(drow, base, srcStride, smoothX.data(), y, dw, op);
@@ -2365,31 +2466,43 @@ static void benchRun(void (*emit)(const char *line))
      * comparable. da == 0/255 use certified Q16 sampling; da == 128
      * deliberately keeps the shipped double sampler. Reset outside the
      * timer so every iteration measures its named destination class. */
-    static const int smoothDa[3] = { 0, 255, 128 };
-    static const char *const smoothName[3] = {
-        "blit_smooth_544x416_to_640x480_da0",
-        "blit_smooth_544x416_to_640x480_da255",
-        "blit_smooth_544x416_to_640x480_da128",
+    struct SmoothCase {
+        const char *name;
+        int sw, sh, dw, dh;
+        int da; /* destination alpha */
+        int sa; /* source alpha; < 0 = alternating 0/128/255 */
+        int iters;
+    };
+    /* The last two: a translucent destination under a source
+     * of varying alpha -- the fractional-alpha traffic the certified double
+     * blend (blendOverD) carries, unlike da128's uniform sa == 255 -- and a
+     * few pixels behind 2048 column taps, which is the tap builder alone. */
+    static const SmoothCase smoothCases[] = {
+        { "blit_smooth_544x416_to_640x480_da0",   544, 416, 640, 480, 0,   255, 3 },
+        { "blit_smooth_544x416_to_640x480_da255", 544, 416, 640, 480, 255, 255, 3 },
+        { "blit_smooth_544x416_to_640x480_da128", 544, 416, 640, 480, 128, 255, 3 },
+        { "blit_smooth_544x416_to_640x480_da128_sa_mixed", 544, 416, 640, 480, 128, -1, 3 },
+        { "blit_smooth_16x16_to_2048x8_da255",    16,  16,  2048, 8,  255, 255, 200 },
     };
 
-    for (int i = 0; i < 3; ++i) {
-        const int sw = 544, sh = 416, dw = 640, dh = 480;
-        std::vector<uint8_t> spix((size_t)sw * (size_t)sh * 4);
-        std::vector<uint8_t> pristine((size_t)dw * (size_t)dh * 4);
-        benchFillPattern(spix, 11, 13, 17, 255);
+    for (const SmoothCase &c : smoothCases) {
+        std::vector<uint8_t> spix((size_t)c.sw * (size_t)c.sh * 4);
+        std::vector<uint8_t> pristine((size_t)c.dw * (size_t)c.dh * 4);
+        benchFillPattern(spix, 11, 13, 17, c.sa);
         for (size_t k = 0; k + 3 < pristine.size(); k += 4) {
             pristine[k + 0] = 10;
             pristine[k + 1] = 20;
             pristine[k + 2] = 30;
-            pristine[k + 3] = (uint8_t)smoothDa[i];
+            pristine[k + 3] = (uint8_t)c.da;
         }
         std::vector<uint8_t> dpix = pristine;
-        Surface d{dpix.data(), dw, dh, dw * 4};
-        Surface s{spix.data(), sw, sh, sw * 4};
+        Surface d{dpix.data(), c.dw, c.dh, c.dw * 4};
+        Surface s{spix.data(), c.sw, c.sh, c.sw * 4};
         uint32_t chk = 0;
         double ms = benchBlitRestoreMs(d, dpix, pristine, s,
-                                       Rect{0, 0, sw, sh}, 200, true, 3, chk);
-        benchEmit(emit, smoothName[i], ms, 3, chk);
+                                       Rect{0, 0, c.sw, c.sh}, 200, true,
+                                       c.iters, chk);
+        benchEmit(emit, c.name, ms, c.iters, chk);
     }
 
     /* The whole-surface effect kernels and the two controls. */
