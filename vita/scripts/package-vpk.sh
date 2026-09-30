@@ -118,7 +118,7 @@ ATTRIBUTE2="${ATTRIBUTE2:-12}"
 if [[ -z ${APP_VER:-} && -f "$ROOT/vita/VERSION" ]]; then
 	derived=$(tr -d ' \t\r\n' < "$ROOT/vita/VERSION")
 	if [[ $derived =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-		APP_VER=$(printf '%02d.%02d' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}")
+		APP_VER=$(printf '%02d.%02d' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))")
 	fi
 fi
 
