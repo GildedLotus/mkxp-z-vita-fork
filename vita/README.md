@@ -335,5 +335,9 @@ in `licenses/` and ship in the release VPK under `app0:/licenses/`. The shipped
 vitaGL shaders are compiler output of this repository's own GLSL. RTPs and
 Sony's `libshacccg.suprx` are never bundled.
 
+The LiveArea art (bubble icon, background and start plate under
+`vita/mkxp-z-vpk/sce_sys/`) is original to this project, GPL-3.0-or-later; regenerate it
+with `vita/mkxp-z-vpk/art/make-livearea.py` (needs Pillow).
+
 Portions of this software are copyright © 2026 The FreeType Project (https://freetype.org).
 All rights reserved. (FreeType is used under the FreeType Licence.)

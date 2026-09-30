@@ -248,6 +248,11 @@ with zipfile.ZipFile(vpk_path) as archive:
         packed = "licenses/" + (rel.split("/", 1)[1] if rel.startswith("licenses/") else rel)
         if packed not in names or archive.read(packed) != (root / rel).read_bytes():
             die("VPK %s is missing or differs from the tree's %s" % (packed, rel))
+    for rel in ("sce_sys/icon0.png", "sce_sys/livearea/contents/bg.png",
+                "sce_sys/livearea/contents/startup.png", "sce_sys/livearea/contents/template.xml"):
+        tracked_art = root / "vita/mkxp-z-vpk" / rel
+        if rel not in names or not tracked_art.is_file() or archive.read(rel) != tracked_art.read_bytes():
+            die("VPK %s is missing or differs from the tracked LiveArea art" % rel)
     fonts = json.loads(archive.read("fonts/fonts.json"))
     absent = [entry["name"] for entry in fonts.get("files", [])
               if entry.get("packaged") and "fonts/" + entry["name"] not in names]

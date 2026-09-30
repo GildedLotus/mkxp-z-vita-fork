@@ -15,6 +15,7 @@
 # VPK contents:
 #   eboot.bin
 #   sce_sys/param.sfo          generated (TITLE_ID, ATTRIBUTE2=12)
+#   sce_sys/icon0.png, livearea/contents/   tracked LiveArea art (vita/mkxp-z-vpk/sce_sys/)
 #   fonts/                     fallback TTFs from build/fonts (vita/scripts/fetch-fonts.sh)
 #                              plus the tracked README.md and fonts.json
 #   config/default.json        placeholder (vita/mkxp-z-vpk/config/)
@@ -672,6 +673,34 @@ if [[ $LICENSE_STAGE -eq 1 ]]; then
 	VPK_ARGS+=(-a "$OUT/licenses=licenses")
 fi
 VPK_ARGS+=(-a "$RUBY_LIB=ruby")
+# LiveArea art: every VPK, test or product, carries the icon and
+# the LiveArea pages. Every image must be 8-bit paletted at the documented
+# size: the installer silently drops the LiveArea page for a 4-bit startup.png
+# (seen on hardware), so refuse anything else here.
+python3 - "$ASSETS/sce_sys" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+wanted = {"icon0.png": (128, 128), "livearea/contents/bg.png": (840, 500),
+          "livearea/contents/startup.png": (280, 158)}
+for name, size in wanted.items():
+    path = root / name
+    blob = path.read_bytes() if path.is_file() else b""
+    if blob[:8] != b"\x89PNG\r\n\x1a\n" or blob[12:16] != b"IHDR":
+        sys.exit("package-vpk: LiveArea art %s is missing or not a PNG" % name)
+    width, height, depth, colour = struct.unpack(">IIBB", blob[16:26])
+    if (width, height) != size or colour != 3 or depth != 8:
+        sys.exit("package-vpk: %s must be %dx%d 8-bit paletted, got %dx%d depth %d colour type %d"
+                 % (name, size[0], size[1], width, height, depth, colour))
+if not (root / "livearea/contents/template.xml").is_file():
+    sys.exit("package-vpk: LiveArea template.xml is missing")
+PY
+VPK_ARGS+=(
+	-a "$ASSETS/sce_sys/icon0.png=sce_sys/icon0.png"
+	-a "$ASSETS/sce_sys/livearea/contents=sce_sys/livearea/contents"
+)
 VPK_ARGS+=(-a "$MKXP_JSON=mkxp.json")
 echo "    packing root mkxp.json from $MKXP_JSON"
 # alsoft.conf must land at the VPK ROOT: openal-soft opens exactly
@@ -734,7 +763,7 @@ if [[ $LICENSE_STAGE -eq 1 ]]; then
 	echo "licenses/    app0:/licenses — LICENSE (GPL-3.0), THIRD-PARTY.md and the component"
 	echo "             licence texts"
 fi
-echo "sce_sys/     param.sfo only; livearea art is optional (add later)"
+echo "sce_sys/     param.sfo, icon0.png and livearea/contents (bg, startup, template.xml)"
 echo "manifest     executable identity and source revision; deployment requires executableKind=player"
 echo "             artifactSha256 matches a crash dump to its symbols"
 echo "ruby/        Ruby 3.1 extension wrappers from installed prefix"
