@@ -323,6 +323,16 @@ RB_METHOD(_marshalLoad) {
 #endif
 #endif
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* config.cpp: the one validity rule for a settings generation (nonempty,
+ * bounded, parses to an object), shared with the boot merge and CFG[]. */
+bool vitaSettingsFileValid(const char *path);
+
+static VALUE settingsFileValid(VALUE, VALUE path) {
+    return vitaSettingsFileValid(StringValueCStr(path)) ? Qtrue : Qfalse;
+}
+#endif
+
 void fileIntBindingInit() {
     VALUE klass = rb_define_class("FileInt", rb_cIO);
 #if RAPI_FULL > 187
@@ -364,8 +374,10 @@ void fileIntBindingInit() {
      * It wraps nothing: a game's saves are upstream's, above and in Ruby. */
     rb_load(rb_str_new_cstr("app0:/preload/settings_file.rb"), 0);
 #endif
-    rb_funcall(rb_const_get(rb_cObject, rb_intern("VitaSettingsFile")),
-               rb_intern("recover"), 1,
+    VALUE settingsModule = rb_const_get(rb_cObject, rb_intern("VitaSettingsFile"));
+    rb_define_singleton_method(settingsModule, "valid?",
+                               RUBY_METHOD_FUNC(settingsFileValid), 1);
+    rb_funcall(settingsModule, rb_intern("recover"), 1,
                rb_utf8_str_new_cstr(shState->config().userConfPath.c_str()));
 #endif
 }

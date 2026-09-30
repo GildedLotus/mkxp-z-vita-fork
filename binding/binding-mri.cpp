@@ -959,9 +959,18 @@ RB_METHOD_GUARD_END
 /* config.cpp. The header does not declare it; CFG[] has to use this reader
  * rather than parse the file again. A corrupt file becomes an empty object. */
 json5pp::value readConfFile(const char *path);
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* Same generation selection as the boot merge: an invalid active file must
+ * not turn the next CFG[]= into a one-key file over the good backup. */
+json5pp::value readUserSettings(const char *path);
+#endif
 
 json5pp::value loadUserSettings() {
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    return readUserSettings(shState->config().userConfPath.c_str());
+#else
     return readConfFile(shState->config().userConfPath.c_str());
+#endif
 }
 
 void saveUserSettings(json5pp::value &settings) {
@@ -1256,6 +1265,7 @@ static void runRMXPScripts(BacktraceData &btData) {
     
     long scriptCount = RARRAY_LEN(scriptArray);
     
+    static const size_t maxDecodedScript = 16u << 20;
     std::string decodeBuffer;
     decodeBuffer.resize(0x1000);
     
@@ -1288,7 +1298,12 @@ static void runRMXPScripts(BacktraceData &btData) {
             if (result != Z_BUF_ERROR)
                 break;
 
-            decodeBuffer.resize(decodeBuffer.size() * 2);
+            /* A zlib bomb otherwise doubles this buffer until the heap is gone. */
+            if (decodeBuffer.size() >= maxDecodedScript)
+                break;
+
+            size_t grown = decodeBuffer.size() * 2;
+            decodeBuffer.resize(grown > maxDecodedScript ? maxDecodedScript : grown);
         }
 
         if (result != Z_OK) {

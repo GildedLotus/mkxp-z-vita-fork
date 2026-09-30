@@ -548,21 +548,45 @@ static std::string vitaJoin(const std::string &dir, const char *leaf)
  * settings file and it runs before Ruby exists: a generation that
  * VitaSettingsFile.recover restores from the pinned backup later would
  * apply only on the next launch, while runtime queries already report the
- * restored values. Select with recover_locked's own rule -- the active
- * file when it is a nonempty regular file, else the backup when that is
- * one -- so the merge consumes the generation the player actually runs
- * with. Restoring the active file itself stays in settings_file.rb. */
-static std::string vitaSelectSettingsGeneration(const std::string &active)
+ * restored values. One validity rule serves this selection, the CFG[] reader
+ * and Ruby's recover (through vitaSettingsFileValid): a generation counts
+ * only when it is a nonempty regular file that parses, within the config
+ * size bound, to a JSON object. The active file is used when valid, else the
+ * backup when that is, else the active path (parsed as {}). Restoring the
+ * active file itself stays in settings_file.rb. */
+static bool vitaSettingsGenerationValid(const std::string &path)
 {
     struct stat st;
-    std::string backup;
+    const char *status = "absent";
 
-    if (stat(active.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+    if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+        return false;
+    vitaReadConfFile(path.c_str(), &status);
+    return !strcmp(status, "ok");
+}
+
+static std::string vitaSelectSettingsGeneration(const std::string &active)
+{
+    if (vitaSettingsGenerationValid(active))
         return active;
-    backup = active + ".bak";
-    if (stat(backup.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0)
+
+    std::string backup = active + ".bak";
+
+    if (vitaSettingsGenerationValid(backup))
         return backup;
     return active;
+}
+
+bool vitaSettingsFileValid(const char *path)
+{
+    return vitaSettingsGenerationValid(path);
+}
+
+json::value readUserSettings(const char *path)
+{
+    const char *status = "absent";
+
+    return vitaReadConfFile(vitaSelectSettingsGeneration(path).c_str(), &status);
 }
 
 static void vitaMergeLayers(json::value &optsJ, json::value &rootConf,
@@ -603,6 +627,9 @@ static void vitaMergeLayers(json::value &optsJ, json::value &rootConf,
          * `game` came from -- so this only ever shows up as the absence of an
          * "Invalid variable" line for a badly typed one. */
         gameVitaConf.as_object().erase("gameFolder");
+        /* Both size the GL surfaces and window bases; a game has no say. */
+        gameVitaConf.as_object().erase("maxTextureSize");
+        gameVitaConf.as_object().erase("enableHires");
         vitaMergeLayer(optsJ, gameVitaConf);
     }
 
@@ -888,8 +915,8 @@ try { exp } catch (...) {}
     if (settingsGen != userConfPath) {
         char tb[512];
         snprintf(tb, sizeof(tb),
-                 "vita-config: settings generation=backup (active missing "
-                 "or empty; merging %s)", settingsGen.c_str());
+                 "vita-config: settings generation=backup (active missing, "
+                 "empty or invalid; merging %s)", settingsGen.c_str());
         vita_glue_trace(tb);
     }
     json::value userConf = readConfFile(settingsGen.c_str());

@@ -97,6 +97,7 @@ typedef struct LauncherView {
     TTF_Font *font_small;    /* 18 px */
     char font_path[256];     /* the face that won, for the log and the report */
     int font_has_jp;         /* 1 if it provides U+3042, U+30A2 and U+4E00 */
+    unsigned char *font_data; /* the winning face's file; both fonts read it from memory */
     LauncherRowCache rows[GAME_SCAN_MAX_ENTRIES];
     int row_bytes;           /* live pitch*h total across all cached rows */
 } LauncherView;

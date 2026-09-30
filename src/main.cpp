@@ -67,6 +67,7 @@
  * lifecycle callbacks; no registered stacks or device exits are modelled.
  */
 #include "vita_fatal.h"
+#include "vita_publish.h"
 /* std::exception, for the boundary around mkxp_main() at the bottom of this
  * file: an exception that leaves main() is std::terminate, and on this device
  * that is a process kill with nothing in the log. */
@@ -335,8 +336,7 @@ static void vitaShutdownBegin() {
   vitaShutdownProgress(VitaShutdownNative);
 }
 
-static bool vitaShutdownAppend(SceUID fd, const char *text) {
-  size_t left = strlen(text);
+static bool vitaShutdownWrite(SceUID fd, const char *text, size_t left) {
   while (left) {
     int written = sceIoWrite(fd, text, left);
     if (written <= 0)
@@ -345,6 +345,10 @@ static bool vitaShutdownAppend(SceUID fd, const char *text) {
     left -= written;
   }
   return true;
+}
+
+static bool vitaShutdownAppend(SceUID fd, const char *text) {
+  return vitaShutdownWrite(fd, text, strlen(text));
 }
 
 static int vitaShutdownReport(SceSize, void *) {
@@ -358,16 +362,37 @@ static int vitaShutdownReport(SceSize, void *) {
     sceKernelDelayThread(10000);
   }
   /* This worker may block on the card. The exit enforcer never joins it on
-   * abort; the running marker remains evidence if any operation stalls. */
-  SceUID fd = sceIoOpen(VITA_FATAL_DIR "/" VITA_FATAL_NAME,
-                       SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0666);
+   * abort; the running marker remains evidence if any operation stalls. The
+   * report is completed at a temporary name (an earlier diagnosis copied in
+   * front of the watchdog note) and only then published through
+   * vita_publish, so cutting this thread short cannot tear last-error.txt. */
+  static const char tmpPath[] = VITA_FATAL_DIR "/last-error.stuck.tmp";
+  static const char finalPath[] = VITA_FATAL_DIR "/" VITA_FATAL_NAME;
+  static const char backupPath[] = VITA_FATAL_DIR "/" VITA_FATAL_NAME ".bak";
+  SceUID fd = sceIoOpen(tmpPath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
   if (fd >= 0) {
     const char *header = VITA_FATAL_MAGIC "\nkind: stuck\ntitle: mkxp-z\n---\n";
-    int length = sceIoLseek32(fd, 0, SCE_SEEK_END);
-    bool written = false;
-    if (length >= 0 && !(state == VitaShutdownAbandoned && length != 0)) {
-      written = length != 0 || vitaShutdownAppend(fd, header);
-      written = written && vitaShutdownAppend(fd,
+    char chunk[512];
+    bool written = true;
+    bool hadReport = false;
+    SceUID previous = sceIoOpen(finalPath, SCE_O_RDONLY, 0);
+    if (previous >= 0) {
+      for (;;) {
+        int got = sceIoRead(previous, chunk, sizeof(chunk));
+        if (got == 0)
+          break;
+        // An unreadable report is never replaced; abandon keeps a diagnosis.
+        if (got < 0 || state == VitaShutdownAbandoned || !vitaShutdownWrite(fd, chunk, got)) {
+          written = false;
+          break;
+        }
+        hadReport = true;
+      }
+      sceIoClose(previous);
+    }
+    if (written) {
+      written = (hadReport || vitaShutdownAppend(fd, header)) &&
+          vitaShutdownAppend(fd,
           state == VitaShutdownRubyAborted
               ? "\nphase: ruby\nShutdown watchdog: Ruby shutdown exceeded 60 seconds.\n"
                 "The player exited without returning to the launcher.\n"
@@ -376,9 +401,10 @@ static int vitaShutdownReport(SceSize, void *) {
     }
     int synced = sceIoSyncByFd(fd, 0);
     int closed = sceIoClose(fd);
+    bool published = written && synced >= 0 && closed >= 0 &&
+        vita_publish_commit(tmpPath, finalPath, backupPath) == 0;
     // Retire the Ruby timeout breadcrumb only after its report is complete.
-    if (state == VitaShutdownRubyAborted && vitaShutdownOwnsMarker &&
-        written && synced >= 0 && closed >= 0)
+    if (state == VitaShutdownRubyAborted && vitaShutdownOwnsMarker && published)
       vita_boot_clear_running();
   }
   return 0;
@@ -1244,6 +1270,10 @@ int main(int argc, char *argv[]) {
 int main(int argc, char *argv[]) { return mkxp_main(argc, argv); }
 #endif
 
+#ifdef MKXPZ_VITAGL_BACKEND
+extern "C" unsigned char vglIsDisplayReady(void); // vitaGL.h GLboolean
+#endif
+
 static SDL_GLContext initGL(SDL_Window *win, Config &conf,
                             RGSSThreadData *threadData) {
   SDL_GLContext glCtx{};
@@ -1265,6 +1295,15 @@ static SDL_GLContext initGL(SDL_Window *win, Config &conf,
     char tb[128];
     snprintf(tb, sizeof(tb), "trace: SDL_GL_CreateContext ok ctx=%p", (void *)glCtx);
     vita_glue_trace(tb);
+  }
+#endif
+#ifdef MKXPZ_VITAGL_BACKEND
+  /* vitaGL logs a failed boot depth/stencil allocation and carries on; a
+   * context that cannot open a scene is refused here, not left black. */
+  if (!vglIsDisplayReady()) {
+    GLINIT_SHOWERROR("vitaGL could not allocate the display depth/stencil surfaces");
+    SDL_GL_DeleteContext(glCtx);
+    return 0;
   }
 #endif
 

@@ -177,6 +177,52 @@ static bool vitaFatalPublish(const char *tmpPath, const char *finalPath,
     return vita_publish_commit(tmpPath, finalPath, backupPath) == 0;
 }
 
+/* A retained .tmp is only worth publishing when the write that made it ran to
+ * the end: the magic line, a complete header ending in the separator line,
+ * and a final newline (the writer always terminates the text). Anything else
+ * is a torn write and must not replace a good report. */
+static bool vitaFatalReportComplete(const char *path)
+{
+    static const char magic[] = VITA_FATAL_MAGIC "\n";
+    static const char sep[] = "\n" VITA_FATAL_SEPARATOR "\n";
+    char chunk[256];
+    size_t seen = 0;
+    size_t matched = 0;
+    bool separated = false;
+    char last = '\0';
+    const int fd = open(path, O_RDONLY, 0);
+
+    if (fd < 0)
+        return false;
+    for (;;) {
+        const ssize_t got = read(fd, chunk, sizeof(chunk));
+
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0) {
+            (void)close(fd);
+            return got == 0 && separated && last == '\n';
+        }
+        for (ssize_t i = 0; i < got; ++i) {
+            const char c = chunk[i];
+
+            if (seen < sizeof(magic) - 1 && c != magic[seen]) {
+                (void)close(fd);
+                return false;
+            }
+            ++seen;
+            if (!separated) {
+                if (c == sep[matched])
+                    ++matched;
+                else
+                    matched = (c == sep[0]) ? 1 : 0;
+                separated = matched == sizeof(sep) - 1;
+            }
+            last = c;
+        }
+    }
+}
+
 bool vitaWriteLastErrorTo(const char *dir, const char *kind, const char *title,
                           const char *text)
 {
@@ -219,10 +265,16 @@ bool vitaWriteLastErrorTo(const char *dir, const char *kind, const char *title,
     (void)vitaFatalAppendField(header, fieldCap, &len, title);
     (void)vitaFatalAppend(header, sizeof(header), &len, kTail);
 
-    // A retained report must leave .tmp before another write can truncate it.
+    // A retained report must leave .tmp before another write can truncate it;
+    // a torn one is discarded, never promoted over the last good report.
     if (access(tmpPath, F_OK) == 0) {
-        if (!vitaFatalPublish(tmpPath, finalPath, backupPath))
+        if (!vitaFatalReportComplete(tmpPath)) {
+            vitaLogMessage("fatal-report: ",
+                           "discarding an incomplete retained report");
+            (void)remove(tmpPath);
+        } else if (!vitaFatalPublish(tmpPath, finalPath, backupPath)) {
             return false;
+        }
     } else if (errno != ENOENT) {
         return false;
     }

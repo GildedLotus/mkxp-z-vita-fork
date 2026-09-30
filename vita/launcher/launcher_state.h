@@ -35,7 +35,8 @@ extern "C" {
 /*
  * Read the remembered path into `out` (cap bytes; GAME_SCAN_PATH_MAX is
  * always enough). Trailing CR/LF and surrounding spaces are stripped; only
- * the first line is used.
+ * the first line is used, and it must end in a newline (a file without one is
+ * a torn write).
  *
  * Returns 0 when a usable path was read, -1 otherwise (missing file, empty,
  * too long for `cap`, control bytes, or I/O failure). `out` is NUL-terminated
@@ -45,7 +46,8 @@ int launcher_state_load(const char *path, char *out, size_t cap);
 
 /*
  * Remember `game_path`. Write and close "<path>.tmp", move a valid `path`
- * to "<path>.bak", then publish the temporary file. A completed temporary
+ * to "<path>.bak" (an invalid one goes to "<path>.corrupt" instead, so it
+ * can never replace a good backup), then publish the temporary file. A completed temporary
  * file is retained if either rename fails; readers never use .tmp.
  *
  * Returns 0 on success, -1 on a bad argument or any I/O failure. A failure

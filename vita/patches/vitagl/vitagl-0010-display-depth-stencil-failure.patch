@@ -1,0 +1,82 @@
+# vitagl-0010: a failed boot depth/stencil allocation no longer reaches sceGxmBeginScene.
+# - gxm.c: init_display_depth_stencil_surfaces returns GLboolean and records display_depth_stencil_ready. The
+#   default-framebuffer branch of scene_reset retries the allocation while it is missing and, if it still fails,
+#   opens no scene (scene_target_missing / needs_scene_reset, as 0006 does for a missing target) instead of
+#   handing the zeroed surface to sceGxmBeginScene. vgl_error stays GL_OUT_OF_MEMORY from 0007.
+# - vitaGL.h: vglIsDisplayReady() exposes the state; the engine's initGL refuses such a context.
+# - Shader output is unchanged: shipped GXPs stay valid (MANIFEST re-attested for the new patch hash only).
+diff --git a/source/gxm.c b/source/gxm.c
+index aac9b89..97fe297 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -63,6 +63,7 @@ static SceSharedFbInfo shared_fb_info; // In-use shared framebuffer info struct
+ framebuffer *in_use_framebuffer = NULL; // Currently in use framebuffer
+ framebuffer *old_framebuffer = NULL; // Framebuffer used in last scene
+ GLboolean dirty_framebuffer = GL_FALSE; // Flag whether current in use framebuffer is invalidated
++GLboolean display_depth_stencil_ready = GL_FALSE; // The display's depth/stencil surface holds real storage
+ GLboolean scene_target_missing = GL_FALSE; // No gxm scene is open because the framebuffer's rendertarget could not be created
+ GLboolean dirty_query = GL_FALSE; // Flag whether occlusion queries needs results
+ static GLboolean needs_end_scene = GL_FALSE; // Flag for gxm end scene requirement at scene reset
+@@ -542,11 +543,18 @@ GLboolean init_depth_stencil_buffer(uint32_t w, uint32_t h, SceGxmDepthStencilSu
+ 	return GL_TRUE;
+ }
+ 
+-void init_display_depth_stencil_surfaces(void) {
+-	// Boot-time allocation from the reserved pools: there is no scene to skip yet and no way to recover
+-	if (!init_depth_stencil_buffer(DISPLAY_WIDTH, DISPLAY_HEIGHT, &gxm_depth_stencil_surface, GL_TRUE)) {
++GLboolean init_display_depth_stencil_surfaces(void) {
++	// Boot-time allocation from the reserved pools. A failure leaves the surface uninitialized, so it is
++	// recorded: scene_reset opens no display scene until a retry succeeds (vglIsDisplayReady reports it)
++	display_depth_stencil_ready = init_depth_stencil_buffer(DISPLAY_WIDTH, DISPLAY_HEIGHT, &gxm_depth_stencil_surface, GL_TRUE);
++	if (!display_depth_stencil_ready) {
+ 		vgl_log("%s:%d Display depth/stencil surfaces could not be allocated.\n", __FILE__, __LINE__);
+ 	}
++	return display_depth_stencil_ready;
++}
++
++GLboolean vglIsDisplayReady(void) {
++	return display_depth_stencil_ready;
+ }
+ 
+ void start_shader_patcher(void) {
+@@ -638,6 +646,12 @@ void scene_reset(void) {
+ 		scene_target_missing = GL_FALSE;
+ 		is_rendering_display = !active_write_fb;
+ 		if (is_rendering_display) { // Default framebuffer is used
++			// sceGxmBeginScene must never see the uninitialized display surface: retry the boot allocation, else no scene
++			if (!display_depth_stencil_ready && !init_display_depth_stencil_surfaces()) {
++				scene_target_missing = GL_TRUE;
++				needs_scene_reset = GL_TRUE;
++				return;
++			}
+ 			if (system_app_mode) {
+ 				sceSharedFbBegin(shared_fb, &shared_fb_info);
+ 				shared_fb_info.vsync = vsync_interval;
+diff --git a/source/shared.h b/source/shared.h
+index f23e65f..d31b287 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -1217,7 +1217,8 @@ void init_gxm_context(SceGxmContext **ctx, uint8_t ctx_slot); // Inits sceGxm co
+ void create_display_render_target(void); // Creates render target for the display
+ void init_display_color_surfaces(GLboolean is_swap); // Creates color surfaces for the display
+ GLboolean init_depth_stencil_buffer(uint32_t w, uint32_t h, SceGxmDepthStencilSurface *surface, GLboolean has_stencil); // Creates depth and stencil surfaces, GL_FALSE (nothing initialized) when their storage is unavailable
+-void init_display_depth_stencil_surfaces(void); // Creates depth and stencil surfaces for the display
++GLboolean init_display_depth_stencil_surfaces(void); // Creates depth and stencil surfaces for the display, GL_FALSE when their storage is unavailable
++extern GLboolean display_depth_stencil_ready; // The display's depth/stencil surface holds real storage
+ void start_shader_patcher(void); // Creates a shader patcher instance
+ void scene_reset(void); // Resets drawing scene if required
+ GLboolean start_shader_compiler(void); // Starts a shader compiler instance
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index a623e68..89dca56 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1202,6 +1202,9 @@ GLboolean vglInitWithCustomSizes(int legacy_pool_size, int width, int height, in
+ // vitaGL init function with customizable resolution, memory pools thresholds and MSAA setup.
+ GLboolean vglInitWithCustomThreshold(int pool_size, int width, int height, int ram_threshold, int cdram_threshold, int phycont_threshold, int cdlg_threshold, SceGxmMultisampleMode msaa);
+ 
++// GL_FALSE while the display's depth/stencil storage is missing (the boot allocation failed): no scene is drawn until a retry succeeds.
++GLboolean vglIsDisplayReady(void);
++
+ // Mark a memory block from a vitaGL internal memory pool to be deleted as soon as GPU finishes using it.
+ void vglLazyFree(void *addr);
+ 

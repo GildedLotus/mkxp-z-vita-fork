@@ -564,6 +564,20 @@ static int compare_thunk(const void *a, const void *b)
     return game_entry_compare((const GameEntry *)a, (const GameEntry *)b);
 }
 
+/* A game path with control bytes fails launch_path_is_valid, so listing it
+ * would only produce a launch that is refused. (A self-named game's execName
+ * is checked the same way in find_execless_game.) */
+static int path_is_launchable(const char *s)
+{
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+
+        if (c < 0x20 || c == 0x7F)
+            return 0;
+    }
+    return 1;
+}
+
 /* ---- the scan ----------------------------------------------------------- */
 
 int game_scan(const char *root, GameEntry *out, int cap, GameScanStats *stats)
@@ -667,6 +681,10 @@ int game_scan(const char *root, GameEntry *out, int cap, GameScanStats *stats)
             }
         }
 
+        if (!path_is_launchable(game_dir)) {
+            stats->skipped_bad_name++;
+            continue;
+        }
         if (count >= cap) {
             stats->truncated = 1;
             continue; /* keep counting what we skipped, store nothing */

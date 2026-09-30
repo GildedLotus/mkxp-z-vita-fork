@@ -347,10 +347,22 @@ struct SoundOpenHandler : FileSystem::OpenHandler
 		 * allocateBuffer() reports the refusal once per filename and
 		 * remembers it, so the file is not read again on every play. */
 		std::vector<uint8_t> pcm;
+		int stalled = 0;
 
 		while (!(sample->flags & (SOUND_SAMPLEFLAG_EOF | SOUND_SAMPLEFLAG_ERROR)))
 		{
 			const uint32_t decoded = Sound_Decode(sample);
+
+			/* A decoder that keeps answering 0 bytes with EAGAIN and never
+			 * reaches EOF would spin here forever; the streaming path
+			 * gives up after SDLSOUND_JOIN_TRIES (16) such answers. */
+			if (decoded == 0 && ++stalled >= 16)
+			{
+				errorMsg = "decoder made no progress";
+				return false;
+			}
+			if (decoded != 0)
+				stalled = 0;
 
 			if (decoded > SE_DECODE_BUDGET - pcm.size())
 			{

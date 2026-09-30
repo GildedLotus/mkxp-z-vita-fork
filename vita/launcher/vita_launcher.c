@@ -398,7 +398,8 @@ static int scan_games(const VitaLauncherOptions *o, LauncherTraceFn trace,
               "ms=%u incomplete=%d",
               o->games_root, count,
               stats.skipped_no_ini + stats.skipped_too_long +
-                  stats.skipped_bad_ini + stats.skipped_ambiguous_ini,
+                  stats.skipped_bad_ini + stats.skipped_ambiguous_ini +
+                  stats.skipped_bad_name,
               stats.truncated, ms, stats.incomplete);
     if (stats.skipped_bad_ini)
         trace_fmt(trace,
@@ -846,6 +847,21 @@ int vita_launcher_run(const VitaLauncherOptions *opt)
             trace_fmt(run.session.trace,
                       "launcher: launch FAILED rc=0x%08x path='%s'",
                       (unsigned)rc, g_entries[index].path);
+            if (rc == VITA_LOADEXEC_ERR_ARGS || rc == VITA_LOADEXEC_ERR_CONFIG) {
+                /* Refused before the teardown hook: the window, context and
+                 * GL objects are still ours, so opening a second session on
+                 * top of them would leak one per press. */
+                snprintf(message, sizeof(message),
+                         "%s\n\nThe game cannot be started from this launcher "
+                         "(rc 0x%08x).",
+                         g_entries[index].path, (unsigned)rc);
+                launcher_model_show_message(&run.model);
+                launcher_view_compose_message(&run.session.view,
+                                              "Could not start the game",
+                                              message);
+                need_upload = 1;
+                break;
+            }
             snprintf(message, sizeof(message),
                      "%s\n\nsceAppMgrLoadExec returned 0x%08x. The game was "
                      "not started.",

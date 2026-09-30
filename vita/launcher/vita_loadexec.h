@@ -44,7 +44,8 @@ typedef void (*LauncherTraceFn)(const char *msg);
 #endif
 
 /* Returned only when the hand-over did not happen. A successful call never
- * returns at all. */
+ * returns at all. ERR_ARGS and ERR_CONFIG come back BEFORE the hooks ran, so
+ * the caller's session is still live; every other failure has torn it down. */
 #define VITA_LOADEXEC_ERR_ARGS   (-1) /* path rejected by launch_path_is_valid */
 #define VITA_LOADEXEC_ERR_CONFIG (-2) /* vita_loadexec_configure not called */
 #define VITA_LOADEXEC_ERR_HOST   (-3) /* built for a host: no sceAppMgrLoadExec */

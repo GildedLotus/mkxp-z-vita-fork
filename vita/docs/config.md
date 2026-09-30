@@ -53,7 +53,7 @@ With layers on, lowest priority to highest:
 | 2 | `app0:/config/default.json` | the device profile |
 | 3 | `ux0:/data/mkxp-z/config.json` | the user's global settings |
 | 4 | `<game>/mkxp.json` | **device-owned keys removed** (list below) |
-| 5 | `<game>/mkxp-vita.json` | only `gameFolder` removed |
+| 5 | `<game>/mkxp-vita.json` | only `gameFolder`, `maxTextureSize` and `enableHires` removed |
 | 6 | `app0:/mkxp.json` | the VPK author's pin |
 | 7 | `--game <path>` | sets `gameFolder`; `--execName <name>` sets `execName` |
 
@@ -104,7 +104,8 @@ dataPathApp         iconPath                preferMetalRenderer   dumpAtlas
 ```
 
 A game that genuinely has something to say about one of them says it in
-`<game>/mkxp-vita.json` (layer 5), from which only `gameFolder` is removed.
+`<game>/mkxp-vita.json` (layer 5), from which only `gameFolder`, `maxTextureSize` and
+`enableHires` are removed (they size window bases and GL surfaces).
 Everything else a game ships — `RTP`, `customScript`, `preloadScript`,
 `patches`, `fontSub`, `windowTitle`, `SESourceCount` … — is honoured from
 layer 4 as-is.
@@ -348,11 +349,16 @@ the launcher consumes it). Those are regenerable-by-us bookkeeping, not a
 game's save. The settings file is rotated: every successful
 publish moves the previous active file to `.bak`, so recovery restores the last
 published generation, not the first one ever written — the same rule the
-binding menu below applies to its keybindings file. Only a nonempty active file
-is rotated, and the copy is itself a synced temporary plus rename, so `.bak`
-always holds a complete file; the accepted costs are that a damaged active that
-is still nonempty rotates in (the player was already running on it) and that
-newlib's non-atomic rename can drop the backup itself, never the active file.
+binding menu below applies to its keybindings file. One validity rule (a
+nonempty regular file within the 64 KiB config bound that parses to a JSON
+object) drives the boot-time generation selection, the `CFG[]` reader and
+recovery, so a corrupt active file selects a valid `.bak`, and the write path
+never starts from the corrupt one. Publication follows the `vita_publish`
+commit order: only a valid active file moves to `.bak`, then the finished
+`.tmp` is renamed onto the free name. An invalid active file is quarantined as
+`settings.json.corrupt[.N]` and never replaces a good backup; the accepted
+cost is that newlib's non-atomic rename can drop the backup itself, never the
+active file.
 `settings.json.bak.keep` and `settings.json.bak.legacy*` files left by earlier
 builds are inert: nothing reads, writes or cleans them.
 

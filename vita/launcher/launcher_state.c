@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "vita_publish.h"
 
@@ -76,14 +77,15 @@ static int state_read(const char *path, char *out, size_t cap)
     }
     buf[n] = '\0';
 
-    /* First line only. */
+    /* First line only, and it must be complete: the writer always ends it
+     * with a newline, so a file without one is a torn write and half a path
+     * would match the wrong folder. */
     {
         char *nl = strchr(buf, '\n');
 
-        if (nl)
-            *nl = '\0';
-        else if (n == sizeof(buf) - 1)
-            return -1; /* The first line did not fit; do not trim a prefix. */
+        if (!nl)
+            return -1;
+        *nl = '\0';
     }
     /* Strip CR and surrounding spaces/tabs. */
     len = strlen(buf);
@@ -169,6 +171,16 @@ int launcher_state_save(const char *path, const char *game_path)
     prior = state_read(path, previous, sizeof(previous));
     if (prior == -2)
         return -1; /* An I/O failure is not evidence that the current file is bad. */
+    if (prior == -1 && access(path, F_OK) == 0) {
+        /* An invalid active file must not be rotated over a good .bak:
+         * quarantine it instead. */
+        char corrupt[STATE_TMP_MAX + 8];
+
+        if (snprintf(corrupt, sizeof(corrupt), "%s.corrupt", path) >=
+                (int)sizeof(corrupt) ||
+            vita_publish_move(path, corrupt) != 0)
+            return -1;
+    }
     /* A failed publish leaves the previous generation readable as .bak. */
     return vita_publish_commit(tmp, path, backup);
 }

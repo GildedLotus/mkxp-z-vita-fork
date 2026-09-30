@@ -75,6 +75,8 @@ typedef struct GameScanStats {
                            * and the other games still list */
     char last_bad_ini_folder[GAME_SCAN_FOLDER_MAX]; /* most recently skipped
                            * such folder, UTF-8 sanitised, for the log line */
+    int skipped_bad_name; /* folders whose path carries a control byte, which
+                           * launch_path_is_valid would refuse */
     int skipped_ambiguous_ini; /* folders where several .ini files have a
                            * matching partner, so no single execName is the
                            * game */

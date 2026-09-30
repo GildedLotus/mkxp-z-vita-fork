@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "utf8_util.h"
@@ -288,6 +289,41 @@ static DIR *open_dir_either(const char *dir, char *used, size_t cap)
     return NULL;
 }
 
+#define FONT_FILE_MAX (16u * 1024u * 1024u)
+
+/* The whole face in memory. A FILE kept open by TTF_OpenFont goes stale after
+ * standby and every glyph not yet cached would then render blank. */
+static unsigned char *slurp_face(const char *path, size_t *size_out)
+{
+    unsigned char *data;
+    long size;
+    FILE *f = fopen(path, "rb");
+
+    if (!f)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) <= 0 ||
+        (unsigned long)size > FONT_FILE_MAX || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    data = (unsigned char *)malloc((size_t)size);
+    if (!data || fread(data, 1, (size_t)size, f) != (size_t)size) {
+        free(data);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *size_out = (size_t)size;
+    return data;
+}
+
+static TTF_Font *open_face(const unsigned char *data, size_t size, int pt)
+{
+    SDL_RWops *rw = SDL_RWFromConstMem(data, (int)size);
+
+    return rw ? TTF_OpenFontRW(rw, 1, pt) : NULL;
+}
+
 static int open_fonts(LauncherView *v, const char *fonts_dir,
                       LauncherTraceFn trace)
 {
@@ -295,6 +331,9 @@ static int open_fonts(LauncherView *v, const char *fonts_dir,
     char root[sizeof(v->font_path)];
     char path[sizeof(v->font_path)];
     char fallback[sizeof(v->font_path)];
+    TTF_Font *fallback_font = NULL;
+    unsigned char *fallback_data = NULL;
+    size_t size = 0, fallback_size = 0;
     DIR *dir;
     struct dirent *de;
     int n = 0, i;
@@ -334,41 +373,59 @@ static int open_fonts(LauncherView *v, const char *fonts_dir,
     }
     sort_names(names, n);
 
-    /* Two passes, one open per candidate each: the first face that can draw
-     * Japanese wins outright; otherwise the first that opens at all. */
+    /* One read per candidate: the first face that can draw Japanese wins
+     * outright; otherwise the first that opens at all is kept as it was
+     * opened. */
     for (i = 0; i < n; i++) {
+        unsigned char *data;
         TTF_Font *probe;
 
         if ((int)snprintf(path, sizeof(path), "%s/%s", root, names[i]) >=
             (int)sizeof(path))
             continue;
-        probe = TTF_OpenFont(path, LAUNCHER_VIEW_FONT_PT);
-        if (!probe)
+        data = slurp_face(path, &size);
+        if (!data)
             continue;
-        if (!fallback[0])
-            memcpy(fallback, path, strlen(path) + 1);
+        probe = open_face(data, size, LAUNCHER_VIEW_FONT_PT);
+        if (!probe) {
+            free(data);
+            continue;
+        }
         if (face_has_japanese(probe)) {
             v->font = probe;
+            v->font_data = data;
             v->font_has_jp = 1;
             memcpy(v->font_path, path, strlen(path) + 1);
             break;
         }
-        TTF_CloseFont(probe);
-    }
-
-    if (!v->font) {
-        if (!fallback[0]) {
-            trace_fmt(trace, "launcher: no face under '%s' could be opened",
-                      fonts_dir);
-            return 0;
+        if (!fallback_font) {
+            fallback_font = probe;
+            fallback_data = data;
+            fallback_size = size;
+            memcpy(fallback, path, strlen(path) + 1);
+        } else {
+            TTF_CloseFont(probe);
+            free(data);
         }
-        v->font = TTF_OpenFont(fallback, LAUNCHER_VIEW_FONT_PT);
-        if (!v->font)
-            return 0;
-        memcpy(v->font_path, fallback, strlen(fallback) + 1);
     }
 
-    v->font_small = TTF_OpenFont(v->font_path, LAUNCHER_VIEW_FONT_SMALL_PT);
+    if (v->font) {
+        if (fallback_font) {
+            TTF_CloseFont(fallback_font);
+            free(fallback_data);
+        }
+    } else if (fallback_font) {
+        v->font = fallback_font;
+        v->font_data = fallback_data;
+        size = fallback_size;
+        memcpy(v->font_path, fallback, strlen(fallback) + 1);
+    } else {
+        trace_fmt(trace, "launcher: no face under '%s' could be opened",
+                  fonts_dir);
+        return 0;
+    }
+
+    v->font_small = open_face(v->font_data, size, LAUNCHER_VIEW_FONT_SMALL_PT);
     if (!v->font_small) {
         /* One face is enough to boot: the small column just gets the big one
          * and the row looks cramped, which beats a launcher that will not
@@ -479,6 +536,8 @@ void launcher_view_shutdown(LauncherView *v)
     if (v->font)
         TTF_CloseFont(v->font);
     v->font = NULL;
+    free(v->font_data);
+    v->font_data = NULL;
     if (v->canvas)
         SDL_FreeSurface(v->canvas);
     v->canvas = NULL;
@@ -504,6 +563,8 @@ static void build_row(LauncherView *v, int index, const GameEntry *e,
                       int rtp_missing)
 {
     LauncherRowCache *row = &v->rows[index];
+    const char *tag = engine_tag(e->rgss_version);
+    int c;
 
     if (row->built)
         return;
@@ -511,14 +572,28 @@ static void build_row(LauncherView *v, int index, const GameEntry *e,
     row->cell[LAUNCHER_CELL_TITLE] =
         render_fitted(v->font, e->title, COL_TITLE_W, kTextBright);
     row->cell[LAUNCHER_CELL_TAG] =
-        render_fitted(v->font_small, engine_tag(e->rgss_version), COL_TAG_W,
-                      kTextDim);
+        render_fitted(v->font_small, tag, COL_TAG_W, kTextDim);
     row->cell[LAUNCHER_CELL_FOLDER] =
         render_fitted(v->font_small, e->folder, COL_FOLDER_W, kTextDim);
     row->cell[LAUNCHER_CELL_RTP] =
         rtp_missing ? render_fitted(v->font_small, "RTP missing", COL_RTP_W,
                                     kTextWarn)
                     : NULL;
+    /* A cell that should have text but has no surface failed to render (out of
+     * memory); leave the row unbuilt so the next draw retries instead of
+     * caching the hole for good. */
+    if ((e->title[0] && !row->cell[LAUNCHER_CELL_TITLE]) ||
+        (tag && tag[0] && !row->cell[LAUNCHER_CELL_TAG]) ||
+        (e->folder[0] && !row->cell[LAUNCHER_CELL_FOLDER]) ||
+        (rtp_missing && !row->cell[LAUNCHER_CELL_RTP])) {
+        for (c = 0; c < LAUNCHER_CELL_COUNT; c++) {
+            if (row->cell[c]) {
+                SDL_FreeSurface(row->cell[c]);
+                row->cell[c] = NULL;
+            }
+        }
+        return;
+    }
     row->built = 1;
     v->row_bytes += row_bytes_of(row);
 }

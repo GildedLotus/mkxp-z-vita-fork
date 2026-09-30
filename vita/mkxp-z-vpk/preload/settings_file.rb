@@ -5,9 +5,10 @@
 # upstream semantics (vita/docs/config.md#save-recovery).
 #
 # The only file handled here is ours and regenerable: settings at userConfPath.
-# Each successful publish rotates the previous generation into <path>.bak, so
-# recovery restores the last settings the player kept; a write interrupted
-# before the final rename leaves the previous file intact.
+# Each successful publish rotates the previous valid generation into <path>.bak,
+# so recovery restores the last settings the player kept; an invalid active
+# file is quarantined as <path>.corrupt, never rotated over the backup, and a
+# write interrupted before the final rename leaves the previous file intact.
 module VitaSettingsFile
   OPEN = File.method(:open)
   ACTIVE = {}
@@ -70,9 +71,10 @@ module VitaSettingsFile
     end
   end
 
-  def self.nonempty?(path)
-    File.file?(path) && File.size(path) > 0
-  end
+  # VitaSettingsFile.valid?(path) is defined by the engine (config.cpp) before
+  # recover runs: the one rule for a usable generation -- a nonempty regular
+  # file within the config size bound that parses to a JSON object -- shared
+  # with the boot-time selection and the CFG[] reader.
 
   def self.retain(path, destination)
     kept = destination
@@ -85,43 +87,57 @@ module VitaSettingsFile
   end
 
   def self.recover_locked(path)
-    return if nonempty?(path)
-    return unless nonempty?(path + '.bak')
+    return if valid?(path)
+    return unless valid?(path + '.bak')
     copy(path + '.bak', path + '.tmp')
     if File.exist?(path)
-      # A previous interrupted attempt is evidence too; never overwrite it.
+      # An invalid generation and any earlier interrupted attempt are evidence
+      # too; never overwrite them. The backup stays: it is only copied.
       retain(path, path + '.corrupt')
     end
     File.rename(path + '.tmp', path)
   end
 
   # Called once by the filesystem binding at initialization, for our own file.
+  # A failure here must not stop the binding: the boot merge already selected
+  # a readable generation, and the next write recovers again.
   def self.recover(path)
     Thread.handle_interrupt(Exception => :never) do
       lease = nil
       begin
         lease = claim(path, true)
         recover_locked(path) if lease
+      rescue StandardError => error
+        begin
+          warn "VitaSettingsFile.recover failed: #{error.class}: #{error.message}"
+        rescue StandardError
+          nil
+        end
       ensure
         release(lease)
       end
     end
+    nil
   end
 
-  def self.before_truncate(path)
-    # Rotate the last published generation into .bak, so recovery restores the
-    # settings the player last kept instead of the first ones ever written. A
-    # partial write never reaches the active name and only a nonempty active
-    # file is copied, so .bak always holds a complete file; newlib's
-    # non-atomic rename can cost the backup itself, never the active file.
-    return unless nonempty?(path)
-    copy(path, path + '.bak.tmp')
-    File.rename(path + '.bak.tmp', path + '.bak')
+  # The vita_publish commit order: move the last valid generation aside to
+  # .bak, then rename the finished temporary onto the free name, so no rename
+  # ever targets an occupied active file and a failure leaves a complete
+  # generation reachable. An invalid active file is quarantined instead of
+  # rotated, so it can never replace a good backup.
+  def self.publish(path)
+    if File.exist?(path)
+      if valid?(path)
+        File.rename(path, path + '.bak')
+      else
+        retain(path, path + '.corrupt')
+      end
+    end
+    File.rename(path + '.tmp', path)
   end
 
-  # Called by saveUserSettings. Writes a complete temporary, rotates the
-  # previous generation to .bak, then renames: the destination is never a
-  # partial file.
+  # Called by saveUserSettings. Writes a complete temporary, then publishes it
+  # in the commit order: the destination is never a partial file.
   def self.write_bytes(path, bytes)
     Thread.handle_interrupt(Exception => :never) do
       lease = nil
@@ -132,8 +148,7 @@ module VitaSettingsFile
           raise IOError, 'short settings write' unless file.write(bytes) == bytes.bytesize
           sync(file)
         end
-        before_truncate(path)
-        File.rename(path + '.tmp', path)
+        publish(path)
       ensure
         release(lease)
       end

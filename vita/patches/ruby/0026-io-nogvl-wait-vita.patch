@@ -1,0 +1,30 @@
+Subject: [Vita] io.c nogvl_wait_for must not reach select()
+
+On an EAGAIN read or IO.copy_stream, io.c's select() build of
+nogvl_wait_for calls rb_fd_select, which VitaSDK newlib implements with
+sceNet epoll; the net library is never initialised, so it aborts at PC 0
+(the same hazard the thread.c wait paths already close for
+rb_thread_fd_select and rb_thread_wait_for_single_fd). This path runs
+without the GVL and cannot raise, so it returns -1 with ENOSYS: IO#read then
+falls back to the GVL-side wait, which raises NotImplementedError, and
+IO.copy_stream raises Errno::ENOSYS.
+
+--- a/io.c
++++ b/io.c
+@@ -11429,6 +11429,16 @@
+ 
+     int fd = fptr->fd;
+     if (fd == -1) return 0;
++
++#if defined(__vita__)
++    /* rb_fd_select is select(), which this newlib implements via sceNet epoll
++     * (the net library is never initialised: prefetch abort at PC 0). This
++     * runs without the GVL, so fail with a plain errno; IO#read falls back to
++     * the GVL-side wait, which raises NotImplementedError, and IO.copy_stream
++     * raises Errno::ENOSYS. */
++    errno = ENOSYS;
++    return -1;
++#endif
+ 
+     rb_fdset_t fds;
+     int ret;
