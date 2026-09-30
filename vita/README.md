@@ -12,10 +12,9 @@ the build recipes and the packaging; the engine changes are in `src/`,
 memory card, pick one, play. Six free RPG Maker titles (two per engine,
 including a Japanese original) have reached in-game on a retail PS Vita, three of
 them with save, quit and fresh-process reload loops. Those three were re-verified
-on the vitaGL build this branch ships, and an eight-game smoke run boots every
-game to its first scene on it. That establishes neither completed games nor
-universal compatibility. Every row, and what has not been
-checked, is in [COMPATIBILITY.md](COMPATIBILITY.md).
+on the vitaGL build this branch ships. That establishes neither completed games
+nor universal compatibility. Every row, and what has not been checked, is in
+[COMPATIBILITY.md](COMPATIBILITY.md).
 
 ---
 
@@ -27,35 +26,23 @@ checked, is in [COMPATIBILITY.md](COMPATIBILITY.md).
 |---|---|
 | A PS Vita running homebrew | Only ever run on a **retail PS Vita**. No firmware version is recorded and no PS TV run has been made: treat both as untested. |
 | VitaShell | Installs the VPK and, in USB mode, copies game files (see [§6](#6-copying-files-use-vitashell-usb-not-ftp)). |
-| libshacccg (optional) | The VPK ships precompiled shader binaries, so a player needs nothing else. A shader that is not in the shipped set (a modified build) is compiled on the device and needs Sony's `libshacccg.suprx`, which is not distributed here. |
+| libshacccg (optional) | The VPK ships precompiled shader binaries, so a player needs nothing else. Only a shader missing from the shipped set (a modified build) has to be compiled on the device, and that needs Sony's `libshacccg.suprx`, which is not distributed here. |
 | Free space on `ux0:` | About 23 MB installed (the 1.0.0 VPK is 12.6 MB and unpacks to 23.2 MB). Games and RTPs come on top. |
 | A host computer | To build the player and to extract an RTP (macOS or Linux with VitaSDK). |
 
-## 2. Build and install the player
+## 2. Install the player
 
-```bash
-vita/scripts/build-player.sh
-```
+1. Download `mkxp-z.vpk` from the
+   [GitHub Releases page](https://github.com/GildedLotus/mkxp-z-vita-fork/releases).
+2. Copy it to the card (VitaShell USB mode is enough) and install it from
+   VitaShell.
+3. Start the bubble from LiveArea.
 
-writes `build/mkxp-z-vpk-vitagl/mkxp-z.vpk`, a **test build** under title id
-`MKXPZ0053` (`VITAGL_TITLE_ID` picks another test id). `vita/scripts/build-release.sh`
-builds the product package under `MKXPZ0001` in `build/mkxp-z-vpk-release/` and stages
-it under `build/release/` together with the corresponding source archive. See
-[Building](#building) for prerequisites.
-
-If a release VPK is available, install that and skip the build. Otherwise copy the VPK
-to the card (VitaShell USB mode is enough), install it from VitaShell
-and start the bubble from LiveArea. It boots into the **launcher**: its root
-configuration pins no game, so it draws the list of games found under
-`ux0:/data/mkxp-z/games`. The first launch creates `ux0:/data`, `ux0:/data/mkxp-z`
-and `ux0:/data/mkxp-z/logs`. It does **not** create `games/` or `rtp/`: make those
-yourself.
-
-**Title ids.** The product application is `MKXPZ0001`. Every test build takes
-its own id, and the packager refuses `MKXPZ0001` unless `MKXPZ_RELEASE=1`
-(which `build-release.sh` sets). It also refuses a *pinned* root config under
-`MKXPZ0001`. `MKXPZ0001` holds your launcher, its started games and the saves
-beside them; a test run must never overwrite it.
+It boots into the **launcher**: its root configuration pins no game, so it draws
+the list of games found under `ux0:/data/mkxp-z/games`. The first launch creates
+`ux0:/data`, `ux0:/data/mkxp-z` and `ux0:/data/mkxp-z/logs`. It does **not**
+create `games/` or `rtp/`: make those yourself. To build the VPK from source
+instead, see [Building](#building).
 
 ## 3. Adding games
 
@@ -72,6 +59,16 @@ when the game exits ([docs/launcher.md](docs/launcher.md)).
    detects it from its own `.ini`/archive pair (Pocket Mirror ships
    `Pocket Mirror.ini` and `Pocket Mirror.rgss3a` and no `Game.ini`).
 
+Launcher controls: Up/Down (D-pad or left stick) move the selection, Cross or
+Circle starts the selected game, Triangle rescans the games folder, and L / R
+turn the page. A game whose `Game.ini` names an RTP that is not installed under
+`ux0:/data/mkxp-z/rtp/` is tagged "RTP missing".
+
+Launcher limits: at most 256 games are listed; folders whose names start with
+`.` are ignored; a game whose full path exceeds 255 bytes is skipped; and the
+folder name is shown up to 127 bytes (a Japanese name is about 42 characters
+in UTF-8).
+
 ## 4. The folder layout on the card
 
 ```text
@@ -85,6 +82,7 @@ ux0:/data/mkxp-z/
 │   ├── XP/                     extracted RPG Maker XP RTP
 │   ├── VX/                     extracted RPG Maker VX RTP
 │   └── VXAce/                  extracted RPG Maker VX Ace RTP
+├── sf2/                        General MIDI SoundFont, .sf2 (optional, see §7)
 ├── fonts/                      extra .ttf faces (optional)
 └── logs/                       runtime logs
 ```
@@ -171,9 +169,16 @@ like an engine bug. FTP is fine for pulling logs off the device afterwards.
 
 Known limits of the port, which apply to every game:
 
-- **MIDI needs a user SoundFont.** The TinySoundFont build is optional and no
-  SoundFont is bundled; `midiSoundFont` selects or disables it. Without one,
-  MIDI (including XP RTP music) is silent and the log says why.
+- **MIDI needs a SoundFont you supply.** The MIDI player is built in, but no
+  SoundFont is bundled. Put a General MIDI `.sf2` in `ux0:/data/mkxp-z/sf2/`
+  (create the folder) or in the game's own folder. The player searches the game
+  folder, then `ux0:/data/mkxp-z/sf2/`, then `app0:/sf2/` (the release VPK carries
+  none), and uses the first `.sf2` of the first folder that has one; within a
+  folder the name that sorts first in byte order wins, so uppercase names come
+  before lowercase. The limits are an 8 MiB font and 64 voices per synth.
+  `midiSoundFont` (see [config.md](docs/config.md)) names one file instead, or
+  `"off"` disables MIDI. Without a SoundFont, MIDI (including XP RTP music) is
+  silent and the log says why.
 - **`Win32API` is not real here.** A Ruby shim (`win32_wrap.rb`) stops
   `Win32API.new` from raising and implements a handful of `user32` calls; any
   other import raises a `RuntimeError` when the game calls it.
@@ -195,10 +200,13 @@ Default controls, over the Vita pad:
 | Triangle | X |
 | L / R | L / R |
 | D-pad, left stick | directions |
+| Right stick left / right | Y / Z (they cannot be held together; untested on a device) |
+| Front touch screen | mouse: the first finger moves the pointer and presses the left button (`vitaTouchMouse`, on by default) |
 
-Start (or F1) opens an in-game binding menu, and Select toggles the FPS counter.
-Holding Start and Select together for two seconds quits the game cleanly (back to
-the launcher when it was started from there). A stored binding file under
+The launcher's own controls are listed in [§3](#3-adding-games). Start (or F1)
+opens an in-game binding menu, and Select toggles the FPS counter. Holding
+Start and Select together for two seconds quits the game cleanly (back to the
+launcher when it was started from there). A stored binding file under
 `ux0:/data/mkxp-z/mkxp-z/` silently overrides these defaults; delete it if a
 control does not match the table above.
 
@@ -232,6 +240,15 @@ failure.
 > process's memory: whatever the game had loaded is in it, and so is anything
 > else the process happened to be holding. The text log is what a maintainer can
 > act on.
+
+## 9. Upgrading and uninstalling
+
+Installing a newer `mkxp-z.vpk` over the installed app keeps
+`ux0:/data/mkxp-z/`: your games, saves, `config.json`, logs and stored bindings
+all live there, outside the app. Deleting the bubble does not remove that folder
+either; delete it by hand to remove everything. A stored binding file under
+`ux0:/data/mkxp-z/mkxp-z/` overrides the defaults of a newer release too (see
+the controls above); delete it to adopt them.
 
 ---
 
@@ -288,10 +305,20 @@ each pinned dependency are patch files under `vita/patches/{vitagl,sdl2,ruby}`,
 applied by the build scripts and never edited in a source clone.
 [THIRD-PARTY.md](../THIRD-PARTY.md) lists every component with its licence.
 
-Output: `build/mkxp-z-vpk-vitagl/mkxp-z.vpk`, with the unstripped ELF beside it
-for crash diagnosis (never publish that file: it names the build machine's
-layout). This is a repeatable procedure, not a claim of byte-identical output
-across unpinned SDK or toolchain installations.
+Output: `build/mkxp-z-vpk-vitagl/mkxp-z.vpk`, a **test build** under title id
+`MKXPZ0053` (`VITAGL_TITLE_ID` picks another test id), with the unstripped ELF
+beside it for crash diagnosis (never publish that file: it names the build
+machine's layout). `vita/scripts/build-release.sh` builds the product package
+under `MKXPZ0001` in `build/mkxp-z-vpk-release/` and stages it under
+`build/release/` together with the corresponding source archive. This is a
+repeatable procedure, not a claim of byte-identical output across unpinned SDK
+or toolchain installations.
+
+**Title ids.** The product application is `MKXPZ0001`. Every test build takes
+its own id, and the packager refuses `MKXPZ0001` unless `MKXPZ_RELEASE=1`
+(which `build-release.sh` sets). It also refuses a *pinned* root config under
+`MKXPZ0001`. `MKXPZ0001` holds your launcher, its started games and the saves
+beside them; a test run must never overwrite it.
 
 **Shaders.** The package ships precompiled vitaGL shader binaries
 (`vita/vitagl-shaders/`, loaded from `app0:/shader_cache/`).

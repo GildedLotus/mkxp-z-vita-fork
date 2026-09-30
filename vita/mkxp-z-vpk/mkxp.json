@@ -19,8 +19,10 @@
     "ux0:/data/mkxp-z/config.json and the game's own mkxp.json first. Full load",
     "order, every key and the pinned-player rules: vita/docs/config.md.",
     "",
-    "preloadScript runs before the game's own scripts and is read with plain",
-    "fopen, so it takes an absolute app0: path (vita/docs/config.md).",
+    "preloadScript in THIS file runs natively before the game's own scripts, with",
+    "the game folder as the working directory, so its entry is an absolute app0:",
+    "path. Preload lists in a game's own mkxp.json or mkxp-vita.json are resolved",
+    "by win32_wrap.rb instead, relative to the game folder (vita/docs/config.md).",
     "enableSettings gates Start and F1 for the Vita overlay menu; product",
     "packages pin true. The packager composes the packaged preload additions",
     "into vitaPackagePreloads; keep win32_wrap.rb on preloadScript."

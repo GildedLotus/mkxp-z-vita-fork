@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# package-vpk.sh — package the mkxp-z product VPK.
+# package-vpk.sh — package the mkxp-z VPK (the release package, or a test build).
 #
 # Pipeline:
 #   arm-vita-eabi-gcc → vita-elf-create → vita-make-fself →
-#   vita-mksfoex -s TITLE_ID=MKXPZ0001 -d ATTRIBUTE2=12 → vita-pack-vpk
+#   vita-mksfoex -s TITLE_ID=<id> -d ATTRIBUTE2=12 → vita-pack-vpk
 #
 # eboot source priority:
 #   1. $MKXPZ_ELF                          (explicit override)
@@ -14,11 +14,11 @@
 #
 # VPK contents:
 #   eboot.bin
-#   sce_sys/param.sfo          generated (TITLE_ID, ATTRIBUTE2=12)
+#   sce_sys/param.sfo          generated (TITLE_ID, ATTRIBUTE2=12, APP_VER)
 #   sce_sys/icon0.png, livearea/contents/   tracked LiveArea art (vita/mkxp-z-vpk/sce_sys/)
 #   fonts/                     fallback TTFs from build/fonts (vita/scripts/fetch-fonts.sh)
 #                              plus the tracked README.md and fonts.json
-#   config/default.json        placeholder (vita/mkxp-z-vpk/config/)
+#   config/default.json        the device profile (vita/mkxp-z-vpk/config/)
 #   preload/                   Ruby preload scripts (vita/mkxp-z-vpk/preload/);
 #                              device baseline and optional game composition
 #   ruby/                      installed Ruby 3.1 extension wrappers
@@ -29,7 +29,7 @@
 #   mkxp-vita-package.json     player identity, source provenance and
 #                              artifactSha256 (eboot/ELF digests)
 #
-# Lessons reused from earlier GLES VPK packaging:
+# Packaging rules:
 #   - source vita/scripts/vita-env.sh for VITASDK resolution
 #   - -ffunction-sections -fdata-sections + -Wl,--gc-sections
 #   - vita-make-fself without -s (unsafe/self) so ux0:data writes work
@@ -44,8 +44,10 @@
 # with VitaShell.
 # MKXP_JSON optionally selects a staged root config without editing assets.
 #
-# Environment overrides (defaults below package the PRODUCT, which is the
-# LAUNCHER — an unpinned root config under MKXPZ0001):
+# Environment overrides. The default root config is the launcher (unpinned) and
+# the default TITLE_ID is the product id MKXPZ0001, which is accepted only with
+# MKXPZ_RELEASE=1 (set by build-release.sh); any other package must set TITLE_ID
+# to a test id:
 #   MKXPZ_ELF, BUILD_DIR, RUBY_PREFIX, TITLE_ID, TITLE, ATTRIBUTE2
 #   VITA_GL_BACKEND accepts only vitagl (the default). A non-release package
 #                   defaults OUT_DIR to build/mkxp-z-vpk-vitagl and refuses the

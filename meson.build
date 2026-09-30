@@ -99,7 +99,8 @@ endif
 # --game and no pinned root config it draws the game list with SDL2 alone and
 # never loads Ruby, and picking a game is sceAppMgrLoadExec of the same eboot.
 # MRI cannot be re-initialised in process, so "quit to the launcher" has to be
-# a process replacement, and a second eboot would double a 45 MB package.
+# a process replacement, and a second eboot would duplicate the whole player
+# executable just to draw a list.
 # Off by default: without it src/main.cpp is the pinned player it always was.
 if get_option('vita_launcher') == true
     global_args += '-DMKXPZ_VITA_LAUNCHER'

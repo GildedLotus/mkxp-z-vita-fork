@@ -74,7 +74,7 @@ are the same code path. `--game=<path>` is accepted as well as `--game <path>`,
 and the first occurrence wins.
 
 A path is only accepted if it is a device-absolute `<dev>:/…` path of at most
-255 bytes with no `..` component and no control bytes
+255 bytes with no `.` or `..` component and no control bytes
 (`vita/launcher/launch_args.c`). That is not decoration: the string crosses a
 process boundary and is then handed to `fopen` and `chdir`.
 
@@ -129,7 +129,7 @@ would be gone. So a launcher boot writes `launcher.log` and a game boot writes
 
 A game the system kills never returns from `main()`. `vita_boot_finish()` never
 runs, there is no LoadExec, and the user lands back on LiveArea with no
-explanation at all — which is exactly what a Blank Dream run looks like today.
+explanation at all.
 
 So, in **game** mode only, as soon as the log is open:
 
@@ -201,25 +201,28 @@ deleted and the existing report is left alone.
 The producer and consumer must agree on the directory, magic, separators and
 kinds: `src/vita_fatal.h` defines them for both.
 
-The writer uses bounded libc buffers without heap allocation: an 8 KiB header buffer, sanitized
-single-line title and a 64 KiB log excerpt cap. Write a temporary file, then rename it; on Vita an
-occupied destination may require unlink-then-rename. The next process consumes it, so that gap is
-acceptable, but publishing a partially written file is not. Persist the report before optional font,
-GL or Ruby-backtrace work can fail; nil/non-array backtraces and malformed strings need safe defaults.
+The writer uses bounded libc buffers and no heap allocation: an 8 KiB header buffer, a sanitized
+single-line title and a 64 KiB cap on the log excerpt. It writes a temporary file and renames it; on
+the Vita an occupied destination may need an unlink first, so there can be a short gap with no
+report. The next process tolerates that gap, but a partly written file is never published. The report
+is persisted before any font, GL or Ruby-backtrace work that could fail, and a nil or non-array
+backtrace or a malformed string falls back to a safe default.
 
-The exception panel sanitizes class/message and at most 32 backtrace entries without modifying
-Ruby strings. It uses one temporary 960×544 texture, a warmed simple shader and normal blending;
-no new FBO, program, VAO or buffer may be required. Restore pushed GL state on every exit.
-Prefer the registered pooled VL Gothic face for CJK; otherwise open the owned built-in face.
-Never close a borrowed pooled font. Panel failure must leave the durable log and must not raise again.
-The RGSS loop is stopped, so dismissal reads raw controller state, waits for press then release,
-and sleeps 12 ms between checks; the main thread still pumps SDL. Honor terminate requests early.
-The autodismiss marker gives tests a five-second exit. Non-Vita implementations remain no-ops.
+The exception panel sanitizes the class, the message and at most 32 backtrace entries without
+modifying Ruby strings. It uses one temporary 960×544 texture, a warmed simple shader and normal
+blending, and needs no new FBO, program, VAO or buffer. It restores the pushed GL state on every
+exit. It prefers the registered pooled VL Gothic face for CJK and otherwise opens its own built-in
+face; a borrowed pooled font is never closed. If the panel fails, the durable log remains and the
+panel does not raise again. The RGSS loop is stopped, so dismissal reads raw controller state, waits
+for a press and then a release, and sleeps 12 ms between checks while the main thread keeps pumping
+SDL; a terminate request ends it early. The autodismiss marker gives tests a five-second exit.
+Non-Vita builds leave the panel as a no-op.
 
 The persistent status overlay instead owns one boot-time 512×128 texture and file-static RGBA staging.
-Hidden overlays issue no GL work; unchanged text avoids upload. Draw on both normal screen-redraw
-exits through the shared quad, using already warmed normal blending; transitions/fades are separate.
-The texture lasts for the process and must not enqueue retirement after the shutdown drain.
+A hidden overlay issues no GL work, and unchanged text is not uploaded again. It is drawn on both
+normal screen-redraw exits through the shared quad with the already warmed normal blending;
+transitions and fades are separate. The texture lasts for the process and is never queued for
+retirement after the shutdown drain.
 
 ## What each mode does at the end
 
@@ -244,10 +247,10 @@ through `vita_boot_report_error()` before the hand-over. An exception leaving
 `main()` would be `std::terminate`, and on this device that is a process kill
 with an empty log.
 
-Choose launcher/game/pinned mode before opening the player log, so browsing preserves the previous
-game's evidence. Launcher mode starts neither MRI nor OpenAL. A wedged RGSS thread permits neither
-GL/AL teardown nor LoadExec; leave the marker for the next launch instead. Production Ruby starts
-only once per process; returning to the launcher always creates a fresh process image.
+The mode is chosen before the player log is opened, so browsing the list preserves the previous
+game's evidence. Launcher mode starts neither MRI nor OpenAL. With a wedged RGSS thread there is
+neither GL/AL teardown nor LoadExec: the marker stays for the next launch instead. Ruby starts
+only once per process, and returning to the launcher always creates a fresh process image.
 
 ## The log lines
 

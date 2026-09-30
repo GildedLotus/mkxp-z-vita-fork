@@ -174,7 +174,7 @@ diff --git a/thread_pthread.c b/thread_pthread.c
 +    /* Always the condvar path. Skipping only rb_sigwait_sleep is not enough:
 +     * with sigwait_fd == -1 the main thread still entered native_ppoll_sleep,
 +     * which polls the self-pipe. pthread cond+timedwait is the verified
-+     * primitive (MKXPZ0010). */
++     * primitive. */
 +    native_cond_sleep(th, rel);
 +#else
 +    int sigwait_fd = rb_sigwait_fd_get(th);

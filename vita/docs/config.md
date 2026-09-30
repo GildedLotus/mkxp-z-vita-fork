@@ -16,7 +16,7 @@ app0:/mkxp.json                      the VPK author's pin: the launcher config,
 ux0:/data/mkxp-z/config.json         the user's global settings
 ux0:/data/mkxp-z/games/<Name>/mkxp.json        the game's own config, as shipped
 ux0:/data/mkxp-z/games/<Name>/mkxp-vita.json   the game's Vita-specific config
-ux0:/data/mkxp-z/mkxp-z/mkxp.json    user config written under customDataPath (stock step 4)
+ux0:/data/mkxp-z/mkxp-z/mkxp.json    user config under customDataPath
 ```
 
 All of them are JSON5 (comments and trailing commas are legal) and are parsed
@@ -64,9 +64,9 @@ All seven are merged **before** the early option reads
 (`SET_STRINGOPT(gameFolder …)` through `SET_OPT(defScreenH …)`), because
 `gameFolder`, `rgssVersion`, `execName` and `dataPathOrg`/`dataPathApp` are
 consumed by the `chdir` and the `readGameINI()` that immediately follow them.
-The stock tail is unchanged, so the last word still belongs to
-
-| 8 | `<customDataPath>/mkxp.json` | merged after `readGameINI()`; cannot change `gameFolder` or `rgssVersion`, because both have already been read |
+An eighth layer, `<customDataPath>/mkxp.json` (layer 8), is merged after
+`readGameINI()` and has the final word; it cannot change `gameFolder` or `rgssVersion`, because both
+have already been read.
 
 `customDataPath` is `SDL_GetPrefPath(dataPathOrg, dataPathApp)` — on this
 device `ux0:/data/<org>/<app>/`.
@@ -147,14 +147,12 @@ diagnostics keep their explicit settings gate and preload list; the engine does
 not run game preloads in that mode.
 
 Only these game lists and package additions participate in composition.
-Device/global `preloadScript` lists are not accumulated. The legacy
-`<customDataPath>/mkxp.json` layer still runs after the root pin in native code:
-do not put `preloadScript` there, since it can bypass the entry point. Native
-enforcement of that existing exception is separate from this packaging policy.
-Game-level config cannot override the packaged `enableSettings: true` pin.
-The legacy layer 8 can set it false to disable both Start and F1 menu entry.
-Explicit `System.show_settings` calls remain independent of this gate, and no
-layer can restore the desktop second window.
+Device/global `preloadScript` lists are not accumulated. Layer 8 runs after the
+root pin in native code: do not put `preloadScript` there, since it can bypass
+the entry point. Game-level config cannot override the packaged
+`enableSettings: true` pin. Layer 8 can set it false to disable both Start and
+F1 menu entry. Explicit `System.show_settings` calls remain independent of this
+gate, and no layer can restore the desktop second window.
 
 ### Old Ruby and Windows limits
 
@@ -183,8 +181,7 @@ The shim's existing keyboard/mouse query implementations remain a limited
 portable subset. Windows libraries and native extensions are not supplied.
 Ao Oni's optional website command requires a thread and Windows shell: it is
 unsupported. A game-specific preload should disable or explain that menu item;
-thread support alone cannot provide the browser action. Host checks of script
-initialization do not establish gameplay, input, saving or hardware acceptance.
+thread support alone cannot provide the browser action.
 
 ## Automatic RTP
 
@@ -338,7 +335,7 @@ for, consumed from or recovered into a game's slot. A deliberate `File.delete`,
 a zero-byte save and a game's own `.bak` name mean what they mean on a PC.
 Files with those names beside a slot (`Save*.txn`, `Save*.bak.keep`,
 `Save*.bak.legacy`, `Save*.bak.tmp`, `Save*.corrupt`, `Save*.corrupt.N`) are
-inert leftovers of earlier builds: nothing reads, consumes or cleans them.
+ordinary files to the player: nothing reads, consumes or cleans them.
 **Nothing recovers a save for you: keep an external copy of anything you care
 about.** Every save call shape gives the same result as on plain MRI 3.1.3.
 
@@ -359,19 +356,17 @@ commit order: only a valid active file moves to `.bak`, then the finished
 `.tmp` is renamed onto the free name. An invalid active file is quarantined as
 `settings.json.corrupt`; the next damaged file is kept as `settings.json.corrupt.1`
 and every later one replaces that second slot, so a fresh install holds two
-copies at most (numbered files left by older builds are never cleaned). It never
-replaces a good backup. A write whose bytes the reader would refuse (over 64 KiB,
+copies at most. It never replaces a good backup. A write whose bytes the reader would refuse (over 64 KiB,
 or not a JSON object) is checked after the sync and raises `IOError` before
 anything is rotated, so a large `CFG[]=` value leaves the last valid settings
 active. The accepted cost is that newlib's
 non-atomic rename can drop the backup itself, never the active file.
-`settings.json.bak.keep` and `settings.json.bak.legacy*` files left by earlier
-builds are inert: nothing reads, writes or cleans them.
+Files named `settings.json.bak.keep` or `settings.json.bak.legacy*` are ordinary
+files: nothing reads, writes or cleans them.
 
 The player deliberately does not intercept a game's own writes: an interception
 layer can lose saves (case aliases, garbage-collected writers, recovery
-resurrecting a save the game deleted). A `vitaSaveGuard` key, if present, is
-unknown like any other.
+resurrecting a save the game deleted).
 
 ## Vita binding menu
 
@@ -395,7 +390,7 @@ warning. Cancel discards the draft; Reset defaults takes effect only on Accept.
 Bindings use the existing `customDataPath/keybindings.mkxp1`, `mkxp2` or `mkxp3`
 file for each RGSS version (normally under `ux0:/data/mkxp-z/mkxp-z/`). They are
 shared by games using that path/version. The menu does not write game or device
-JSON settings. Packaged `enableSettings` is now true.
+JSON settings.
 
 On Vita, Accept writes `.tmp`, checks write/flush/sync/close and reads it back,
 then rotates a valid current file to `.bak` before publishing the replacement.
@@ -486,6 +481,8 @@ is the one the Vita build changes, and the row says so; the
 | `vitaConfigLayers` | bool | `false` | — (set it in `app0:/mkxp.json`) |
 | `vitaAutoRTP` | bool | `true` | — |
 | `vitaTouchMouse` | bool | `true` | — |
+| `controllerDeadzone` | float | `0.3` (Vita only; clamped to 0.05–0.95, see below) | — |
+| `vitaGamesRoot` | string | — (not a ConfDef key; the launcher reads it from `app0:/mkxp.json` only) | — |
 | `vitaglRamPoolMiB` / `vitaglCdramPoolMiB` / `vitaglPhycontPoolMiB` | int | `0` | — (vitaGL builds only; see below) |
 
 `xbrzScalingFactor` exists only in an `MKXPZ_SSL` build and is not compiled
@@ -505,7 +502,7 @@ here.
   VL Gothic` and drew Japanese text as tofu.
 * **`enableSettings` gates Start and F1 for the Vita overlay menu.** Product
   packages pin it `true` in `app0:/mkxp.json` (layer 6), above both game-level
-  configs. The legacy layer 8 can override it to disable both entry points.
+  configs. Layer 8 can override it to disable both entry points.
   Explicit `System.show_settings` calls remain available regardless. The menu
   uses the existing game window.
 * **`defScreenW`/`defScreenH` are the window**, not the game's internal
@@ -527,7 +524,19 @@ here.
   `bindingNames` and everything the defaults set. Delete it first when a
   binding mystery survives a rebuild.
 * **`smoothScaling` is an integer**: `0` Nearest, `1` Bilinear, `2` Bicubic,
-  `3` Lanczos3, `4` xBRZ.
+  `3` Lanczos3, `4` xBRZ. **The release package offers only `0` and `1`.** It is
+  built without the optional shaders (the Bicubic and Lanczos3 programs), and
+  xBRZ exists only in a build with HTTPS support (`MKXPZ_SSL`), which the Vita
+  build turns off. On such a build every value of `2` or higher is silently treated as `1` (Bilinear), for
+  `smoothScaling`, `smoothScalingDown`, `bitmapSmoothScaling` and
+  `bitmapSmoothScalingDown` alike.
+* **`midiSoundFont`** is either a file name, or `"off"` to disable MIDI. A name is
+  opened as written, so it is relative to the game folder or an absolute device
+  path such as `ux0:/data/mkxp-z/sf2/GM.sf2`. The default, an empty string,
+  searches for a `.sf2` in the game folder, then `ux0:/data/mkxp-z/sf2/`, then
+  `app0:/sf2/`: the first folder that has one wins, and within it the file whose
+  name sorts first in byte order. No SoundFont is bundled; without one MIDI is
+  silent. A font larger than 8 MiB is refused, and a synth plays at most 64 voices.
 
 ### Handheld controller defaults
 
@@ -550,11 +559,10 @@ These cached per-binding gates also apply to saved stick-to-button mappings;
 direction bindings, trigger axes, raw-axis queries and binding-file contents are
 unchanged. Settings capture still uses the movement gate described below.
 Y/Z cannot be held together on this default axis. Desktop defaults still use clicks.
-Device acceptance of the handheld mapping is still pending.
+The handheld mapping has not been tested on a device.
 
-Saved bindings replace the RGSS rows above; an old file keeps its old L3/R3 mapping.
-Back up and remove that file to adopt the new defaults. `bindingNames` only changes
-labels, not the controls. To isolate an existing format-3 binding file per game,
+A stored binding file replaces the RGSS rows above. Back up and remove it to use
+these defaults. `bindingNames` only changes labels, not the controls. To isolate an existing format-3 binding file per game,
 set `"dataPathOrg": "mkxp-z", "dataPathApp": "MyGame"` in that game's
 `mkxp-vita.json`, then put `keybindings.mkxp1`, `.mkxp2` or `.mkxp3` (for XP,
 VX or Ace) in `ux0:/data/mkxp-z/MyGame/`. Use a binding file saved by mkxp-z's
@@ -586,9 +594,9 @@ inactivity have not been checked on hardware.
 `controllerDeadzone` is Vita-only: default `0.30`, clamped to `[0.05, 0.95]` of SDL's signed
 16-bit axis range. SDL's Vita response curve is nonlinear; `0.30` means about 37% physical
 travel at the pinned SDL revision, not 30%. `0.5` restores the stock gate `0x4000`.
-Resolve the threshold when bindings are applied and cache it per axis binding, so the frame loop
-does one integer comparison. Settings capture uses the same resolved threshold. Binding file
-format/version remain unchanged; stored bindings still win over defaults. The curve was recomputed from the SDL source and diagonals were tested, rather than assuming a linear stick response.
+The threshold is resolved once, when bindings are applied, and cached per axis binding. The binding
+menu's capture uses the same threshold. The binding file format is unchanged, and stored bindings
+still win over defaults.
 
 ### Frame pacing
 
