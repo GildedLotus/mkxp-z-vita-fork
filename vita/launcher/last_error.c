@@ -12,7 +12,7 @@
 #include "vita_publish.h"
 
 /* Header lines read before giving up on finding the "---" separator. The
- * producer writes exactly three (magic, kind, title); a handful of slack
+ * producer writes four (magic, kind, title, bytes); a handful of slack
  * costs nothing and keeps a future field from swallowing the whole body. */
 #define HEADER_LINES_MAX 8
 

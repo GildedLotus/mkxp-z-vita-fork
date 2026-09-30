@@ -77,47 +77,43 @@ mode_t umask(mode_t mask) { (void)mask; return 0; }
 
 /* dup2: Vita newlib has dup/close/open/fcntl but not dup2. MRI uses dup2
  * unconditionally in ruby_sysinit/pipe paths even when configure says no.
- * F_DUPFD returns exactly newfd when that slot is free, which is the common
- * case and needs no close at all, so it cannot race. Only replacing an
+ * Nothing here needs a spare descriptor, so a full table cannot make a valid
+ * dup2 fail. oldfd == newfd is validated with F_GETFD, which allocates
+ * nothing. F_DUPFD returns exactly newfd when that slot is free, which is the
+ * common case and needs no close at all, so it cannot race. Only replacing an
  * OCCUPIED newfd is a close followed by a duplicate, and newlib offers no
  * lock that makes the pair atomic: that path is for MRI's single-threaded
  * startup and redirection, where the caller owns newfd. If another thread
  * takes the slot in between, the shim fails with EBUSY (an error POSIX
- * allows dup2) and never claims a neighbouring descriptor. oldfd is
- * duplicated first, which proves it valid (a bad oldfd fails with newfd
- * untouched, as POSIX requires) and keeps the file open across the close.
- * An out-of-range newfd is EBADF, as for dup2, not F_DUPFD's EINVAL. */
+ * allows dup2) and never claims a neighbouring descriptor.
+ * Vita's F_DUPFD reports every failure but an out-of-range minimum (EINVAL)
+ * as EBADF, a full table included, so a failed duplicate is told apart by
+ * asking F_GETFD whether oldfd is valid: a bad oldfd fails with newfd
+ * untouched, as POSIX requires; a valid one means newfd is occupied and the
+ * table is full. An out-of-range newfd is EBADF, as for dup2. */
 int dup2(int oldfd, int newfd) {
-  int held, r, err;
+  int r, err;
   if (newfd < 0) {
     errno = EBADF;
     return -1;
   }
-  held = dup(oldfd);
-  if (held < 0)
-    return -1;
-  if (oldfd == newfd || held == newfd) {
-    if (oldfd == newfd)
-      close(held);
+  if (oldfd == newfd)
+    return fcntl(oldfd, F_GETFD) < 0 ? -1 : newfd;
+  r = fcntl(oldfd, F_DUPFD, newfd);
+  if (r == newfd)
     return newfd;
-  }
-  r = fcntl(held, F_DUPFD, newfd);
   err = errno;
-  if (r == newfd) {
-    close(held);
-    return newfd;
-  }
   if (r >= 0) {
     close(r);
-  } else if (err != EMFILE) {
-    close(held);
-    errno = err == EINVAL ? EBADF : err;
+  } else if (err == EINVAL) {
+    errno = EBADF;
+    return -1;
+  } else if (fcntl(oldfd, F_GETFD) < 0) {
     return -1;
   }
   close(newfd);
-  r = fcntl(held, F_DUPFD, newfd);
+  r = fcntl(oldfd, F_DUPFD, newfd);
   err = errno;
-  close(held);
   if (r < 0) {
     errno = err == EINVAL ? EBADF : err;
     return -1;

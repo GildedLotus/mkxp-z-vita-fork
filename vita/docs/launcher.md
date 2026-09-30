@@ -177,7 +177,9 @@ the field existed carries none and is still read when its envelope is whole.
 The writer applies the same rule before it rotates: a whole active report moves
 to `last-error.txt.bak`, a damaged one to `last-error.txt.corrupt`, so damage
 can never displace a valid backup, and a retained `.tmp` is published only when
-it declares and matches its length.
+it declares and matches its length. Any other retained `.tmp` (torn, or a complete
+report from a build that declared no length, which may be the newest diagnosis) is
+moved to `last-error.txt.corrupt`, never deleted; a newer one takes that slot.
 
 `script-error`, `init-error` and `stuck` are `src/vita_fatal.h`'s.
 `unclean-exit` (a breadcrumb was found) and `bad-argument` (a rejected `--game`,

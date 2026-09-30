@@ -178,21 +178,28 @@ static int vitaFatalUsable(const char *path)
     return 0;
 }
 
+static bool vitaFatalCorruptPath(char *out, size_t cap, const char *finalPath)
+{
+    size_t n = 0;
+
+    if (!vitaFatalAppend(out, cap, &n, finalPath) ||
+        !vitaFatalAppend(out, cap, &n, VITA_FATAL_CORRUPT_SUFFIX))
+        return false;
+    out[n] = '\0';
+    return true;
+}
+
 bool vitaFatalPublish(const char *tmpPath, const char *finalPath,
                       const char *backupPath)
 {
     char corrupt[VITA_FATAL_PATH_MAX];
-    size_t n = 0;
 
     // The publication policy (move-aside, publish, failure recoverability)
     // lives in vita_publish, shared by every generation-preserving writer.
     // A damaged active report is quarantined, so it can never displace a
     // valid backup.
-    if (!vitaFatalAppend(corrupt, sizeof(corrupt), &n, finalPath) ||
-        !vitaFatalAppend(corrupt, sizeof(corrupt), &n,
-                         VITA_FATAL_CORRUPT_SUFFIX))
+    if (!vitaFatalCorruptPath(corrupt, sizeof(corrupt), finalPath))
         return false;
-    corrupt[n] = '\0';
     return vita_publish_commit_checked(tmpPath, finalPath, backupPath, corrupt,
                                        vitaFatalUsable) == 0;
 }
@@ -343,8 +350,8 @@ bool vitaFatalReportInspect(const char *path, bool requireLength,
 
 /* A retained .tmp is only worth publishing when the write that made it ran to
  * the end: a whole envelope whose body is exactly the length it declares
- * (this writer always declares one). Anything else is a torn write and must
- * not replace a good report. */
+ * (this writer always declares one). Anything else is not promoted over a good
+ * report. */
 static bool vitaFatalReportComplete(const char *path)
 {
     return vitaFatalReportInspect(path, true, NULL);
@@ -391,13 +398,21 @@ bool vitaWriteLastErrorTo(const char *dir, const char *kind, const char *title,
     if (len == 0 || bodyLen >= 10000000000ull)
         return false;
 
-    // A retained report must leave .tmp before another write can truncate it;
-    // a torn one is discarded, never promoted over the last good report.
+    // A retained report must leave .tmp before another write can truncate it.
+    // One that is not promotable (torn, or written by a build that declared no
+    // length, which may still be the newest diagnosis) is kept as
+    // last-error.txt.corrupt, never promoted over the last good report and
+    // never deleted.
     if (access(tmpPath, F_OK) == 0) {
         if (!vitaFatalReportComplete(tmpPath)) {
+            char corruptPath[VITA_FATAL_PATH_MAX];
+
             vitaLogMessage("fatal-report: ",
-                           "discarding an incomplete retained report");
-            (void)remove(tmpPath);
+                           "quarantining a retained report that is not whole");
+            if (!vitaFatalCorruptPath(corruptPath, sizeof(corruptPath),
+                                      finalPath) ||
+                vita_publish_move(tmpPath, corruptPath) != 0)
+                return false;
         } else if (!vitaFatalPublish(tmpPath, finalPath, backupPath)) {
             return false;
         }

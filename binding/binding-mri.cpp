@@ -973,11 +973,14 @@ json5pp::value loadUserSettings() {
 #endif
 }
 
-void saveUserSettings(json5pp::value &settings) {
+/* Returns 0, or the Ruby tag of a failed write. It never raises itself: the
+ * caller still holds C++ objects, and a Ruby raise is a longjmp that skips
+ * their destructors, so it leaves its scope and only then rb_jump_tag()s. */
+int saveUserSettings(json5pp::value &settings) {
     VALUE cpath = rb_utf8_str_new_cstr(shState->config().userConfPath.c_str());
+    int state = 0;
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     VALUE bytes;
-    int state = 0;
     {
         std::string text = settings.stringify5(json5pp::rule::space_indent<>());
         bytes = rb_protect([](VALUE arg) -> VALUE {
@@ -985,16 +988,20 @@ void saveUserSettings(json5pp::value &settings) {
             return rb_utf8_str_new(text->data(), text->size());
         }, reinterpret_cast<VALUE>(&text), &state);
     }
-    // Ruby longjmp cannot skip the C++ string destructor.
     if (state)
-        rb_jump_tag(state);
-    rb_funcall(rb_const_get(rb_cObject, rb_intern("VitaSettingsFile")),
-               rb_intern("write_bytes"), 2, cpath, bytes);
+        return state;
+    VALUE write[2] = {cpath, bytes};
+    rb_protect([](VALUE arg) -> VALUE {
+        VALUE *write = reinterpret_cast<VALUE *>(arg);
+        return rb_funcall(rb_const_get(rb_cObject, rb_intern("VitaSettingsFile")),
+                          rb_intern("write_bytes"), 2, write[0], write[1]);
+    }, reinterpret_cast<VALUE>(write), &state);
 #else
     VALUE f = rb_funcall(rb_cFile, rb_intern("open"), 2, cpath, rb_str_new("w", 1));
     rb_funcall(f, rb_intern("write"), 1, rb_utf8_str_new_cstr(settings.stringify5(json5pp::rule::space_indent<>()).c_str()));
     rb_funcall(f, rb_intern("close"), 0);
 #endif
+    return state;
 }
 
 RB_METHOD_GUARD(mkxpGetJSONSetting) {
@@ -1026,10 +1033,15 @@ RB_METHOD_GUARD(mkxpSetJSONSetting) {
     rb_scan_args(argc, argv, "2", &sname, &svalue);
     SafeStringValue(sname);
     
-    auto settings = loadUserSettings();
-    auto &s = settings.as_object();
-    s[RSTRING_PTR(sname)] = rb2json(svalue);
-    saveUserSettings(settings);
+    int state;
+    {
+        auto settings = loadUserSettings();
+        auto &s = settings.as_object();
+        s[RSTRING_PTR(sname)] = rb2json(svalue);
+        state = saveUserSettings(settings);
+    }
+    if (state)
+        rb_jump_tag(state);
     
     return Qnil;
 }

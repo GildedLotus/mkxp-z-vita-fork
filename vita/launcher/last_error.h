@@ -153,11 +153,14 @@ typedef struct LastErrorReport {
 int last_error_parse(const char *data, size_t len, LastErrorReport *out);
 
 /* Read one generation without changing it. Returns 1 for a displayable v1
- * report with both header fields, a separator, body bytes and final newline;
+ * report with both header fields, a separator, body bytes and final newline
+ * (and the declared length, when there is one);
  * 0 for absent/invalid content or invalid arguments; -1 for I/O failure.
  * Unknown kinds and empty titles/bodies are allowed, as in the producer.
- * On 0/-1, parsed fields are empty; -1 sets io_error. This is structural
- * validation: v1 has no checksum or length to detect loss at a line boundary. */
+ * On 0/-1, parsed fields are empty; -1 sets io_error. When the header
+ * declares `bytes:` the body must be exactly that long, which is what detects
+ * loss at a line boundary; a legacy v1 report from before the field carries
+ * no length, so only its structure can be checked. */
 int last_error_read(const char *path, LastErrorReport *out);
 
 /*

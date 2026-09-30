@@ -4,6 +4,7 @@
 #include <SDL.h>
 #include <cstdint>
 #include <new>
+#include <string>
 
 #include "filesystem/filesystem.h"
 #include "miniffi.h"
@@ -32,16 +33,30 @@
 #define _T_INTEGER 3
 #define _T_BOOL 4
 
-/* The library and the entry point it resolved live in the typed data, out of
- * reach of Ruby: func stays null until initialize has resolved a real
- * function, and MiniFFI_call refuses to run without one. */
+/* Everything an initialized object is lives in this one record, out of reach
+ * of Ruby: initialize builds a complete replacement and publishes it with one
+ * pointer swap, so an object is either wholly old or wholly new. func is
+ * always a resolved entry point; an object that never finished initialize has
+ * no record at all. */
 struct MiniFFIData {
     void *lib;
     void *func;
-    /* Calls running outside the GVL. Only touched with the GVL held, so a
-     * reinitialize can refuse to unload code that is executing. */
+    /* Calls in flight, from argument conversion to the result. Only touched
+     * with the GVL held, so reinitialize can refuse to unload code that is
+     * executing or about to. */
     int active;
+    int exports;
+    VALUE libname;
+    VALUE funcname;
+    VALUE imports;
 };
+
+static void MiniFFIMark(void *p) {
+    MiniFFIData *data = static_cast<MiniFFIData *>(p);
+    rb_gc_mark(data->libname);
+    rb_gc_mark(data->funcname);
+    rb_gc_mark(data->imports);
+}
 
 static void MiniFFIFree(void *p) {
     MiniFFIData *data = static_cast<MiniFFIData *>(p);
@@ -53,7 +68,9 @@ static void MiniFFIFree(void *p) {
 #if RAPI_FULL > 187
 DEF_TYPE_CUSTOMFREE(MiniFFI, MiniFFIFree);
 #else
-DEF_ALLOCFUNC_CUSTOMFREE(MiniFFI, MiniFFIFree);
+static VALUE MiniFFIAllocate(VALUE klass) {
+    return Data_Wrap_Struct(klass, MiniFFIMark, MiniFFIFree, 0);
+}
 #endif
 
 static void *MiniFFI_GetFunctionHandle(void *libhandle, const char *func) {
@@ -70,9 +87,13 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
     rb_scan_args(argc, argv, "22", &libname, &func, &imports, &exports);
     SafeStringValue(libname);
     SafeStringValue(func);
-    /* Reinitializing replaces the object's whole state or none of it: every
-     * check that can raise into Ruby runs before anything is loaded or
-     * changed, and the new state is published last. */
+    /* Reinitializing replaces the object's whole state or none of it. Every
+     * step that can raise into Ruby (a Ruby raise is a longjmp: no C++
+     * destructor runs and nothing native may be held) happens before anything
+     * is loaded; the replacement is then built in one record and published by
+     * one swap. These two are the cheap early refusals; the swap checks again,
+     * because the conversions below can run Ruby code and let another thread
+     * start a call or freeze the object. */
     if (OBJ_FROZEN(self))
         rb_error_frozen("MiniFFI");
     MiniFFIData *previous = getPrivateDataNoRaise<MiniFFIData>(self);
@@ -184,38 +205,42 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
         }
     }
 
-    /* From here only C++ exceptions can leave, so a half-acquired library or
-     * state record is released by hand and the object is still untouched. */
-    MiniFFIData *data = new (std::nothrow) MiniFFIData{0, 0, 0};
+    /* From here nothing calls into Ruby until the swap, so only C++ exceptions
+     * can leave and the record and library are released by hand on each. */
+    MiniFFIData *data = new (std::nothrow) MiniFFIData{0, 0, 0, ex, libname, func, ary_imports};
     if (!data)
         throw std::bad_alloc();
+    try {
 #ifdef __APPLE__
-    void *hlib = SDL_LoadObject(mkxp_fs::normalizePath(RSTRING_PTR(libname), 1, 1).c_str());
+        data->lib = SDL_LoadObject(mkxp_fs::normalizePath(RSTRING_PTR(libname), 1, 1).c_str());
 #else
-    void *hlib = SDL_LoadObject(RSTRING_PTR(libname));
+        data->lib = SDL_LoadObject(RSTRING_PTR(libname));
 #endif
-    void *hfunc = MiniFFI_GetFunctionHandle(hlib, RSTRING_PTR(func));
+        data->func = MiniFFI_GetFunctionHandle(data->lib, RSTRING_PTR(func));
 #ifdef __WIN32__
-    if (hlib && !hfunc) {
-        VALUE func_a = rb_str_new3(func);
-        func_a = rb_str_cat(func_a, "A", 1);
-        hfunc = SDL_LoadFunction(hlib, RSTRING_PTR(func_a));
-    }
+        if (data->lib && !data->func) {
+            std::string func_a(RSTRING_PTR(func));
+            func_a += 'A';
+            data->func = SDL_LoadFunction(data->lib, func_a.c_str());
+        }
 #endif
-    if (!hfunc) {
-        Exception failure(Exception::RuntimeError, "%s", SDL_GetError());
-        if (hlib)
-            SDL_UnloadObject(hlib);
-        delete data;
-        throw failure;
+        if (!data->func)
+            throw Exception(Exception::RuntimeError, "%s", SDL_GetError());
+    } catch (...) {
+        MiniFFIFree(data);
+        throw;
     }
-    data->lib = hlib;
-    data->func = hfunc;
 
-    rb_iv_set(self, "_funcname", func);
-    rb_iv_set(self, "_libname", libname);
-    rb_iv_set(self, "_imports", ary_imports);
-    rb_iv_set(self, "_exports", INT2FIX(ex));
+    /* Nothing can run between this check and the swap, so it is final. */
+    const bool frozen = OBJ_FROZEN(self);
+    previous = getPrivateDataNoRaise<MiniFFIData>(self);
+    if (frozen || (previous && previous->active)) {
+        MiniFFIFree(data);
+        if (frozen)
+            rb_error_frozen("MiniFFI");
+        throw Exception(Exception::RuntimeError,
+                 "MiniFFI function is running; it cannot be reinitialized");
+    }
     setPrivateData(self, data);
     if (rb_block_given_p())
         rb_yield(self);
@@ -236,33 +261,15 @@ void* miniffi_call_cb(void *args) {
     }
 #endif
 
-RB_METHOD_GUARD(MiniFFI_call) {
+/* The call proper, with the object's record pinned by `active` (see
+ * MiniFFI_call), so the library and everything the record holds stay valid
+ * however much Ruby code the conversions below run. */
+RB_METHOD_GUARD(MiniFFI_callPinned) {
     MiniFFIFuncArgs param;
 #define params param.params
-    VALUE own_imports = rb_iv_get(self, "_imports");
-    VALUE own_exports = rb_iv_get(self, "_exports");
     MiniFFIData *funcData = getPrivateDataNoRaise<MiniFFIData>(self);
-    MINIFFI_FUNC ApiFunction = funcData ? (MINIFFI_FUNC)funcData->func : 0;
-    /* Never branch to an address initialize did not resolve. The pointer is
-     * set only after SDL_LoadFunction succeeded, and it lives in the C
-     * struct, so an object that skipped or failed initialize (an override
-     * that skips `super`, MiniFFI.allocate, a dup of one) has none and gets a
-     * Ruby error the game can rescue instead of a call through garbage. */
-    if (!ApiFunction) {
-        VALUE libname = rb_iv_get(self, "_libname");
-        VALUE funcname = rb_iv_get(self, "_funcname");
-        throw Exception(Exception::RuntimeError,
-                 "%s:%s has no entry point on this platform",
-                 NIL_P(libname) ? "?" : RSTRING_PTR(libname),
-                 NIL_P(funcname) ? "?" : RSTRING_PTR(funcname));
-    }
-    /* `_imports` is stored last by initialize: an object whose initialize
-     * raised (or that skipped it) has none, and it must never be sized as an
-     * array. Bound it as well: params[] holds MINIFFI_MAX_ARGS. */
-    if (TYPE(own_imports) != T_ARRAY ||
-        RARRAY_LEN(own_imports) > MINIFFI_MAX_ARGS)
-        throw Exception(Exception::RuntimeError,
-                 "MiniFFI function was not initialized");
+    MINIFFI_FUNC ApiFunction = (MINIFFI_FUNC)funcData->func;
+    VALUE own_imports = funcData->imports;
     VALUE args;
     int items = rb_scan_args(argc, argv, "0*", &args);
     int nimport = RARRAY_LEN(own_imports);
@@ -304,14 +311,12 @@ RB_METHOD_GUARD(MiniFFI_call) {
     }
 #if RAPI_MAJOR >= 2
     MFFICallCBArgs cb_args {ApiFunction, &param, nimport};
-    ++funcData->active;
     mffi_value ret = (mffi_value)rb_thread_call_without_gvl(miniffi_call_cb, &cb_args, 0, 0);
-    --funcData->active;
 #else
     mffi_value ret = miniffi_call_intern(ApiFunction, &param, nimport);
 #endif
     
-    switch (FIX2INT(own_exports)) {
+    switch (funcData->exports) {
         case _T_NUMBER:
         case _T_INTEGER:
             return MVAL2RB(ret);
@@ -329,9 +334,46 @@ RB_METHOD_GUARD(MiniFFI_call) {
 }
 RB_METHOD_GUARD_END
 
+struct MiniFFICallFrame {
+    MiniFFIData *data;
+    int argc;
+    VALUE *argv;
+    VALUE self;
+};
+
+static VALUE MiniFFI_callBody(VALUE frame) {
+    MiniFFICallFrame *f = reinterpret_cast<MiniFFICallFrame *>(frame);
+    return MiniFFI_callPinned(f->argc, f->argv, f->self);
+}
+
+/* Runs on every way out, including the Thread#raise / Thread#kill / Timeout
+ * unwind that rb_thread_call_without_gvl performs on return, which would
+ * skip a plain decrement and leave the object refusing to reinitialize. */
+static VALUE MiniFFI_callRelease(VALUE frame) {
+    --reinterpret_cast<MiniFFICallFrame *>(frame)->data->active;
+    return Qnil;
+}
+
+RB_METHOD_GUARD(MiniFFI_call) {
+    MiniFFIData *funcData = getPrivateDataNoRaise<MiniFFIData>(self);
+    /* An object that skipped or failed initialize (an override that skips
+     * `super`, MiniFFI.allocate, a dup of one) has no record and so no entry
+     * point: a Ruby error the game can rescue instead of a call through
+     * garbage. */
+    if (!funcData)
+        throw Exception(Exception::RuntimeError,
+                 "MiniFFI function was not initialized");
+    MiniFFICallFrame frame = {funcData, argc, argv, self};
+    ++funcData->active;
+    return rb_ensure(MiniFFI_callBody, reinterpret_cast<VALUE>(&frame),
+                     MiniFFI_callRelease, reinterpret_cast<VALUE>(&frame));
+}
+RB_METHOD_GUARD_END
+
 void MiniFFIBindingInit() {
     VALUE cMiniFFI = rb_define_class("MiniFFI", rb_cObject);
 #if RAPI_FULL > 187
+    MiniFFIType.function.dmark = MiniFFIMark;
     rb_define_alloc_func(cMiniFFI, classAllocate<&MiniFFIType>);
 #else
     rb_define_alloc_func(cMiniFFI, MiniFFIAllocate);
