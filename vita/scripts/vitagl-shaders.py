@@ -28,6 +28,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Importing xxh3 must not leave a __pycache__ in the tree: a release refuses a dirty one.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from xxh3 import xxh3_64  # noqa: E402
 

@@ -49,6 +49,7 @@
       "repo": "https://github.com/vitasdk/packages",
       "commit": "e8eb5f5469730e151146907fee29769efbe38b11"
     },
+    "packageServer": "https://github.com/vitasdk/vitasdk-autobuild/releases/download/packages-2026.08-snapshot-20260912.42.1",
     "packages": {
       "freetype": {
         "version": "2.14.3-1",
@@ -228,10 +229,14 @@
   },
   "toolchain": {
     "versionInfoFile": "version_info.txt",
-    "comment": "Revisions the VitaSDK toolchain records for the libraries linked from it; checked against $VITASDK/version_info.txt at release time. pthread-embedded is the pthreadEmbedded pin above.",
+    "comment": "Revisions the VitaSDK toolchain records for the libraries linked from it; checked against $VITASDK/version_info.txt at release time. pthread-embedded is the pthreadEmbedded pin above; newlib, pthread-embedded and vita-headers must all match.",
     "newlib": {
       "repo": "https://github.com/vitasdk/newlib",
       "commit": "64aa7aa33d4f380451a1f100d19589226cdad334"
+    },
+    "vitaHeaders": {
+      "repo": "https://github.com/vitasdk/vita-headers",
+      "commit": "ebc8f4f7ac8313fe4f74ca95724116b224bad184"
     }
   }
 }

@@ -45,7 +45,7 @@ Keep a patch header short: what it changes and why. Changing a
 `vita/vitagl-shaders/MANIFEST`: review the change, then run
 
 ```bash
-python3 vita/scripts/vitagl-shaders.py manifest --source . --dir vita/vitagl-shaders
+python3 -B vita/scripts/vitagl-shaders.py manifest --source . --dir vita/vitagl-shaders
 ```
 
 (see [vita/vitagl-shaders/README.md](vitagl-shaders/README.md)). A change to any

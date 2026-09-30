@@ -40,10 +40,10 @@
 #   SDL_sound  mkxp-z/SDL_sound @ cfb2533eb3bac3700015cbd87cc623bea1467239
 #   pthread-embedded  fetched for the source archive only (the VitaSDK libpthread is linked
 #              from the toolchain, not built here)
-#   vdpm-sources  the upstream sources and the vitasdk/packages recipes of the statically
-#              linked vdpm libraries (FreeType, SDL2_image, SDL2_ttf, libpng, zlib, bzip2,
-#              libwebp, libogg, libvorbis, PhysFS): fetched for the source archive only,
-#              each pinned by SHA-256 or commit in dep-pins.json
+#   vdpm-sources  the package files, upstream sources and vitasdk/packages recipes of the
+#              statically linked vdpm libraries (FreeType, SDL2_image, SDL2_ttf, libpng, zlib,
+#              bzip2, libwebp, libogg, libvorbis, PhysFS, SDL2): fetched for the source archive
+#              only, each pinned by SHA-256 or commit in dep-pins.json
 #   pixman     0.42.2 release tarball — the exact Version in the vdpm sysroot's
 #              pixman-1.pc (the vdpm recipe itself is not recoverable offline).
 #              The sysroot archive is a debug-goal build ("Aggressive Debug"),
@@ -540,11 +540,12 @@ fetch_pthread_embedded() {
   fetch_git_pinned "$PTHREAD_DIR" "$PTHREAD_URL" "$PTHREAD_COMMIT"
 }
 
-# Source only: the statically linked vdpm libraries are VitaSDK binary packages. Their upstream
-# tarballs and patches are fetched into $DIST/vdpm/<package>/ (each refused unless its pinned
-# SHA-256 matches), libpng comes from its pinned commit, and the vitasdk/packages recipes at
-# their pinned commit. The release source archive carries all of it; it checks the installed
-# libraries against the digests pinned in dep-pins.json.
+# Source only: the statically linked vdpm libraries are VitaSDK binary packages. Each package
+# file and its upstream tarballs and patches are fetched into $DIST/vdpm/<package>/ (each refused
+# unless its pinned SHA-256 matches), libpng comes from its pinned commit, and the
+# vitasdk/packages recipes at their pinned commit. The release source archive carries the
+# sources; it checks each package file's .BUILDINFO against the pinned recipe digest and the
+# installed libraries against the digests pinned in dep-pins.json.
 fetch_vdpm_sources() {
   need curl
   need git

@@ -9,9 +9,11 @@ are in this branch's vita/patches/). Dependencies that come as release tarballs 
 build extracted, already patched where the build patches it; the seal (vita/scripts/treedigest.py) names the input it
 was made from (URL, version, tarball digest, digest of every patch and transformation) and proves nobody edited it
 or built inside it. The statically linked VitaSDK (vdpm) libraries are archived as the upstream tarballs, patches
-and commits their packages were built from, with the vitasdk/packages recipes at the pinned commit; the installed
-libraries are checked against the digests pinned in dep-pins.json, and the toolchain revisions of newlib and
-pthread-embedded against $VITASDK/version_info.txt. Every input is checked before the output file is opened, every
+and commits their packages were built from, with the vitasdk/packages recipes at the pinned commit. Each pinned
+package file is required (build-vita-deps.sh fetches it from the pinned snapshot by SHA-256): its own .BUILDINFO
+must name the package, its version and the pinned VITABUILD digest, it must hold the pinned library bytes, and the
+installed libraries must be those bytes. The toolchain revisions of newlib, pthread-embedded and vita-headers are
+checked against $VITASDK/version_info.txt. Every input is checked before the output file is opened, every
 member is scanned for the builder's home directory, hostname, VitaSDK path and checkout path, and the archive
 appears under OUT only when complete: any failure removes the partial file.
 Prints one JSON record (file, sha256, size, components, toolchain) on stdout. Members are sorted and carry the
@@ -157,9 +159,10 @@ def plan_files(name, directory, files, upstream, extra=None):
 def toolchain_record():
     """Check the VitaSDK on this machine against the pins, and return what the release records about it.
 
-    The toolchain revisions the VitaSDK records for newlib and pthread-embedded must be the pinned ones, and the
-    statically linked vdpm libraries must be byte-for-byte the pinned packages' files: only then are the sources
-    archived below the sources of what the executable links."""
+    The toolchain revisions the VitaSDK records for newlib, pthread-embedded and vita-headers must be the pinned ones,
+    and the statically linked vdpm libraries must be byte-for-byte the pinned packages' files (check_package() ties
+    those bytes to the pinned package file): only then are the sources archived below the sources of what the
+    executable links."""
     sdk = Path(vitasdk())
     if not (sdk / "bin/arm-vita-eabi-gcc").is_file():
         die("no VitaSDK found (set VITASDK)")
@@ -171,7 +174,8 @@ def toolchain_record():
         fields = line.split()
         if len(fields) == 2 and re.fullmatch(r"[0-9a-f]{40}", fields[1]):
             info[fields[0]] = fields[1]
-    want = {"newlib": pins["toolchain"]["newlib"]["commit"], "pthread-embedded": pins["pthreadEmbedded"]["commit"]}
+    want = {"newlib": pins["toolchain"]["newlib"]["commit"], "pthread-embedded": pins["pthreadEmbedded"]["commit"],
+            "vita-headers": pins["toolchain"]["vitaHeaders"]["commit"]}
     for name, commit in want.items():
         if info.get(name) != commit:
             die("the VitaSDK records %s at %s, the pin is %s: the linked library is not the pinned source"
@@ -185,17 +189,42 @@ def toolchain_record():
             path = sdk / "arm-vita-eabi/lib" / lib
             if not path.is_file() or sha256(path) != digest:
                 die("%s does not match the pinned %s %s package" % (path, package, entry["version"]))
-        cached = sdk / "var/cache/pacman/pkg" / ("%s-%s-vita.pkg.tar.xz" % (package, entry["version"]))
-        if cached.is_file() and sha256(cached) != entry["packageSha256"]:
-            die("the cached package %s does not match its pinned digest" % cached.name)
     return {"versionInfo": {name: info[name] for name in sorted(info)}, "newlib": pins["toolchain"]["newlib"],
-            "pthreadEmbedded": pins["pthreadEmbedded"], "vdpmChannel": pins["vdpm"]["channel"],
-            "vdpmRecipes": pins["vdpm"]["recipes"]}
+            "vitaHeaders": pins["toolchain"]["vitaHeaders"], "pthreadEmbedded": pins["pthreadEmbedded"],
+            "vdpmChannel": pins["vdpm"]["channel"], "vdpmRecipes": pins["vdpm"]["recipes"]}
+
+
+def check_package(package, entry):
+    """The pinned package file is authoritative for what the release calls this package: it must be the pinned bytes,
+    name this package, version and recipe digest in its own .BUILDINFO, and contain the pinned library files. The
+    installed libraries are compared with the same digests in toolchain_record()."""
+    name = "%s-%s-vita.pkg.tar.xz" % (package, entry["version"])
+    path = dist / "vdpm" / package / name
+    if not path.is_file():
+        die("%s: the pinned package file is missing; run vita/scripts/build-vita-deps.sh vdpm-sources" % name)
+    if sha256(path) != entry["packageSha256"]:
+        die("%s does not match its pinned digest" % path)
+    with tarfile.open(path) as tar:
+        try:
+            buildinfo = tar.extractfile(".BUILDINFO").read().decode()
+        except (KeyError, AttributeError):
+            die("%s has no .BUILDINFO" % name)
+        record = dict(line.split(" = ", 1) for line in buildinfo.splitlines() if " = " in line)
+        for field, want in (("pkgname", package), ("pkgver", entry["version"]), ("pkgbuild_sha256sum", entry["vitabuildSha256"])):
+            if record.get(field) != want:
+                die("%s: its .BUILDINFO records %s %s, the pin is %s" % (name, field, record.get(field), want))
+        for lib, digest in entry["libs"].items():
+            try:
+                member = tar.extractfile("arm-vita-eabi/lib/" + lib)
+            except KeyError:
+                member = None
+            if member is None or hashlib.sha256(member.read()).hexdigest() != digest:
+                die("%s does not contain the pinned %s" % (name, lib))
 
 
 def check_recipe(package, entry, recipes):
-    """The pinned recipe is the one the installed package was built from (its VITABUILD digest is recorded in the
-    package's own .BUILDINFO), names this version, and names each pinned source by digest."""
+    """The pinned recipe is the one the pinned package file was built from (check_package() matched that file's
+    .BUILDINFO to the same VITABUILD digest), names this version, and names each pinned source by digest."""
     commit = pins["vdpm"]["recipes"]["commit"]
     blob = subprocess.run(["git", "-C", str(recipes), "show", "%s:%s/VITABUILD" % (commit, package)],
                           check=True, capture_output=True).stdout
@@ -264,6 +293,7 @@ vdpm = pins["vdpm"]
 components.append(plan_git("vitasdk-packages", recipes, vdpm["recipes"]["commit"], vdpm["recipes"]["repo"],
                            clean=True, pinned=True))
 for package, entry in vdpm["packages"].items():
+    check_package(package, entry)
     check_recipe(package, entry, recipes)
     record = {"version": entry["version"], "vitabuildSha256": entry["vitabuildSha256"],
               "packageSha256": entry["packageSha256"], "libs": entry["libs"]}

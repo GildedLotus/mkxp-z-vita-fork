@@ -29,10 +29,10 @@
 #   RELEASE-NOTES.md       generated from the vita/COMPATIBILITY.md rows,
 #                          < 120 lines
 # The unstripped ELF (symbolisation copy for vita-parse-core) is never staged
-# there: it is kept in build/release-private/ under a name carrying its SHA-256
-# (mkxp-z-<version>-<digest>.elf.unstripped, the digest also in manifest.json),
-# installed only after the release swap succeeded and never replacing an earlier
-# generation.
+# there: it is kept in build/release-private/ under a name carrying the first
+# 16 hex digits of its SHA-256 (mkxp-z-<version>-<digits>.elf.unstripped; the
+# full digest is in manifest.json), installed only after the release swap
+# succeeded and never replacing an earlier generation.
 # Staging only: this script publishes nothing, pushes nothing, tags nothing and
 # creates no branch. Licensing: GPL-3.0 combined work with GPL-3.0-or-later port
 # files (LICENSE, THIRD-PARTY.md, licenses/).
@@ -428,7 +428,11 @@ fi
 # another generation: an existing file of that name can only be the same bytes, and is checked to be.
 symbol=$(basename "$(ls "$PRIVATE_STAGE"/*.elf.unstripped)")
 if [[ -e $PRIVATE/$symbol ]]; then
-  cmp -s "$PRIVATE_STAGE/$symbol" "$PRIVATE/$symbol" || die "$PRIVATE/$symbol exists with different content"
+  if ! cmp -s "$PRIVATE_STAGE/$symbol" "$PRIVATE/$symbol"; then
+    kept=$PRIVATE_STAGE
+    PRIVATE_STAGE=""
+    die "the release is installed, but $PRIVATE/$symbol exists with different content: the new symbol ELF is kept at $kept/$symbol"
+  fi
 else
   if ! mv "$PRIVATE_STAGE/$symbol" "$PRIVATE/$symbol"; then
     kept=$PRIVATE_STAGE

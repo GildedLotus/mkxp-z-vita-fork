@@ -126,11 +126,10 @@ These game files are read with the engine's JSON5 parser, including UTF-8 BOM
 handling. Missing files are ignored; malformed objects, lists or entries raise
 an error. They are read from the actual game working directory. Relative
 script paths resolve there too, including package-author additions; absolute
-`app0:/`, `ux0:/` and `uma0:/` paths retain their root. Ruby's path handling treats
-only those three device names as roots, so a preload under any other
-`name:/` prefix resolves as a path relative to the game folder. Backslashes
-become slashes, and repeated separators, `.` and `..` are normalized. Paths are
-case-preserving; symlink aliases are not deduplicated. Preloads must be loose
+`app0:/`, `ux0:/` and `uma0:/` paths retain their root; a preload under any other
+`name:/` prefix, upper-case spellings such as `UX0:/` included, is refused with
+an error at boot. Backslashes become slashes, and repeated separators, `.` and
+`..` are normalized. Paths are case-preserving; symlink aliases are not deduplicated. Preloads must be loose
 files: Ruby `load` does not read an encrypted RGSS archive or search RTPs.
 
 The first normalized occurrence runs once. References to the four bundled
@@ -358,11 +357,13 @@ recovery, so a corrupt active file selects a valid `.bak`, and the write path
 never starts from the corrupt one. Publication follows the `vita_publish`
 commit order: only a valid active file moves to `.bak`, then the finished
 `.tmp` is renamed onto the free name. An invalid active file is quarantined as
-`settings.json.corrupt` (a second damaged file replaces `settings.json.corrupt.1`,
-so two copies at most) and never replaces a good backup. A write whose bytes
-the reader would refuse (over 64 KiB, or not a JSON object) is checked after the
-sync and raises `IOError` before anything is rotated, so a large `CFG[]=` value
-leaves the last valid settings active. The accepted cost is that newlib's
+`settings.json.corrupt`; the next damaged file is kept as `settings.json.corrupt.1`
+and every later one replaces that second slot, so a fresh install holds two
+copies at most (numbered files left by older builds are never cleaned). It never
+replaces a good backup. A write whose bytes the reader would refuse (over 64 KiB,
+or not a JSON object) is checked after the sync and raises `IOError` before
+anything is rotated, so a large `CFG[]=` value leaves the last valid settings
+active. The accepted cost is that newlib's
 non-atomic rename can drop the backup itself, never the active file.
 `settings.json.bak.keep` and `settings.json.bak.legacy*` files left by earlier
 builds are inert: nothing reads, writes or cleans them.

@@ -159,17 +159,19 @@ or checkout path, and any symlink that is absolute or leaves its tree. With this
 (vitaGL, vitaShaRK, OpenAL Soft).
 
 **The vdpm binaries.** These libraries are prebuilt packages of the VitaSDK project's CI (channel 2026.08), not built
-here. The build pins each package's version, the digest of its `VITABUILD` recipe and of the package file, and the
-digest of every library file the player links. `source-archive.py` refuses to archive unless the installed libraries
-are those bytes and the recipes at the pinned commit hash to the `VITABUILD` digest that each package's own
-`.BUILDINFO` records, name the package's version and name each tarball by its pinned digest. Two inputs cannot be
+here. The build pins each package's version, the digest of its `VITABUILD` recipe, the digest of the package file
+(fetched by that digest from the pinned snapshot named by `packageServer` in `dep-pins.json`) and the digest of every
+library file the player links. `source-archive.py` refuses to archive unless the pinned package file is present with
+its pinned digest, its own `.BUILDINFO` names the package, its version and the pinned `VITABUILD` digest, it holds the
+pinned library bytes and the installed libraries are those same bytes; and unless the recipes at the pinned commit
+hash to that `VITABUILD` digest, name the package's version and name each tarball by its pinned digest. Two inputs cannot be
 proven by the recipe itself: libpng is built from the git tag `v1.6.58` (pinned here by its commit), and the PhysFS
 Vita patch is fetched by the recipe from the `isage/physfs` master branch without a digest (pinned here by the commit
 that last changed the file, before the package was built). The pins identify them; the recipe does not.
 
 **The toolchain.** libpthread is pthread-embedded and libc and libm are newlib; `$VITASDK/version_info.txt` records the
 revision each was built from, and the release build refuses to archive unless they are the pinned ones
-(pthread-embedded 11d2e5722d98, newlib 64aa7aa33d4f). pthread-embedded's source is in the archive. newlib (permissive),
+(pthread-embedded 11d2e5722d98, newlib 64aa7aa33d4f, vita-headers ebc8f4f7ac83). pthread-embedded's source is in the archive. newlib (permissive),
 libstdc++ and libgcc (GCC 15.2.0, GPL-3.0 with the GCC Runtime Library Exception: the exception covers a program
 compiled with GCC, with or without modifications, and VitaSDK's arm-vita-eabi GCC is necessarily a patched build) and
 the import stubs generated from vita-headers are the compiler package's own libraries and are not archived.

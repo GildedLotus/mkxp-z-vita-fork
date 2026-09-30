@@ -20,7 +20,7 @@ module VitaPreloads
       end
       "#{root}:/#{parts.join('/')}"
     elsif entry.include?(':') || entry.start_with?('/')
-      raise ArgumentError, 'preloads need a game-relative or device:/ path'
+      raise ArgumentError, 'preloads need a game-relative or app0:/, ux0:/ or uma0:/ path'
     else
       path("#{base}/#{entry}", base)
     end

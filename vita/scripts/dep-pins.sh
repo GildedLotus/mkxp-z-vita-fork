@@ -63,11 +63,15 @@ fetch_git_pinned() {
   git -C "$dir" diff --quiet && git -C "$dir" diff --cached --quiet || die "$dir has tracked edits; remove it and rebuild"
 }
 
-# vdpm_downloads: one line per pinned VitaSDK package source: package, file, url, sha256 (tab separated).
+# vdpm_downloads: one line per pinned VitaSDK package download: package, file, url, sha256 (tab separated). Each
+# package's own file comes first (from the pinned snapshot server), then its upstream sources.
 vdpm_downloads() {
   python3 -c '
 import json, sys
-for package, entry in json.load(open(sys.argv[1]))["vdpm"]["packages"].items():
+vdpm = json.load(open(sys.argv[1]))["vdpm"]
+for package, entry in vdpm["packages"].items():
+    name = "%s-%s-vita.pkg.tar.xz" % (package, entry["version"])
+    print("\t".join((package, name, vdpm["packageServer"] + "/" + name, entry["packageSha256"])))
     for source in entry["sources"]:
         print("\t".join((package, source["file"], source["url"], source["sha256"])))
 ' "$DEP_PINS"
