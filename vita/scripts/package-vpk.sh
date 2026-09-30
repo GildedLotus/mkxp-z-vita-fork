@@ -354,6 +354,32 @@ for tracked_font in "$ASSETS/fonts"/*.ttf; do
 	die "font binary must not be tracked: $tracked_font (fetch it into $FONTS_PREFIX with vita/scripts/fetch-fonts.sh)"
 done
 
+# The fetched set is exactly what fonts.json names: a font file the manifest does not list is refused (never
+# packed unverified, whatever ALLOW_MISSING_FONTS says), and every packaged font must match its recorded digest.
+# Only manifest entries are ever staged below.
+python3 - "$ASSETS/fonts/fonts.json" "$FONTS_PREFIX" <<'FONTGATE' || exit 1
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+manifest, fetched = Path(sys.argv[1]), Path(sys.argv[2])
+record = json.loads(manifest.read_text(encoding="utf-8"))
+known = {entry["name"] for entry in record["files"] + record["documents"]}
+problems = []
+if fetched.is_dir():
+    for path in sorted(fetched.iterdir()):
+        if path.suffix.lower() in (".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2") and path.name not in known:
+            problems.append("%s is not listed in fonts.json" % path.name)
+    for entry in record["files"]:
+        path = fetched / entry["name"]
+        if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
+            problems.append("%s does not match its fonts.json digest" % entry["name"])
+if problems:
+    sys.exit("package-vpk: refusing the fonts in %s: %s\n"
+             "  remove the extra files or re-run vita/scripts/fetch-fonts.sh" % (fetched, "; ".join(problems)))
+FONTGATE
+
 # What the fetched set must satisfy: every font fonts.json marks packaged, and
 # between them the codepoints the launcher probes for. Liberation Sans has no
 # kana and no kanji, so "the fonts directory is not empty" is not a check --
@@ -473,8 +499,8 @@ rm -f "$OUT"/mkxp-z.{elf,velf,vpk} "$OUT"/eboot.bin "$OUT"/param.sfo "$OUT/$VPK_
 # Stage app0:/fonts
 # ---------------------------------------------------------------------------
 # The fonts are fetched, never committed (vita/scripts/fetch-fonts.sh), so the packed
-# tree is assembled here: the tracked README.md and fonts.json, plus every .ttf
-# the fetch installed. Checked above, before anything was removed. The upstream
+# tree is assembled here: the tracked README.md and fonts.json, plus each font
+# fonts.json marks packaged. Checked above, before anything was removed. The upstream
 # licence texts stay in $FONTS_PREFIX and are deliberately not packed --
 # licensing is v1 work (vita/mkxp-z-vpk/fonts/README.md says where they live).
 mkdir -p "$OUT/fonts"
@@ -483,13 +509,17 @@ for font_asset in "$ASSETS/fonts"/*; do
 	cp -f "$font_asset" "$OUT/fonts/"
 done
 FONTS_FOUND=0
-if [[ -d $FONTS_PREFIX ]]; then
-	for font_file in "$FONTS_PREFIX"/*.ttf; do
-		[[ -f $font_file ]] || continue
-		cp -f "$font_file" "$OUT/fonts/"
-		FONTS_FOUND=$((FONTS_FOUND + 1))
-	done
-fi
+PACKAGED_FONTS=$(python3 -c '
+import json, sys
+for entry in json.load(open(sys.argv[1], encoding="utf-8"))["files"]:
+    if entry.get("packaged"):
+        print(entry["name"])
+' "$ASSETS/fonts/fonts.json")
+while IFS= read -r font_name; do
+	[[ -n $font_name && -f "$FONTS_PREFIX/$font_name" ]] || continue
+	cp -f "$FONTS_PREFIX/$font_name" "$OUT/fonts/"
+	FONTS_FOUND=$((FONTS_FOUND + 1))
+done <<<"$PACKAGED_FONTS"
 
 SHADER_STAGE=0
 # Players have no shader compiler: ship the precompiled GXP cache.

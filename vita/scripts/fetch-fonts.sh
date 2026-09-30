@@ -61,6 +61,23 @@ if [[ -n ${FONTS_SHA256:-} && -z ${FONTS_ARCHIVE:-} ]]; then
 	die "FONTS_SHA256 needs FONTS_ARCHIVE; the download is pinned to $ARCHIVE_SHA256"
 fi
 
+# A font file the manifest does not list is never installed alongside the pinned set: refuse it.
+python3 - "$MANIFEST" "$PREFIX" <<'PY' || exit 1
+import json
+from pathlib import Path
+import sys
+
+manifest, prefix = Path(sys.argv[1]), Path(sys.argv[2])
+record = json.loads(manifest.read_text(encoding="utf-8"))
+known = {entry["name"] for entry in record["files"] + record["documents"]}
+extra = []
+if prefix.is_dir():
+    extra = [p.name for p in sorted(prefix.iterdir())
+             if p.suffix.lower() in (".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2") and p.name not in known]
+if extra:
+    sys.exit("fetch-fonts: %s holds fonts that fonts.json does not list: %s; remove them" % (prefix, ", ".join(extra)))
+PY
+
 # ---------------------------------------------------------------------------
 # Already installed?
 # ---------------------------------------------------------------------------
