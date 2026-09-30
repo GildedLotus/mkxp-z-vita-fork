@@ -271,7 +271,7 @@ for source, name in ((vpk_path, "mkxp-z.vpk"), (eboot_path, "eboot.bin")):
 source_archive = json.loads(subprocess.run(
     [sys.executable, "-B", str(root / "vita/scripts/source-archive.py"), str(root),
      str(release / ("mkxp-z-source-%s.tar.xz" % version))],
-    check=True, capture_output=True, text=True).stdout)
+    check=True, stdout=subprocess.PIPE, text=True).stdout)
 # Every linked GPL/LGPL component of THIRD-PARTY.md must be in the archive that was just written.
 subprocess.run([sys.executable, "-B", str(root / "vita/scripts/check-corresponding-source.py"), str(root),
                 str(release / source_archive["file"])], check=True)

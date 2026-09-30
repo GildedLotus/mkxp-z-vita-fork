@@ -296,6 +296,9 @@ try:
 except BaseException:
     if proc and proc.poll() is None:
         proc.kill()
+    if proc and tar is not None:
+        # The stream's finalizer would otherwise try to flush into the killed xz.
+        tar.closed = tar.fileobj.closed = True
     if sink and not sink.closed:
         sink.close()
     part.unlink(missing_ok=True)
