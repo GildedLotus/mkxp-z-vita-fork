@@ -1541,10 +1541,17 @@ struct FPSLimiter {
         bool resetFlag;
     } adj;
     
+    /* Frame skip may drop at most this many Graphics.update frames in a row
+     * and the debt is capped at this many frames: skipping saves render cost
+     * only, so script work over the frame budget would otherwise grow the
+     * debt forever and never present. */
+    static const unsigned maxConsecutiveSkips = 5;
+    unsigned skipStreak;
+    
     FPSLimiter(uint16_t desiredFPS)
     : lastTickCount(SDL_GetPerformanceCounter()),
     tickFreq(SDL_GetPerformanceFrequency()), tickFreqMS(tickFreq / 1000),
-    tickFreqNS((double)tickFreq / NS_PER_S), disabled(false) {
+    tickFreqNS((double)tickFreq / NS_PER_S), disabled(false), skipStreak(0) {
         setDesiredFPS(desiredFPS);
         
         adj.last = SDL_GetPerformanceCounter();
@@ -1557,7 +1564,7 @@ struct FPSLimiter {
     void delay() {
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
         const int64_t measuredDebt = adj.idealDiff;
-        const unsigned measuredReset = adj.resetFlag;
+        unsigned measuredReset = adj.resetFlag;
         if (vita_measure_mode && disabled)
             vita_measure_delay(measuredDebt, measuredDebt, 0, tpf, tickFreq, 2);
 #endif
@@ -1588,6 +1595,14 @@ struct FPSLimiter {
             adj.idealDiff = 0;
             adj.resetFlag = false;
         }
+        
+        const int64_t maxDebt = tpf * (int64_t)maxConsecutiveSkips;
+        if (adj.idealDiff > maxDebt) {
+            adj.idealDiff = maxDebt;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+            measuredReset |= 4;
+#endif
+        }
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
         if (vita_measure_mode)
             vita_measure_delay(measuredDebt, adj.idealDiff, diff, tpf, tickFreq, measuredReset);
@@ -1599,6 +1614,7 @@ struct FPSLimiter {
         if (vita_measure_mode) vita_measure_reset();
 #endif
         adj.resetFlag = true;
+        skipStreak = 0;
     }
     
     /* If we're more than a full frame's worth
@@ -1610,6 +1626,17 @@ struct FPSLimiter {
             return false;
         
         return adj.idealDiff > tpf;
+    }
+    
+    /* frameSkipRequired() bounded to maxConsecutiveSkips in a row; the frame
+     * after the last allowed skip presents with the debt left to pace off. */
+    bool takeSkip() {
+        if (!frameSkipRequired() || skipStreak >= maxConsecutiveSkips) {
+            skipStreak = 0;
+            return false;
+        }
+        ++skipStreak;
+        return true;
     }
     
 private:
@@ -2868,7 +2895,10 @@ void Graphics::update(bool checkForShutdown) {
     }
     
     if (p->fpsLimiter.frameSkipRequired()) {
-        if (p->useFrameSkip) {
+        if (!p->useFrameSkip) {
+            /* Just reset frame adjust counter */
+            p->fpsLimiter.resetFrameAdjust();
+        } else if (p->fpsLimiter.takeSkip()) {
             /* Skip frame */
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
             profileFrame.skipped = true;
@@ -2883,10 +2913,9 @@ void Graphics::update(bool checkForShutdown) {
             p->threadData->ethread->notifyFrame();
             
             return;
-        } else {
-            /* Just reset frame adjust counter */
-            p->fpsLimiter.resetFrameAdjust();
         }
+    } else {
+        p->fpsLimiter.skipStreak = 0;
     }
     
     p->checkResize();

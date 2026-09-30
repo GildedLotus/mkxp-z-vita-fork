@@ -733,21 +733,11 @@ void Config::read(int argc, char *argv[]) {
         {"windowTitle", ""},
         {"fixedFramerate", 0},
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
-        /* Frame skipping is ON by default on this device.
-         * Stock defaults it off because a desktop does not overrun a 16.6 ms
-         * budget; a 444 MHz Cortex-A9 rasterising in software does. With it
-         * off, src/display/graphics.cpp Graphics::update answers an overrun
-         * with fpsLimiter.resetFrameAdjust() and draws the late frame anyway,
-         * so every overrun stretches in-game time and the game runs in slow
-         * motion. With it on, the late frame is dropped -- the frame counter
-         * and Input still advance -- and game logic keeps pace with the wall
-         * clock. Only the default moves: the branch itself is stock.
-         *
-         * "frameSkip": false in any layer turns it back off. fixedFramerate
-         * above stays 0, which means "follow Graphics.frame_rate"; set it to
-         * 30 to pin a game that cannot hold its own rate. Both keys are
-         * documented in vita/docs/config.md. */
-        {"frameSkip", true},
+        /* Off, as in stock. Rendering is on the GPU, so an overrun is script
+         * work, which skipping the draw does not shorten; RGSS itself never
+         * skips. "frameSkip": true in any layer opts into the bounded skip
+         * (FPSLimiter::maxConsecutiveSkips). See vita/docs/config.md. */
+        {"frameSkip", false},
 #else
         {"frameSkip", false},
 #endif

@@ -27,7 +27,7 @@ nor universal compatibility. Every row, and what has not been checked, is in
 | A PS Vita running homebrew | Only ever run on a **retail PS Vita**. No firmware version is recorded and no PS TV run has been made: treat both as untested. |
 | VitaShell | Installs the VPK and, in USB mode, copies game files (see [§6](#6-copying-files-use-vitashell-usb-not-ftp)). |
 | libshacccg (optional) | The VPK ships precompiled shader binaries, so a player needs nothing else. Only a shader missing from the shipped set (a modified build) has to be compiled on the device, and that needs Sony's `libshacccg.suprx`, which is not distributed here. |
-| Free space on `ux0:` | About 23 MB installed (the 1.0.0 VPK is 12.6 MB and unpacks to 23.2 MB). Games and RTPs come on top. |
+| Free space on `ux0:` | About 23 MB installed (the VPK is about 12.6 MB and unpacks to about 23 MB). Games and RTPs come on top. |
 | A host computer | To build the player and to extract an RTP (macOS or Linux with VitaSDK). |
 
 ## 2. Install the player
@@ -161,9 +161,9 @@ like an engine bug. FTP is fine for pulling logs off the device afterwards.
   Sony memory card was not re-tested on this build.
 - **Performance.** Title, map and menu scenes hold 16.7 ms (VX, VX Ace) and 25 ms
   (XP) frame budgets on the games profiled so far; the visible costs are scene
-  transitions such as loading a save. Script-heavy games are expected to be slower:
-  the player drops frames rather than stretching the game clock (`frameSkip` is
-  on by default here, unlike stock mkxp-z).
+  transitions such as loading a save. Script-heavy scenes run slightly slower
+  rather than dropping frames, as in RPG Maker itself; `"frameSkip": true`
+  (see [config.md](docs/config.md#frame-pacing)) trades that for dropped frames.
 - **Movies** (`Graphics.play_movie`, VX Ace) play in real time with synced audio
   (Theora/Vorbis `.ogv`). XP and VX have no engine movie call.
 

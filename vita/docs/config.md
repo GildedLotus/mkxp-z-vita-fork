@@ -229,12 +229,12 @@ One status per layer: `ok` (read and merged), `absent` (no such file, or no
 run.
 
 ```
-vita-config: effective gameFolder='ux0:/data/mkxp-z/games/Blank Dream' rgssVersion=3 rtp=[ux0:/data/mkxp-z/rtp/VXAce] smoothScaling=1 fixedAspect=1 integer=0/1 frameSkip=1 fixedFramerate=0
+vita-config: effective gameFolder='ux0:/data/mkxp-z/games/Blank Dream' rgssVersion=3 rtp=[ux0:/data/mkxp-z/rtp/VXAce] smoothScaling=1 fixedAspect=1 integer=0/1 frameSkip=0 fixedFramerate=0
 ```
 
 What the engine actually ended up with, after every layer and both clamps.
 Always emitted. `integer=` is `integerScalingActive`/`integerScalingLastMile`.
-`frameSkip=1 fixedFramerate=0` is the device default; see **Frame pacing**
+`frameSkip=0 fixedFramerate=0` is the device default; see **Frame pacing**
 below for what the two of them do.
 
 ## `--game`
@@ -406,8 +406,7 @@ and power-loss durability still need device testing.
 
 Types are what `copyObject` enforces. `int` and `float` are both "number" to
 it, so `1` where a float is wanted is fine; `true` where a number is wanted is
-not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee` — `frameSkip`
-is the one the Vita build changes, and the row says so; the
+not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 "app0:/config/default.json" column is what the shipped device profile sets.
 
 | Key | Type | ConfDef | device profile |
@@ -434,7 +433,7 @@ is the one the Vita build changes, and the row says so; the
 | `defScreenH` | int | `0` | `544` |
 | `windowTitle` | string | `""` | — |
 | `fixedFramerate` | int | `0` | — |
-| `frameSkip` | bool | `true` here, stock `false` | — |
+| `frameSkip` | bool | `false` | — |
 | `syncToRefreshrate` | bool | `false` | — |
 | `solidFonts` | array of string | `[]` | — |
 | `preferMetalRenderer` | bool | `false` | — |
@@ -600,25 +599,22 @@ still win over defaults.
 
 ### Frame pacing
 
-Two keys, no new engine code: mkxp-z has read
-both since forever and `src/display/graphics.cpp` already acts on them. What
-this port changes is the compiled default of one of them.
+Two keys that mkxp-z reads and `src/display/graphics.cpp` acts on.
 
-* **`frameSkip` is `true` here** and `false` in stock mkxp-z. When
-  `Graphics.update` finds the frame limiter more than a whole frame behind the
-  ideal timestep, it either drops the redraw (`frameSkip` on) or throws the
-  accumulated debt away and draws the late frame anyway (`frameSkip` off). Both
-  cost the same wall clock; what differs is what the *game* sees. With it on,
-  `Graphics.frame_count`, `Input` repeat timing and every `Graphics.update` loop
-  in Ruby keep counting at the rate the game asked for, and the player drops
-  frames. With it off the engine never catches up, so a four-second animation
-  takes six — the game runs in slow motion. On a desktop frames do not overrun
-  and stock's default is the right one; on a 444 MHz CPU rasterising RGSS in
-  software they do, and a stutter beats a stretched clock.
+* **`frameSkip` is `false`**, as in stock mkxp-z. When `Graphics.update` finds
+  the frame limiter more than a whole frame behind the ideal timestep, it
+  either drops the redraw (`frameSkip` on) or throws the accumulated debt away
+  and draws the late frame anyway (`frameSkip` off). Rendering runs on the GPU,
+  so a frame that overruns is almost always script work, and skipping the draw
+  does not shorten it: a script-heavy map plays smoothly and slightly slower
+  with the skip off, but choppily with it on. RGSS itself never skips frames.
 
-  Set `"frameSkip": false` in any layer to get the stock behaviour back. A
-  game's own `mkxp.json` may set it too: this is a real preference, not a key
-  the device owns.
+  Set `"frameSkip": true` in any layer (a game's own `mkxp.json` may too) to
+  keep `Graphics.frame_count`, `Input` repeat timing and every `Graphics.update`
+  loop at the rate the game asked for, dropping frames instead of slowing down.
+  The skip is bounded: at most 5 consecutive updates are skipped (at least one
+  in six is drawn) and the accumulated debt is capped at 5 frames, so a long
+  load cannot cause a burst of skipped frames afterwards.
 
 * **`fixedFramerate` pins the limiter.** `0` (the default) means "follow
   `Graphics.frame_rate`", which is what the game asks for — 60 for VX Ace, 40
@@ -637,7 +633,7 @@ this port changes is the compiled default of one of them.
   RGSS counts animation timing in frames, so halving the limiter halves the
   game's clock too: a 60 fps game pinned to 30 draws every frame and plays at
   half speed, where the same game left at `0` with `frameSkip` on keeps
-  real-time speed and drops the frames it cannot draw. Reach for
+  near real-time speed and drops frames it cannot draw. Reach for
   `fixedFramerate` when steady, unskipped motion matters more than pace —
   otherwise leave it at `0`.
 
