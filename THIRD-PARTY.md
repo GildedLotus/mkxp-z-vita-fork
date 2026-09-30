@@ -23,8 +23,10 @@ text the entry says so under "Known gaps".
 
 - **FreeType 2.14.3** (linked via SDL2_ttf): FreeType licence (FTL) *or* GPL-2.0-or-later. We elect the **FTL** arm,
   which FreeType's own README states is compatible with GPLv3 (the combined work is GPL-3.0). The FTL asks for the
-  credit line below in the documentation; it is in this file, `README.md` and `vita/README.md`. Electing the FTL
-  leaves no copyleft obligation on FreeType, so no FreeType source is in the release archive.
+  credit line below in the documentation; it is in this file, `README.md` and `vita/README.md`. The election settles
+  FreeType's own terms and nothing more: FreeType is statically linked into `eboot.bin`, which is conveyed as a
+  GPL-3.0 combined work, so its source is part of that work's corresponding source (GPL-3.0 section 1) whichever
+  arm is elected, and the release archive carries it (see "Source for a release").
 - **uchardet 0.0.8**: MPL-1.1 / GPL-2.0-or-later / LGPL-2.1-or-later. We elect **GPL-2.0-or-later**, used under GPL-3.0.
 - **OpenAL Soft 1.19.1**: LGPL-2.0-or-later (its COPYING is the LGPL 2.0 text, not 2.1). Elected to GPL-3 through
   LGPL-2 section 3 (a GPL notice may be substituted for the LGPL one).
@@ -120,30 +122,57 @@ the shared MIT wording). The GPL-3.0 text is `LICENSE`. vitaGL's `COPYING` is th
 
 ## Source for a release
 
-Each release ships with `mkxp-z-source-<version>.tar.xz`, written by `vita/scripts/build-release.sh`
-(`vita/scripts/source-archive.py`) and recorded, with its SHA-256 and component list, in `manifest.json`. It holds
-this branch and the source of every dependency the build fetches and builds: vitaGL, vitaShaRK, SceShaccCgExt,
-math-neon and taiHEN (with its submodules) at the commits in `vita/scripts/vitagl-pins.json`, the mkxp-z Ruby fork
-(with the `config.guess` and `config.sub` its build uses), SDL2, SDL_sound, libtheora, uchardet, pixman, OpenAL Soft,
-pthread-embedded, the TinySoundFont headers and the font distributions. Every download is pinned in
-`vita/scripts/dep-pins.json` (SHA-256 or full commit) and refused on a mismatch; the pins are recorded in `manifest.json`.
-Git-based dependencies are pristine trees at the pinned commit; tarball dependencies are the sealed trees the build
-extracted (never built in); the changes this branch makes to them are `vita/patches/`, applied by the build scripts.
-`vita/scripts/check-corresponding-source.py` fails the release unless every linked GPL or LGPL component in the
-tables above has its source in the archive, and the archive builder refuses any member that contains the builder's
-home directory, hostname, VitaSDK path or checkout path. With this branch, the archive and `vita/scripts/build-player.sh`, anyone
-can rebuild the executable and relink it against a modified LGPL library (vitaGL, vitaShaRK, OpenAL Soft).
+`eboot.bin` is one combined work under GPL-3.0, so its corresponding source includes the source of every component
+linked statically into it, whatever that component's own licence says; only the compiler's own runtime and C library
+are left out (below). Each release therefore ships with `mkxp-z-source-<version>.tar.xz`, written by
+`vita/scripts/build-release.sh` (`vita/scripts/source-archive.py`). Its SHA-256, its component list (each entry with
+its pin, and for tarball trees the input identity and the tree digest) and the toolchain revisions are recorded in
+`manifest.json`, and `SOURCES.txt` inside the archive lists the same. Under `dependencies/<name>/` it holds:
 
-pthread-embedded 11d2e5722d98 (LGPL-2.1-or-later) is linked from the VitaSDK toolchain; its pinned source is in the
-archive. This repository does not pin the exact VitaSDK build of that binary, so the archive holds the named upstream
-commit, not a proof that the VitaSDK binary was built from it.
+- this branch (`branch/`);
+- pristine git trees at their pinned commits: vitaGL, vitaShaRK, SceShaccCgExt, math-neon and taiHEN (with its
+  submodules), the mkxp-z Ruby fork (with the `config.guess` and `config.sub` its build uses), SDL_sound, uchardet,
+  pthread-embedded and libpng;
+- the release tarballs libtheora, pixman, OpenAL Soft and SDL2 as the sealed trees the build extracted and never built
+  in. **SDL2, pixman and OpenAL Soft are archived patched**, with the changes already applied: SDL2 with the series in
+  `vita/patches/sdl2`, pixman with one `sed` over `pixman-arm-simd-asm.S`, OpenAL Soft with isage's Vita patch and a
+  one-line `SZFMT` substitution. Do not apply them a second time. Each such record says "patched tree of tarball
+  sha256 ..." and lists the patches; the seal binds the tree to the URL, version, tarball digest and the digest of
+  every patch and transformation it was made from, and the build extracts it again when any of them changes, so a bump
+  of a pin cannot leave the old source in the archive;
+- the TinySoundFont headers and the font distributions;
+- the statically linked vdpm libraries (FreeType, SDL2_image, SDL2_ttf, libpng, zlib, bzip2, libwebp with sharpyuv,
+  libogg, libvorbis, PhysFS, and the pristine SDL2 tarball of the sysroot package as `sdl2-vdpm`): the upstream
+  tarballs and patches the packages were built from, libpng at its commit, and the `vitasdk/packages` recipes at the
+  pinned commit (`vitasdk-packages/`).
 
-These components are linked from VitaSDK binary packages (`vdpm`) or the VitaSDK toolchain and are **not** in the
-archive; the version and upstream source location of each are in the tables above, and the package recipes are in
-https://github.com/vitasdk/packages: FreeType 2.14.3 (FTL arm; https://freetype.org), libstdc++ and libgcc from
-GCC 15.2.0 (GPL-3.0 with the runtime exception, which puts no source obligation on a program built by an unmodified
-GCC; https://github.com/vitasdk), newlib, and the permissively licensed SDL2_image, SDL2_ttf, libpng, zlib, bzip2,
-libwebp, libogg, libvorbis, PhysFS and vita-headers stubs.
+Every download is refused unless it matches its pin. The pins are in `vita/scripts/dep-pins.json` (libtheora, pixman,
+OpenAL Soft, uchardet, pthread-embedded, `config.guess`/`config.sub`, the vdpm libraries, newlib),
+`vita/scripts/sdl2-pin.sh`, `vita/scripts/vitagl-pins.json`, `vita/scripts/fetch-tinysoundfont.json`,
+`vita/mkxp-z-vpk/fonts/fonts.json` (with `fetch-fonts.sh`), `RUBY_PIN` in `vita/scripts/build-player.sh` and
+`SDLSOUND_PIN` in `vita/scripts/build-vita-deps.sh`. `vita/scripts/check-corresponding-source.py` fails the release
+unless every linked, compiled-in or bundled row of the tables above has its source in the archive (or an exemption
+with its reason), refuses a malformed row, and compares the libraries on the link line of the built executable with
+those rows. The archive builder refuses any member that contains the builder's home directory, hostname, VitaSDK path
+or checkout path, and any symlink that is absolute or leaves its tree. With this branch, the archive and
+`vita/scripts/build-player.sh`, anyone can rebuild the executable and relink it against a modified LGPL library
+(vitaGL, vitaShaRK, OpenAL Soft).
+
+**The vdpm binaries.** These libraries are prebuilt packages of the VitaSDK project's CI (channel 2026.08), not built
+here. The build pins each package's version, the digest of its `VITABUILD` recipe and of the package file, and the
+digest of every library file the player links. `source-archive.py` refuses to archive unless the installed libraries
+are those bytes and the recipes at the pinned commit hash to the `VITABUILD` digest that each package's own
+`.BUILDINFO` records, name the package's version and name each tarball by its pinned digest. Two inputs cannot be
+proven by the recipe itself: libpng is built from the git tag `v1.6.58` (pinned here by its commit), and the PhysFS
+Vita patch is fetched by the recipe from the `isage/physfs` master branch without a digest (pinned here by the commit
+that last changed the file, before the package was built). The pins identify them; the recipe does not.
+
+**The toolchain.** libpthread is pthread-embedded and libc and libm are newlib; `$VITASDK/version_info.txt` records the
+revision each was built from, and the release build refuses to archive unless they are the pinned ones
+(pthread-embedded 11d2e5722d98, newlib 64aa7aa33d4f). pthread-embedded's source is in the archive. newlib (permissive),
+libstdc++ and libgcc (GCC 15.2.0, GPL-3.0 with the GCC Runtime Library Exception: the exception covers a program
+compiled with GCC, with or without modifications, and VitaSDK's arm-vita-eabi GCC is necessarily a patched build) and
+the import stubs generated from vita-headers are the compiler package's own libraries and are not archived.
 
 ## Not shipped
 
@@ -155,8 +184,8 @@ timidity, OpenSSL and the X11/Wayland/hidapi parts of SDL.
 
 - `sigslot`, `json5pp` and `rapidcsv` carry no licence text in the pinned mkxp-z tree; their texts are the upstream
   repositories' licence files. The vdpm-installed libraries (SDL2_ttf, SDL2_image, libpng, zlib, bzip2, libwebp,
-  libogg, libvorbis, FreeType, PhysFS) have no source in this tree: their texts come from the release tarball of
-  the same version (the vdpm package DB carries no licence fields), and match the notices in the installed headers.
+  libogg, libvorbis, FreeType, PhysFS) have no source in this tree (it is in the release archive): their texts come
+  from the release tarball of the same version (the vdpm package DB carries no licence fields), and match the notices in the installed headers.
 - vitaGL's `source/utils/preprocessor/` (john-blackburn/preprocessor, GPL-3.0) and `shacccg_paramquery.h`
   (Pigs-In-A-Blanket, LGPL-3.0) carry no licence text in the pinned tree; the licences are the upstream repositories'.
   vitaGL's `debug.c` includes a Linux-kernel 6x10 font table (GPL-2.0 in the kernel); no `font` symbol is in the

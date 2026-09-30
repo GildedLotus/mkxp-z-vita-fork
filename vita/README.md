@@ -248,6 +248,11 @@ shasum, tar, unzip and xxd. Install these VitaSDK packages first with `vdpm inst
 bzip2 and harfbuzz. Do not install `sdl2_vitagl`, which conflicts with `sdl2`.
 The first build downloads and builds the pinned sources (vitaGL, SDL2, Ruby,
 theora, uchardet, SDL_sound, pixman, OpenAL Soft and the other libraries below).
+It also downloads the upstream sources of the vdpm libraries above, pinned by digest,
+for the release source archive. A test build links whatever vdpm packages are installed;
+`vita/scripts/build-release.sh` refuses to write the archive unless they are the exact
+packages pinned in `vita/scripts/dep-pins.json` (vdpm channel 2026.08) and
+`$VITASDK/version_info.txt` names the pinned newlib and pthread-embedded revisions.
 
 ```bash
 vita/scripts/build-player.sh

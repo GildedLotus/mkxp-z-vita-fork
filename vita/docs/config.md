@@ -126,7 +126,9 @@ These game files are read with the engine's JSON5 parser, including UTF-8 BOM
 handling. Missing files are ignored; malformed objects, lists or entries raise
 an error. They are read from the actual game working directory. Relative
 script paths resolve there too, including package-author additions; absolute
-`app0:/`, `ux0:/`, `uma0:/` and other device paths retain their root. Backslashes
+`app0:/`, `ux0:/` and `uma0:/` paths retain their root. Ruby's path handling treats
+only those three device names as roots, so a preload under any other
+`name:/` prefix resolves as a path relative to the game folder. Backslashes
 become slashes, and repeated separators, `.` and `..` are normalized. Paths are
 case-preserving; symlink aliases are not deduplicated. Preloads must be loose
 files: Ruby `load` does not read an encrypted RGSS archive or search RTPs.
