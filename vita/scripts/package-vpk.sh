@@ -148,9 +148,12 @@ if [[ $TITLE_ID == "MKXPZ0001" && $MKXPZ_RELEASE -eq 0 ]]; then
 	die "a package without MKXPZ_RELEASE=1 is a test build only: set TITLE_ID=MKXPZ00xx (MKXPZ0001 is the product id; vita/scripts/build-release.sh is the release path)"
 fi
 
-# The release package: the product id, complete and unwaived.
+# The release package: the product id, complete and unwaived, from a clean tree, started by build-release.sh.
 # Every ALLOW_* switch weakens a check the release depends on.
 if [[ $MKXPZ_RELEASE -eq 1 ]]; then
+	# shellcheck source=/dev/null
+	. "$ROOT/vita/scripts/release-gate.sh"
+	release_gate
 	[[ $TITLE_ID == "MKXPZ0001" ]] || die "MKXPZ_RELEASE=1 is the product package: TITLE_ID must be MKXPZ0001, got $TITLE_ID"
 	for escape in ALLOW_MISSING_SHADERS ALLOW_MISSING_FONTS ALLOW_STALE_ELF ALLOW_PINNED_PRODUCT_ID; do
 		[[ ${!escape:-0} != 1 ]] || die "MKXPZ_RELEASE=1 refuses $escape=1"

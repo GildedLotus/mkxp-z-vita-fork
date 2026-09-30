@@ -40,6 +40,11 @@ case "$MKXPZ_RELEASE" in
   0|1) ;;
   *) die "MKXPZ_RELEASE must be 0 or 1" ;;
 esac
+if [[ "$MKXPZ_RELEASE" == 1 ]]; then
+  # shellcheck source=/dev/null
+  . "$ROOT/vita/scripts/release-gate.sh"
+  release_gate
+fi
 BUILD_NAME=mkxp-z-vitagl
 PKG_TITLE_ID="${VITAGL_TITLE_ID:-MKXPZ0053}"
 PKG_OUT="$ROOT/build/mkxp-z-vpk-vitagl"
