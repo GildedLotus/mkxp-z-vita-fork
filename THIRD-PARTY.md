@@ -21,8 +21,10 @@ text the entry says so under "Known gaps".
 
 ## Elections (where a component offers a choice)
 
-- **FreeType 2.14.3** (linked via SDL2_ttf): FreeType licence *or* GPL-2.0-or-later. We elect the **GPL** arm;
-  FreeType's own README states the FTL is compatible with GPLv3 but not GPLv2.
+- **FreeType 2.14.3** (linked via SDL2_ttf): FreeType licence (FTL) *or* GPL-2.0-or-later. We elect the **FTL** arm,
+  which FreeType's own README states is compatible with GPLv3 (the combined work is GPL-3.0). The FTL asks for the
+  credit line below in the documentation; it is in this file, `README.md` and `vita/README.md`. Electing the FTL
+  leaves no copyleft obligation on FreeType, so no FreeType source is in the release archive.
 - **uchardet 0.0.8**: MPL-1.1 / GPL-2.0-or-later / LGPL-2.1-or-later. We elect **GPL-2.0-or-later**, used under GPL-3.0.
 - **OpenAL Soft 1.19.1**: LGPL-2.0-or-later (its COPYING is the LGPL 2.0 text, not 2.1). Elected to GPL-3 through
   LGPL-2 section 3 (a GPL notice may be substituted for the LGPL one).
@@ -53,9 +55,11 @@ text the entry says so under "Known gaps".
 | zlib | 1.3.2 | zlib | https://zlib.net | linked (static) | `licenses/zlib-1.3.2.txt` |
 | bzip2 | 1.0.8 | bzip2 (BSD-style) | https://sourceware.org/bzip2/ | linked (static) | `licenses/permissive-notices.txt#bzip2` |
 | libwebp (+sharpyuv) | 1.6.0 | BSD-3-Clause + patent grant | https://chromium.googlesource.com/webm/libwebp | linked (static) | `licenses/permissive-notices.txt#libwebp` |
-| FreeType | 2.14.3 | GPL-2.0-or-later arm elected; BDF/PCF drivers X11-style | https://freetype.org | linked (static) | `licenses/FreeType-2.14.3.txt`, `licenses/GPL-2.0.txt` |
+| FreeType | 2.14.3 | FreeType Licence (FTL) arm elected; BDF/PCF drivers X11-style | https://freetype.org | linked (static) | `licenses/FreeType-2.14.3.txt` |
 | pixman | 0.42.2 | MIT | https://cairographics.org/releases/ | linked (static) | `licenses/permissive-notices.txt#pixman` |
 | PhysFS | 3.0.2 | zlib | https://github.com/icculus/physfs | linked (static) | `licenses/permissive-notices.txt#PhysFS` |
+
+Portions of this software are copyright © 2026 The FreeType Project (https://freetype.org). All rights reserved.
 
 The shipped GXP shaders (`app0:/shader_cache/`, `vita/vitagl-shaders/`) are **compiler output of this repo's own
 GLSL**, produced by the Sony shader compiler on a Vita; they carry the repo's licence (GPL-3.0) and contain no
@@ -116,19 +120,27 @@ the shared MIT wording). The GPL-3.0 text is `LICENSE`. vitaGL's `COPYING` is th
 Each release ships with `mkxp-z-source-<version>.tar.xz`, written by `vita/scripts/build-release.sh`
 (`vita/scripts/source-archive.py`) and recorded, with its SHA-256 and component list, in `manifest.json`. It holds
 this branch and the source of every dependency the build fetches and builds: vitaGL, vitaShaRK, SceShaccCgExt,
-math-neon and taiHEN (with its submodules) at the commits in `vita/scripts/vitagl-pins.json`, the mkxp-z Ruby fork,
-SDL2, SDL_sound, libtheora, uchardet, pixman, OpenAL Soft, the TinySoundFont headers and the font distributions.
-Git-based dependencies are pristine trees at the pinned commit; the changes this branch makes to them are
-`vita/patches/`, applied by the build scripts. With this branch, the archive and `vita/scripts/build-player.sh`, anyone
+math-neon and taiHEN (with its submodules) at the commits in `vita/scripts/vitagl-pins.json`, the mkxp-z Ruby fork
+(with the `config.guess` and `config.sub` its build uses), SDL2, SDL_sound, libtheora, uchardet, pixman, OpenAL Soft,
+pthread-embedded, the TinySoundFont headers and the font distributions. Every download is pinned in
+`vita/scripts/dep-pins.json` (SHA-256 or full commit) and refused on a mismatch; the pins are recorded in `manifest.json`.
+Git-based dependencies are pristine trees at the pinned commit; tarball dependencies are the sealed trees the build
+extracted (never built in); the changes this branch makes to them are `vita/patches/`, applied by the build scripts.
+`vita/scripts/check-corresponding-source.py` fails the release unless every linked GPL or LGPL component in the
+tables above has its source in the archive, and the archive builder refuses any member that contains the builder's
+home directory, hostname, VitaSDK path or checkout path. With this branch, the archive and `vita/scripts/build-player.sh`, anyone
 can rebuild the executable and relink it against a modified LGPL library (vitaGL, vitaShaRK, OpenAL Soft).
+
+pthread-embedded 11d2e5722d98 (LGPL-2.1-or-later) is linked from the VitaSDK toolchain; its pinned source is in the
+archive. This repository does not pin the exact VitaSDK build of that binary, so the archive holds the named upstream
+commit, not a proof that the VitaSDK binary was built from it.
 
 These components are linked from VitaSDK binary packages (`vdpm`) or the VitaSDK toolchain and are **not** in the
 archive; the version and upstream source location of each are in the tables above, and the package recipes are in
-https://github.com/vitasdk/packages: FreeType 2.14.3 (GPL arm; https://freetype.org), pthread-embedded 11d2e5722d98
-(LGPL-2.1-or-later; https://github.com/vitasdk/pthread-embedded), libstdc++ and libgcc from GCC 15.2.0 (GPL-3.0 with
-the runtime exception; https://github.com/vitasdk), newlib, and the permissively licensed SDL2_image, SDL2_ttf, libpng,
-zlib, bzip2, libwebp, libogg, libvorbis, PhysFS and vita-headers stubs. This repository does not pin the exact
-VitaSDK build inputs of these binaries; no GPL or LGPL component is without a named upstream version and location.
+https://github.com/vitasdk/packages: FreeType 2.14.3 (FTL arm; https://freetype.org), libstdc++ and libgcc from
+GCC 15.2.0 (GPL-3.0 with the runtime exception, which puts no source obligation on a program built by an unmodified
+GCC; https://github.com/vitasdk), newlib, and the permissively licensed SDL2_image, SDL2_ttf, libpng, zlib, bzip2,
+libwebp, libogg, libvorbis, PhysFS and vita-headers stubs.
 
 ## Not shipped
 
@@ -149,4 +161,4 @@ timidity, OpenSSL and the X11/Wayland/hidapi parts of SDL.
 - The libnsgif sources say only "MIT"; the MIT wording is the one in `licenses/permissive-notices.txt`.
 - The newlib COPYING is the whole file of the pinned VitaSDK revision. Individual newlib sources may carry
   further per-file notices that the file's own list covers.
-- FTL/GPL-3 compatibility rests on FreeType's own README statement; the FTL arm is not used.
+- FTL/GPL-3 compatibility rests on FreeType's own README statement, which the FTL election relies on.

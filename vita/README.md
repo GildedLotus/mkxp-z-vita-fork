@@ -321,3 +321,6 @@ licence, upstream and the licence arm elected where one is offered; the texts ar
 in `licenses/` and ship in the release VPK under `app0:/licenses/`. The shipped
 vitaGL shaders are compiler output of this repository's own GLSL. RTPs and
 Sony's `libshacccg.suprx` are never bundled.
+
+Portions of this software are copyright © 2026 The FreeType Project (https://freetype.org).
+All rights reserved. (FreeType is used under the FreeType Licence.)

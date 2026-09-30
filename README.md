@@ -12,6 +12,8 @@
 
 > **PS Vita port:** see [vita/README.md](vita/README.md). The Vita port's own files are licensed GPL-3.0-or-later
 > (see [LICENSE](LICENSE) and [THIRD-PARTY.md](THIRD-PARTY.md)), alongside upstream's [COPYING](COPYING), which is unchanged.
+>
+> Portions of this software are copyright © 2026 The FreeType Project (https://freetype.org). All rights reserved.
 
 <p align=center>
     <img src="screenshot.png?raw=true" width=512 height=412>

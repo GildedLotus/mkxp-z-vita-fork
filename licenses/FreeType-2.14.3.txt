@@ -1,5 +1,6 @@
-FreeType 2.14.3 (release tarball freetype-2.14.3.tar.xz). This build elects the GPL arm (docs/GPLv2.TXT, any later version; the text is licenses/GPL-2.0.txt).
-The FTL is included because LICENSE.TXT refers to it; the BDF and PCF driver notices apply whichever arm is chosen.
+FreeType 2.14.3 (release tarball freetype-2.14.3.tar.xz). This build elects the FreeType Licence (FTL, docs/FTL.TXT below);
+the GPL arm (docs/GPLv2.TXT) is not used. The BDF and PCF driver notices apply whichever arm is chosen.
+Credit required by the FTL: Portions of this software are copyright (c) 2026 The FreeType Project (https://freetype.org). All rights reserved.
 
 ===== LICENSE.TXT =====
 ===== source: freetype-2.14.3.tar.xz
