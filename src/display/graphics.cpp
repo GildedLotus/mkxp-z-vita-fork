@@ -766,7 +766,12 @@ struct Movie
         alGenBuffers(MOVIE_AUDIO_BUFS, alBuffers);
         for (ALuint buffer : alBuffers)
             if (!buffer || !alIsBuffer(buffer)) {
+                /* A partial alGenBuffers still made the earlier names. */
                 alDeleteSources(1, &audioSource);
+                for (ALuint made : alBuffers)
+                    if (made && alIsBuffer(made))
+                        alDeleteBuffers(1, &made);
+                memset(alBuffers, 0, sizeof(alBuffers));
                 return false;
             }
         audioStarted = true;

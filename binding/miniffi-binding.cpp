@@ -218,6 +218,13 @@ RB_METHOD_GUARD(MiniFFI_call) {
                  NIL_P(libname) ? "?" : RSTRING_PTR(libname),
                  NIL_P(funcname) ? "?" : RSTRING_PTR(funcname));
     }
+    /* `_imports` is stored last by initialize: an object whose initialize
+     * raised (or that skipped it) has none, and it must never be sized as an
+     * array. Bound it as well: params[] holds MINIFFI_MAX_ARGS. */
+    if (TYPE(own_imports) != T_ARRAY ||
+        RARRAY_LEN(own_imports) > MINIFFI_MAX_ARGS)
+        throw Exception(Exception::RuntimeError,
+                 "MiniFFI function was not initialized");
     VALUE args;
     int items = rb_scan_args(argc, argv, "0*", &args);
     int nimport = RARRAY_LEN(own_imports);

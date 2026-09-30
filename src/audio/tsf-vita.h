@@ -91,7 +91,7 @@ static uint32_t midiLE(const unsigned char *p, int width)
 struct MidiSFTable { const unsigned char *data = nullptr; size_t count = 0; };
 /* TSF assumes valid hydra indices. Validate the bounded RIFF before its loader
  * follows those indices; reject duplicate chunks and unsupported compressed SF3. */
-static bool midiFontStructure(const std::vector<unsigned char> &bytes)
+static bool midiFontStructure(const std::vector<unsigned char> &bytes, size_t &sampleCount)
 {
 	const char *names[] = {"phdr", "pbag", "pmod", "pgen", "inst", "ibag", "imod", "igen", "shdr"};
 	const int widths[] = {38, 4, 10, 4, 22, 4, 10, 4, 46};
@@ -179,6 +179,7 @@ static bool midiFontStructure(const std::vector<unsigned char> &bytes)
 		uint32_t start = midiLE(p + 20, 4), end = midiLE(p + 24, 4);
 		if (start >= end || end >= samples || midiLE(p + 36, 4) < 1000 || midiLE(p + 36, 4) > 192000 || (midiLE(p + 44, 2) & ~7u)) return false;
 	}
+	sampleCount = samples;
 	return true;
 }
 
@@ -222,7 +223,8 @@ static int midi_synth_sfload(fluid_synth_t *s, const char *filename, int) try
 		try { bytes.resize(size); } catch (const std::bad_alloc&) { fclose(file); return -1; }
 		bool read = fread(bytes.data(), 1, bytes.size(), file) == bytes.size();
 		fclose(file);
-		if (!read || !midiFontStructure(bytes))
+		size_t sampleCount = 0;
+		if (!read || !midiFontStructure(bytes, sampleCount))
 		{ midiFailure = "MIDI: malformed or unsupported SoundFont"; return -1; }
 		s->settings->font = tsf_load_memory(bytes.data(), int(bytes.size()));
 		if (!s->settings->font) { midiFailure = "MIDI: SoundFont exceeds synthesis budget or is invalid"; return -1; }
@@ -235,7 +237,9 @@ static int midi_synth_sfload(fluid_synth_t *s, const char *filename, int) try
 			for (int j = 0; j < preset.regionNum; ++j)
 			{
 				tsf_region &r = preset.regions[j];
-				if (regionCount > 4096 || r.offset >= r.end ||
+				/* TSF clamps r.end to the sample count and the renderer
+				 * interpolates against input[pos + 1] up to r.end. */
+				if (regionCount > 4096 || r.offset >= r.end || r.end >= sampleCount ||
 				    (r.loop_mode && (r.loop_start < r.offset || r.loop_start >= r.loop_end || r.loop_end >= r.end)))
 				{
 					tsf_close(s->settings->font); s->settings->font = nullptr;

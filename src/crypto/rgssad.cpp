@@ -422,7 +422,18 @@ RGSS_ioDuplicate(PHYSFS_Io *self)
 	 * duplicate, and destroying either would free it under the other.
 	 * Take a stream of our own and carry the decrypt cursor across, which
 	 * is what leaves the duplicate reading where the original stands. */
-	RGSS_entryHandle *entryDup = new RGSS_entryHandle(entry->data, entry->io);
+	/* PhysFS is C without unwind tables on the Vita: no callback here may let
+	 * an exception out. */
+	RGSS_entryHandle *entryDup;
+	try
+	{
+		entryDup = new RGSS_entryHandle(entry->data, entry->io);
+	}
+	catch (...)
+	{
+		PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+		return 0;
+	}
 
 	if (!entryDup->io)
 	{
@@ -557,7 +568,8 @@ verifyHeader(PHYSFS_Io *io, char version)
 }
 
 static void*
-RGSS_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
+RGSS_openArchiveBody(PHYSFS_Io *io, const char *name, int forWrite, int *claimed,
+                     RGSS_archiveData *&data)
 {
 	if (forWrite)
 		return NULL;
@@ -575,7 +587,7 @@ RGSS_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
 		return NULL;
 	}
 
-	RGSS_archiveData *data = new RGSS_archiveData;
+	data = new RGSS_archiveData;
 	data->archiveIo = io;
 
 	uint32_t magic = RGSS_MAGIC;
@@ -647,7 +659,25 @@ RGSS_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
 error:
 	PHYSFS_setErrorCode(PHYSFS_ERR_CORRUPT);
 	delete data;
+	data = NULL;
 	return NULL;
+}
+
+static void*
+RGSS_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
+{
+	RGSS_archiveData *data = NULL;
+
+	try
+	{
+		return RGSS_openArchiveBody(io, name, forWrite, claimed, data);
+	}
+	catch (...)
+	{
+		delete data;
+		PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+		return NULL;
+	}
 }
 
 static PHYSFS_EnumerateCallbackResult
@@ -657,24 +687,32 @@ RGSS_enumerateFiles(void *opaque, const char *dirname,
 {
 	RGSS_archiveData *data = static_cast<RGSS_archiveData*>(opaque);
 
-	std::string _dirname(dirname);
-
-	if (!data->dirHash.contains(_dirname))
-		return PHYSFS_ENUM_STOP;
-
-	const BoostSet<std::string> &entries = data->dirHash[_dirname];
-
-	BoostSet<std::string>::const_iterator iter;
-	for (iter = entries.cbegin(); iter != entries.cend(); ++iter)
+	try
 	{
-		PHYSFS_EnumerateCallbackResult result = cb(callbackdata, origdir, iter->c_str());
-		if (result == PHYSFS_ENUM_ERROR)
-			PHYSFS_setErrorCode(PHYSFS_ERR_APP_CALLBACK);
-		if (result != PHYSFS_ENUM_OK)
-			return result;
-	}
+		std::string _dirname(dirname);
 
-	return PHYSFS_ENUM_OK;
+		if (!data->dirHash.contains(_dirname))
+			return PHYSFS_ENUM_STOP;
+
+		const BoostSet<std::string> &entries = data->dirHash[_dirname];
+
+		BoostSet<std::string>::const_iterator iter;
+		for (iter = entries.cbegin(); iter != entries.cend(); ++iter)
+		{
+			PHYSFS_EnumerateCallbackResult result = cb(callbackdata, origdir, iter->c_str());
+			if (result == PHYSFS_ENUM_ERROR)
+				PHYSFS_setErrorCode(PHYSFS_ERR_APP_CALLBACK);
+			if (result != PHYSFS_ENUM_OK)
+				return result;
+		}
+
+		return PHYSFS_ENUM_OK;
+	}
+	catch (...)
+	{
+		PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+		return PHYSFS_ENUM_ERROR;
+	}
 }
 
 static PHYSFS_Io*
@@ -682,11 +720,20 @@ RGSS_openRead(void *opaque, const char *filename)
 {
 	RGSS_archiveData *data = static_cast<RGSS_archiveData*>(opaque);
 
-	if (!data->entryHash.contains(filename))
-		return 0;
+	RGSS_entryHandle *entry;
 
-	RGSS_entryHandle *entry =
-	        new RGSS_entryHandle(data->entryHash[filename], data->archiveIo);
+	try
+	{
+		if (!data->entryHash.contains(filename))
+			return 0;
+
+		entry = new RGSS_entryHandle(data->entryHash[filename], data->archiveIo);
+	}
+	catch (...)
+	{
+		PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+		return 0;
+	}
 
 	if (!entry->io)
 	{
@@ -714,7 +761,17 @@ RGSS_stat(void *opaque, const char *filename, PHYSFS_Stat *stat)
 {
 	RGSS_archiveData *data = static_cast<RGSS_archiveData*>(opaque);
 
-	const int type = RGSS_entryType(data, filename);
+	int type;
+
+	try
+	{
+		type = RGSS_entryType(data, filename);
+	}
+	catch (...)
+	{
+		PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+		return 0;
+	}
 
 	if (type == RGSS_PATH_ABSENT)
 	{
@@ -729,9 +786,16 @@ RGSS_stat(void *opaque, const char *filename, PHYSFS_Stat *stat)
 
 	if (type == PHYSFS_FILETYPE_REGULAR)
 	{
-		const RGSS_entryData &entry = data->entryHash[filename];
+		try
+		{
+			stat->filesize = data->entryHash[filename].size;
+		}
+		catch (...)
+		{
+			PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+			return 0;
+		}
 
-		stat->filesize = entry.size;
 		stat->filetype = PHYSFS_FILETYPE_REGULAR;
 	}
 	else
@@ -819,7 +883,8 @@ readUint32AndXor(PHYSFS_Io *io, uint32_t &result, uint32_t key)
 }
 
 static void*
-RGSS3_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
+RGSS3_openArchiveBody(PHYSFS_Io *io, const char *name, int forWrite, int *claimed,
+                      RGSS_archiveData *&data)
 {
 	if (forWrite)
 		return NULL;
@@ -842,7 +907,7 @@ RGSS3_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
 
 	baseMagic = (baseMagic * 9) + 3;
 
-	RGSS_archiveData *data = new RGSS_archiveData;
+	data = new RGSS_archiveData;
 	data->archiveIo = io;
 
 	/* Top level entry list */
@@ -912,11 +977,29 @@ RGSS3_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
 	error:
 		PHYSFS_setErrorCode(PHYSFS_ERR_CORRUPT);
 		delete data;
+		data = NULL;
 		return NULL;
 	}
 
 	registerArchive(data, name);
 	return data;
+}
+
+static void*
+RGSS3_openArchive(PHYSFS_Io *io, const char *name, int forWrite, int *claimed)
+{
+	RGSS_archiveData *data = NULL;
+
+	try
+	{
+		return RGSS3_openArchiveBody(io, name, forWrite, claimed, data);
+	}
+	catch (...)
+	{
+		delete data;
+		PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+		return NULL;
+	}
 }
 
 const PHYSFS_Archiver RGSS3_Archiver =

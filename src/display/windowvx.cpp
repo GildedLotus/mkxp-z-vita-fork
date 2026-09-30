@@ -509,6 +509,12 @@ struct WindowVXPrivate
 			return;
 		}
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* Before any geometry: the counts below wrap an int for a huge window
+		 * and TileQuads::build then writes past the array. */
+		SoftBase::checkBaseSize(geo.w, geo.h);
+#endif
+
 		const IntRect bgPos(2, 2, geo.w-4, geo.h-4);
 		size_t count = 0;
 

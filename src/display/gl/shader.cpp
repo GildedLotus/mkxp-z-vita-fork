@@ -106,12 +106,21 @@
     std::string Shader::shaderCommon = "";
 #endif
 
+/* A driver that fails the query leaves the length untouched, and one that
+ * lies about it must not size an allocation. */
+static GLint clampLogLength(GLint length)
+{
+	const GLint maxLength = 64 * 1024;
+
+	return length < 0 ? 0 : (length > maxLength ? maxLength : length);
+}
+
 static void printShaderLog(GLuint shader)
 {
-	GLint logLength;
+	GLint logLength = 0;
 	gl.GetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLength);
 
-	std::string log(logLength, '\0');
+	std::string log(clampLogLength(logLength), '\0');
 	gl.GetShaderInfoLog(shader, log.size(), 0, &log[0]);
 
 	std::clog << "Shader log:\n" << log;
@@ -119,10 +128,10 @@ static void printShaderLog(GLuint shader)
 
 static void printProgramLog(GLuint program)
 {
-	GLint logLength;
+	GLint logLength = 0;
 	gl.GetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
 
-	std::string log(logLength, '\0');
+	std::string log(clampLogLength(logLength), '\0');
 	gl.GetProgramInfoLog(program, log.size(), 0, &log[0]);
 
 	std::clog << "Program log:\n" << log;

@@ -28,9 +28,7 @@
 #include "sharedstate.h"
 #include "global-ibo.h"
 #include "shader.h"
-#ifdef MKXPZ_SOFTWARE_BITMAPS
 #include "exception.h"
-#endif
 
 #include <vector>
 #include <stdint.h>
@@ -139,6 +137,10 @@ inline void replaceTileQuadBuffer(VBO::ID &current,
 }
 #endif
 
+/* A 32-bit size_t wraps `size * 4` for a large count and hands the geometry
+ * builders a tiny vector to write past; no array here needs more than this. */
+enum { QuadArrayMaxQuads = 1 << 16 };
+
 template<class VertexType>
 struct QuadArray
 {
@@ -177,6 +179,9 @@ struct QuadArray
 
 	void resize(size_t size)
 	{
+		if (size > QuadArrayMaxQuads)
+			throw Exception(Exception::MKXPError, "Quad array too large");
+
 		vertices.resize(size * 4);
 		quadCount = size;
 	}

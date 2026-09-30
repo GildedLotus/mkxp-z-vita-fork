@@ -39,6 +39,7 @@
 #include <physfs.h>
 
 #include <algorithm>
+#include <exception>
 #include <new>
 #include <stack>
 #include <set>
@@ -130,9 +131,15 @@ static PHYSFS_Io *createSDLRWIo(const char *filename) {
   } catch (const Exception &e) {
     Debug() << "Failed mounting" << filename;
     return 0;
+  } catch (...) {
+    return 0;  // PhysFS calls SDLRWIoDuplicate: nothing may unwind into it
   }
 
-  PHYSFS_Io *io = new PHYSFS_Io;
+  PHYSFS_Io *io = new (std::nothrow) PHYSFS_Io;
+  if (!io) {
+    delete ctx;
+    return 0;
+  }
   *io = SDLRWIoTemplate;
   io->opaque = ctx;
 
@@ -572,6 +579,9 @@ struct CacheEnumData {
   // once full, unrecorded directories simply use the original traversal.
   std::set<std::string> scannedDirectories;
   static constexpr size_t scannedDirectoryLimit = 64;
+  // PhysFS is C without unwind tables on the Vita: an exception must never
+  // cross its frames. A callback parks it here and the C++ caller rethrows.
+  std::exception_ptr error;
 #ifdef __vita__
   struct Entry { std::string directory, name; int type; };
   // One bounded continuation stack replaces recursive native directory handles.
@@ -627,10 +637,11 @@ static int queueCacheDirectory(const char *path, CacheEnumData &data);
 
 static PHYSFS_EnumerateCallbackResult cacheEnumCB(void *d, const char *origdir,
                                                   const char *fname) {
+  CacheEnumData &data = *static_cast<CacheEnumData *>(d);
+  try {
   if (shState && shState->rtData().rqTerm)
     throw Exception(Exception::MKXPError, "Game close requested. Aborting path cache enumeration.");
 
-  CacheEnumData &data = *static_cast<CacheEnumData *>(d);
   char fullPath[512];
 
   int length;
@@ -722,6 +733,11 @@ static PHYSFS_EnumerateCallbackResult cacheEnumCB(void *d, const char *origdir,
   }
 
   return PHYSFS_ENUM_OK;
+  } catch (...) {
+    if (!data.error)
+      data.error = std::current_exception();
+    return PHYSFS_ENUM_ERROR;
+  }
 }
 
 #ifdef __vita__
@@ -731,8 +747,10 @@ static int queueCacheDirectory(const char *path, CacheEnumData &data) {
     CacheEnumData &data;
     VitaCacheTypes::Listings listings;
     bool overflow = false;
+    std::exception_ptr error = nullptr;
     static PHYSFS_EnumerateCallbackResult entry(void *ptr, const char *dir, const char *name) {
       Collect &c = *static_cast<Collect *>(ptr);
+      try {
       if (shState && shState->rtData().rqTerm)
         throw Exception(Exception::MKXPError, "Game close requested. Aborting path cache enumeration.");
       if (c.data.entries.size() == CacheEnumData::entryLimit) {
@@ -743,12 +761,18 @@ static int queueCacheDirectory(const char *path, CacheEnumData &data) {
         return PHYSFS_ENUM_ERROR;
       c.data.entries.push_back({dir, name, VitaCacheTypes::type(c.listings, name)});
       return PHYSFS_ENUM_OK;
+      } catch (...) {
+        c.error = std::current_exception();
+        return PHYSFS_ENUM_ERROR;
+      }
     }
   };
   bool overflow;
   {
     Collect collect{data, data.nativeTypes.list(path, *data.io)};
-    if (!PHYSFS_enumerate(path, Collect::entry, &collect)) return 0;
+    const int listed = PHYSFS_enumerate(path, Collect::entry, &collect);
+    if (collect.error) std::rethrow_exception(collect.error);
+    if (!listed) return 0;
     overflow = collect.overflow;
   } // Native listing scratch and its handle are gone before any descent.
   if (overflow) {
@@ -796,6 +820,8 @@ void FileSystem::createPathCache() {
 #else
   const int result = PHYSFS_enumerate("", cacheEnumCB, &data);
 #endif
+  if (data.error)
+    std::rethrow_exception(data.error);
   if (!result) {
     Debug() << "Path cache failed; using uncached lookup.";
     return;
@@ -823,12 +849,17 @@ struct FontSetsCBData {
   /* Exact lookup paths, local to one initialization. Overflow keeps scanning. */
   std::vector<std::string> processed;
   static const size_t maxProcessed = 64;
+  std::exception_ptr error = nullptr;  // parked here: PhysFS frames cannot unwind
 };
 
 static PHYSFS_EnumerateCallbackResult fontSetEnumCB(void *data, const char *dir,
                                                     const char *fname) {
   FontSetsCBData *d = static_cast<FontSetsCBData *>(data);
 
+  if (d->error)
+    return PHYSFS_ENUM_ERROR;
+
+  try {
   /* Only consider filenames with font extensions */
   const char *ext = findExt(fname);
 
@@ -868,6 +899,10 @@ static PHYSFS_EnumerateCallbackResult fontSetEnumCB(void *data, const char *dir,
     d->processed.push_back(filename);
 
   return PHYSFS_ENUM_OK;
+  } catch (...) {
+    d->error = std::current_exception();
+    return PHYSFS_ENUM_ERROR;
+  }
 }
 
 /* Basically just a case-insensitive search
@@ -893,6 +928,8 @@ void FileSystem::initFontSets(SharedFontState &sfs) {
   FontSetsCBData d = {p, &sfs, {}};
 
   PHYSFS_enumerate("", findFontsFolderCB, &d);
+  if (d.error)
+    std::rethrow_exception(d.error);
 }
 
 struct OpenReadEnumData {
@@ -914,6 +951,9 @@ struct OpenReadEnumData {
   /* In case of a PhysFS error, save it here so it
    * doesn't get changed before we get back into our code */
   const char *physfsError;
+
+  /* An exception thrown by the handler, parked for openRead to rethrow. */
+  std::exception_ptr error;
 
   OpenReadEnumData(FileSystem::OpenHandler &handler, const char *filename,
                    size_t filenameN,
@@ -990,6 +1030,7 @@ openReadEnumCB(void *d, const char *dirpath, const char *filename) {
   char buffer[512];
   const char *fullPath;
 
+  try {
   if (data.stopSearching)
     return PHYSFS_ENUM_STOP;
 
@@ -1055,6 +1096,11 @@ openReadEnumCB(void *d, const char *dirpath, const char *filename) {
 
   ++data.matchCount;
   return PHYSFS_ENUM_OK;
+  } catch (...) {
+    data.error = std::current_exception();
+    data.stopSearching = true;
+    return PHYSFS_ENUM_ERROR;
+  }
 }
 
 void FileSystem::openRead(OpenHandler &handler, const char *filename) {
@@ -1102,6 +1148,9 @@ void FileSystem::openRead(OpenHandler &handler, const char *filename) {
     if (!PHYSFS_enumerate(actualDir, openReadEnumCB, &data) && !data.physfsError)
       data.physfsError = PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode());
   }
+
+  if (data.error)
+    std::rethrow_exception(data.error);
 
   if (data.physfsError)
     throw Exception(Exception::PHYSFSError, "PhysFS: %s", data.physfsError);

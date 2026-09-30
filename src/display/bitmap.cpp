@@ -5382,6 +5382,13 @@ void Bitmap::removeFrame(int position) {
 
 #ifdef MKXPZ_SOFTWARE_BITMAPS
     {
+        /* An animation can hold no frame at all (a GIF whose partial decode
+         * found none) and the last one cannot go either: the index below
+         * would be -1 or 0 of an empty vector. */
+        if (p->animation.cpuFrames.size() < 2)
+            throw Exception(Exception::MKXPError,
+                            "Cannot remove the only frame of an animated bitmap");
+
         int pos = (position < 0) ? (int)p->animation.cpuFrames.size() - 1
                                  : clamp(position, 0, (int)(p->animation.cpuFrames.size() - 1));
         BitmapPrivate::countPixels(p->animation.cpuFrames[pos], -1);
@@ -5407,6 +5414,10 @@ void Bitmap::removeFrame(int position) {
         return;
     }
 #else
+    if (p->animation.frames.size() < 2)
+        throw Exception(Exception::MKXPError,
+                        "Cannot remove the only frame of an animated bitmap");
+
     int pos = (position < 0) ? (int)p->animation.frames.size() - 1 : clamp(position, 0, (int)(p->animation.frames.size() - 1));
     shState->texPool().release(p->animation.frames[pos]);
     p->animation.frames.erase(p->animation.frames.begin() + pos);

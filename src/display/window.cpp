@@ -371,11 +371,18 @@ void drawQuad(const Surface &dst, const IntRect &pos,
 	}
 }
 
+/* The GPU limit is 4096 and a game's mkxp-vita.json can raise caps.maxTexSize
+ * past it; the base is a CPU buffer plus a texture, so its pixels are bounded
+ * too, in 64 bits so the product cannot wrap. */
+static const int kMaxBaseDim = 4096;
+static const long long kMaxBaseBytes = 16LL * 1024 * 1024;
+
 void checkBaseSize(int w, int h)
 {
-	const int maxSize = glState.caps.maxTexSize;
+	const int maxSize = std::min(glState.caps.maxTexSize, kMaxBaseDim);
 
-	if (w > maxSize || h > maxSize)
+	if (w < 0 || h < 0 || w > maxSize || h > maxSize ||
+	    (long long) w * (long long) h * 4 > kMaxBaseBytes)
 		throw Exception(Exception::MKXPError,
 		                "Texture dimensions [%d, %d] exceed hardware capabilities",
 		                w, h);
@@ -385,8 +392,8 @@ void allocBase(std::vector<uint8_t> &px, int w, int h)
 {
 	checkBaseSize(w, h);
 
-	/* checkBaseSize has bounded both dimensions by GL_MAX_TEXTURE_SIZE, so
-	 * this product cannot wrap even where size_t is 32 bits. */
+	/* checkBaseSize bounds the pixel count, so this product cannot wrap even
+	 * where size_t is 32 bits. */
 	const size_t bytes = (size_t) w * (size_t) h * 4;
 
 	try
@@ -783,27 +790,27 @@ struct WindowPrivate
 		cornerRects.bl = IntRect(0,    h-16, 16, 16);
 		cornerRects.br = IntRect(w-16, h-16, 16, 16);
 
-		/* Required quad count */
-		int count = 0;
+		/* Required quad count; 64 bits so a huge window cannot wrap it (it
+		 * still fits a 32-bit size_t), and resize() refuses one the array
+		 * cannot hold. */
+		long long count = 0;
 
 		/* Background */
-		if (bgStretch)
-			backgroundVert.count = 1;
-		else
-			backgroundVert.count =
-			        TileQuads::twoDimCount(128, 128, bgRect.w, bgRect.h);
+		const int bgCount = bgStretch ? 1 :
+		        TileQuads::twoDimCount(128, 128, bgRect.w, bgRect.h);
 
-		count += backgroundVert.count;
+		count += bgCount;
 
 		/* Borders (sides) */
-		count += TileQuads::oneDimCount(32, w-16) * 2;
-		count += TileQuads::oneDimCount(32, h-16) * 2;
+		count += (long long) TileQuads::oneDimCount(32, w-16) * 2;
+		count += (long long) TileQuads::oneDimCount(32, h-16) * 2;
 
 		/* Corners */
 		count += 4;
 
 		/* Our vertex array */
-		baseQuadArray.resize(count);
+		baseQuadArray.resize((size_t) count);
+		backgroundVert.count = bgCount;
 		Vertex *vert = baseQuadArray.vertices.data();
 
 		int i = 0;

@@ -667,6 +667,10 @@ static void WorkerThread(TheoraDecoder *ctx)
                 // end of stream once video has drained too, and audio held
                 //  back by a full queue has been decoded.
                 eos = video_dry && !audio_left();
+                // Only a full audio queue is left: wait for the consumer
+                //  rather than spin on the exhausted file.
+                if (!eos && video_dry && !ctx->halt)
+                    sleepms(10);
             } // if
             else if (rc < 0)
                 goto cleanup;  // i/o error, etc.
