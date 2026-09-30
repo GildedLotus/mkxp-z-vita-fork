@@ -814,26 +814,44 @@ struct BitmapPrivate
     /* THE deletion-policy call site for a Bitmap cache texture: budget
      * eviction, the idle sweep and Bitmap::releaseResources() all end here,
      * so whatever the boot/GL policy settles on for texture deletion
-     * is changed in ONE place. Today that policy is the deferred
-     * queue -- TEX::del enqueues the name and GPUBudget::frameAdvance()
-     * releases it deferSwaps[DeferTexture] REAL swaps later -- which is also
-     * what makes it safe to evict a texture whose id an earlier call in this
-     * same frame already handed to a shader (sprite.cpp setPattern,
-     * graphics.cpp setTransMap): the GL object outlives the frame drawing
-     * with it. cacheMakeRoom() still prefers older victims and refuses the
-     * bound one, so eviction is also sane with deferSwaps[] set to 0. */
-    void cacheDrop()
+     * is changed in ONE place. Two policies, chosen by the caller:
+     *
+     *   inFlight == false  the name is parked in the recycle pool and the
+     *                      next same-size Bitmap re-specifies it in place.
+     *   inFlight == true   the entry was sampled this real frame, so a draw
+     *                      recorded earlier in it (sprite.cpp setPattern,
+     *                      graphics.cpp setTransMap, a sprite drawn before
+     *                      this one) still reads the storage. Recycling
+     *                      would let the incoming Bitmap overwrite it under
+     *                      that draw, so the name is retired through the
+     *                      deferred queue instead: TEX::del enqueues it and
+     *                      GPUBudget::frameAdvance() releases it
+     *                      deferSwaps[DeferTexture] REAL swaps later.
+     *
+     * Only cacheMakeRoom() can reach the second case; the idle sweep drops
+     * entries a whole idle horizon old, and a dispose happens between frames
+     * (after a freeze's own GPU drain). cacheMakeRoom() still prefers older
+     * victims and refuses the bound one, so eviction is also sane with
+     * deferSwaps[] set to 0. */
+    void cacheDrop(bool inFlight = false)
     {
         cacheForget();
 
         if (gl.tex.gl)
         {
-            /* the name is recycled, not retired. The next
-             * Bitmap of this size re-specifies it in place -- the upload
-             * path measured at the whole-level rate, several times the
-             * fresh-object upload a replacement name would pay. Overflow
-             * and drains retire it through the deferred queue. */
-            GPUBudget::texRecycleOffer(gl.tex.gl, gl.width, gl.height);
+            if (inFlight)
+            {
+                TEX::del(gl.tex);
+            }
+            else
+            {
+                /* the name is recycled, not retired. The next
+                 * Bitmap of this size re-specifies it in place -- the upload
+                 * path measured at the whole-level rate, several times the
+                 * fresh-object upload a replacement name would pay. Overflow
+                 * and drains retire it through the deferred queue. */
+                GPUBudget::texRecycleOffer(gl.tex.gl, gl.width, gl.height);
+            }
             gl.tex = TEX::ID(0);
         }
 
@@ -931,7 +949,8 @@ struct BitmapPrivate
              * case the budget is meant never to reach: counted on its own so
              * a hardware log says whether kTexCacheMaxTextures is too small
              * for a real game rather than leaving it to be guessed. */
-            if (victim->lastSampledFrame == now)
+            const bool inFlight = victim->lastSampledFrame == now;
+            if (inFlight)
                 ++texCacheEvictedHot;
 
             ++texCacheEvicted;
@@ -941,7 +960,7 @@ struct BitmapPrivate
                              victim->cacheBytes);
 
             const unsigned was = texCacheLive;
-            victim->cacheDrop();
+            victim->cacheDrop(inFlight);
 
             /* Every iteration must make room. A spin here would be a frozen
              * game on the device, so the loop refuses to trust that it does

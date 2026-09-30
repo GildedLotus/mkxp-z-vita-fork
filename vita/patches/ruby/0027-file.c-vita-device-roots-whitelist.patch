@@ -1,0 +1,40 @@
+From: mkxp-z-vita
+Subject: [PATCH] file.c: Vita device roots only for the mounts the engine uses
+
+The device-root matcher treated every alphanumeric "name:/" prefix as an absolute root, so
+os0:/, vd0:/, host0:/ and the rest became absolute for File.expand_path,
+File.dirname and rb_is_absolute_path. Restrict the matcher to app0: (bundle),
+ux0: (card) and uma0: (USB); other prefixes resolve as ordinary relative
+names again.
+
+--- a/file.c
++++ b/file.c
+@@ -3424,16 +3424,21 @@
+ #endif
+ 
+ #ifdef __vita__
+-/* Newlib accepts Vita mount paths directly.  They are roots, not relative
+- * filenames or DOS drive-relative paths (app0:foo remains relative). */
++/* Newlib accepts Vita mount paths directly.  The mounts the engine uses --
++ * app0: (bundle), ux0: (card) and uma0: (USB) -- are roots, not relative
++ * filenames or DOS drive-relative paths (app0:foo remains relative).  Any
++ * other "name:/" prefix stays an ordinary relative name. */
+ static size_t
+ vita_device_prefix_length(const char *path, const char *end)
+ {
+-    const char *p = path;
+-    if (p == end || !ISALPHA((unsigned char)*p)) return 0;
+-    while (p < end && ISALNUM((unsigned char)*p)) ++p;
+-    if (end - p >= 2 && p[0] == ':' && p[1] == '/')
+-        return p + 1 - path;
++    static const char *const mounts[] = {"app0", "ux0", "uma0"};
++    size_t i;
++    for (i = 0; i < sizeof(mounts) / sizeof(mounts[0]); ++i) {
++        size_t n = strlen(mounts[i]);
++        if ((size_t)(end - path) >= n + 2 && memcmp(path, mounts[i], n) == 0 &&
++            path[n] == ':' && path[n + 1] == '/')
++            return n + 1;
++    }
+     return 0;
+ }
+ #endif

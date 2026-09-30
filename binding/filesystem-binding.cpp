@@ -27,6 +27,8 @@
 #include "sharedstate.h"
 #include "src/util/util.h"
 
+#include <climits>
+
 #if RAPI_FULL > 187
 #include "ruby/encoding.h"
 #include "ruby/intern.h"
@@ -112,10 +114,12 @@ RB_METHOD(fileIntRead) {
         if (end < 0)
             end = ops->size(ops);
         
-        length = end - cur;
+        // Keep the span 64-bit: a file past 4 GiB must not wrap into a short read.
+        const Sint64 span = end - cur;
         SDL_RWseek(ops, cur, SEEK_SET);
-        if (end < 0 || length < 0)
+        if (end < 0 || span < 0 || span > INT_MAX)
             rb_raise(rb_eIOError, "cannot determine file size");
+        length = (int)span;
     } else if (length < 0) {
         rb_raise(rb_eArgError, "negative length %d given", length);
     }

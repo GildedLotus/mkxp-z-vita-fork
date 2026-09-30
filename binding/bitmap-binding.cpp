@@ -302,6 +302,12 @@ RB_METHOD_GUARD(bitmapClear) {
 }
 RB_METHOD_GUARD_END
 
+static VALUE pinnedColorClass() {
+    VALUE klass = rb_const_get(rb_cObject, rb_intern("Color"));
+    rb_gc_register_mark_object(klass);
+    return klass;
+}
+
 RB_METHOD_GUARD(bitmapGetPixel) {
     Bitmap *b = getPrivateData<Bitmap>(self);
     
@@ -318,8 +324,9 @@ RB_METHOD_GUARD(bitmapGetPixel) {
     /* The save-preview hot path: resolve the wrapper class
      * once instead of rb_intern + rb_const_get per call, and fill the
      * allocator's own Color instead of allocating a second one and freeing
-     * the pre-init one. Games do not rebind the Color constant. */
-    static VALUE colorClass = rb_const_get(rb_cObject, rb_intern("Color"));
+     * the pre-init one. MRI does not mark C statics, so the class is pinned:
+     * a script that removes the Color constant cannot free it under us. */
+    static VALUE colorClass = pinnedColorClass();
     
     VALUE obj = rb_obj_alloc(colorClass);
     *getPrivateDataNoRaise<Color>(obj) = value;

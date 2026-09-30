@@ -75,17 +75,33 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
 /* umask: no process umask on Vita; accept and report previous = 0. */
 mode_t umask(mode_t mask) { (void)mask; return 0; }
 
-/* dup2: implement via close(newfd)+fcntl(oldfd, F_DUPFD, newfd). Vita newlib
- * has dup/close/open/fcntl but not dup2. MRI uses dup2 unconditionally in
- * ruby_sysinit/pipe paths even when configure says no. */
+/* dup2: Vita newlib has dup/close/open/fcntl but not dup2. MRI uses dup2
+ * unconditionally in ruby_sysinit/pipe paths even when configure says no.
+ * F_DUPFD cannot land on an occupied slot, so newfd has to be closed; oldfd
+ * is duplicated first, which proves it valid (a bad oldfd fails with newfd
+ * untouched, as POSIX requires) and keeps the file open across the close. */
 int dup2(int oldfd, int newfd) {
-  int r;
-  if (oldfd == newfd)
-    return newfd;
-  close(newfd);
-  r = fcntl(oldfd, F_DUPFD, newfd);
-  if (r < 0)
+  int held, r, err;
+  if (newfd < 0) {
+    errno = EBADF;
     return -1;
+  }
+  held = dup(oldfd);
+  if (held < 0)
+    return -1;
+  if (oldfd == newfd || held == newfd) {
+    if (oldfd == newfd)
+      close(held);
+    return newfd;
+  }
+  close(newfd);
+  r = fcntl(held, F_DUPFD, newfd);
+  err = errno;
+  close(held);
+  if (r < 0) {
+    errno = err;
+    return -1;
+  }
   if (r != newfd) {
     close(r);
     errno = EBADF;

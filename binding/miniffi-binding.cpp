@@ -3,6 +3,7 @@
 
 #include <SDL.h>
 #include <cstdint>
+#include <new>
 
 #include "filesystem/filesystem.h"
 #include "miniffi.h"
@@ -31,10 +32,25 @@
 #define _T_INTEGER 3
 #define _T_BOOL 4
 
+/* The library and the entry point it resolved live in the typed data, out of
+ * reach of Ruby: func stays null until initialize has resolved a real
+ * function, and MiniFFI_call refuses to run without one. */
+struct MiniFFIData {
+    void *lib;
+    void *func;
+};
+
+static void MiniFFIFree(void *p) {
+    MiniFFIData *data = static_cast<MiniFFIData *>(p);
+    if (data->lib)
+        SDL_UnloadObject(data->lib);
+    delete data;
+}
+
 #if RAPI_FULL > 187
-DEF_TYPE_CUSTOMFREE(MiniFFI, SDL_UnloadObject);
+DEF_TYPE_CUSTOMFREE(MiniFFI, MiniFFIFree);
 #else
-DEF_ALLOCFUNC_CUSTOMFREE(MiniFFI, SDL_UnloadObject);
+DEF_ALLOCFUNC_CUSTOMFREE(MiniFFI, MiniFFIFree);
 #endif
 
 static void *MiniFFI_GetFunctionHandle(void *libhandle, const char *func) {
@@ -56,7 +72,13 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
 #else
     void *hlib = SDL_LoadObject(RSTRING_PTR(libname));
 #endif
-    setPrivateData(self, hlib);
+    MiniFFIData *data = new (std::nothrow) MiniFFIData{hlib, 0};
+    if (!data) {
+        if (hlib)
+            SDL_UnloadObject(hlib);
+        throw std::bad_alloc();
+    }
+    setPrivateData(self, data);
     void *hfunc = MiniFFI_GetFunctionHandle(hlib, RSTRING_PTR(func));
 #ifdef __WIN32__
     if (hlib && !hfunc) {
@@ -68,7 +90,7 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
     if (!hfunc)
         throw Exception(Exception::RuntimeError, "%s", SDL_GetError());
     
-    rb_iv_set(self, "_func", MVAL2RB((mffi_value)hfunc));
+    data->func = hfunc;
     rb_iv_set(self, "_funcname", func);
     rb_iv_set(self, "_libname", libname);
     
@@ -199,17 +221,15 @@ void* miniffi_call_cb(void *args) {
 RB_METHOD_GUARD(MiniFFI_call) {
     MiniFFIFuncArgs param;
 #define params param.params
-    VALUE func = rb_iv_get(self, "_func");
     VALUE own_imports = rb_iv_get(self, "_imports");
     VALUE own_exports = rb_iv_get(self, "_exports");
-    MINIFFI_FUNC ApiFunction = (MINIFFI_FUNC)RB2MVAL(func);
-    /* Never branch to address 0. MiniFFI_initialize raises when the entry
-     * point is missing, so `_func` should always be a resolved address by the
-     * time a call lands here -- but that invariant lives in another method and
-     * anything that reaches this one without it (an override that skips
-     * `super`, a re-lookup that stored a null) would otherwise call through a
-     * null pointer and take the process down with it. A Ruby error the game
-     * can rescue is the correct failure. */
+    MiniFFIData *funcData = getPrivateDataNoRaise<MiniFFIData>(self);
+    MINIFFI_FUNC ApiFunction = funcData ? (MINIFFI_FUNC)funcData->func : 0;
+    /* Never branch to an address initialize did not resolve. The pointer is
+     * set only after SDL_LoadFunction succeeded, and it lives in the C
+     * struct, so an object that skipped or failed initialize (an override
+     * that skips `super`, MiniFFI.allocate, a dup of one) has none and gets a
+     * Ruby error the game can rescue instead of a call through garbage. */
     if (!ApiFunction) {
         VALUE libname = rb_iv_get(self, "_libname");
         VALUE funcname = rb_iv_get(self, "_funcname");

@@ -2567,13 +2567,49 @@ struct GraphicsPrivate {
     }
 #endif
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+    /* The freeze contract for the per-frame composite: a refused upload
+     * retires the deferred queue and retries once; a second one skips the
+     * frame (the CPU pixels are intact and the next update draws the scene
+     * again) instead of raising into the script, like freeze and transition.
+     * A skipped frame presents nothing but still counts and paces. */
+    bool compositeOrSkip() {
+        for (unsigned attempt = 0; attempt < 2; ++attempt) {
+            try {
+                screen.composite();
+                return true;
+            } catch (const TEX::UploadError &) {
+                if (attempt == 0)
+                    GPUBudget::deferDrain("frame-retry", true);
+            }
+        }
+        static Uint32 lastSkip = 0;
+        static bool skipLogged = false;
+        const Uint32 now = SDL_GetTicks();
+        if (!skipLogged || now - lastSkip >= 1000) {
+            std::fputs("vita-gpu: Graphics.update upload failed; skipping the frame\n", stderr);
+            lastSkip = now;
+            skipLogged = true;
+        }
+        fpsLimiter.delay();
+        ++frameCount;
+        threadData->ethread->notifyFrame();
+        return false;
+    }
+#endif
+
     void redrawScreen() {
         GLStateGuard state(glState);
         resetTargetCounters();
 #if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) && VITA_GLUE_FRAME_TRACE
         vita_glue_trace("trace: redrawScreen enter");
 #endif
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+        if (!compositeOrSkip())
+            return;
+#else
         screen.composite();
+#endif
 #if (defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)) && VITA_GLUE_FRAME_TRACE
         vita_glue_trace("trace: redrawScreen composite done");
 #endif
@@ -2959,7 +2995,7 @@ void Graphics::transition(int duration, const char *filename, int vague) {
     
     /* Capture new scene */
 #ifdef MKXPZ_SOFTWARE_BITMAPS
-    /* 0168's freeze contract, extended to the scene being changed TO. Both
+    /* The freeze contract, extended to the scene being changed TO. Both
      * uploads this call can reach are inside the guard: the new scene's
      * Bitmaps, sampled by the composite, and the transition bitmap. A
      * recoverable failure retires the deferred queue and retries once; a
