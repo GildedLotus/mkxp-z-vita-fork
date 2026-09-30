@@ -14,7 +14,10 @@
 # flags, cmake options, compiler and vitaGL headers/archives as this run, and
 # every installed file still matches. An explicit SDL2_VITAGL_SRC tree is used
 # as given, patched in place (it is this build's private tree; never point it
-# at build/sdl2-src) and recorded by content digest.
+# at build/sdl2-src) and recorded by content digest. The default tree is sealed
+# once patched, with the identity of what it was made from (URL, version, tarball
+# digest, digest of every patch), and is never built in; it is reused only while
+# that identity equals the current pins and patches.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -156,8 +159,13 @@ except (OSError, ValueError):
 PY
 }
 if receipt check; then
-  echo "build-sdl2-vitagl: already built at $PREFIX (receipt identity and payload match)"
-  exit 0
+  # The release source archive takes the sealed tree, so an installed prefix whose tree is gone, edited or
+  # sealed from other inputs is built again rather than trusted.
+  if [[ -n ${SDL2_VITAGL_SRC:-} || $(python3 -B "$ROOT/vita/scripts/treedigest.py" state "$SRC" sdl2) == current ]]; then
+    echo "build-sdl2-vitagl: already built at $PREFIX (receipt identity and payload match)"
+    exit 0
+  fi
+  echo "build-sdl2-vitagl: installed prefix matches, but $SRC is not a sealed tree of the current pins and patches; building again"
 fi
 
 if [[ -z ${SDL2_VITAGL_SRC:-} ]]; then
@@ -165,7 +173,7 @@ if [[ -z ${SDL2_VITAGL_SRC:-} ]]; then
   sdl2_fetch_src "$SRC" die
   apply_backend_patch
   # The release source archive takes this tree as it is: seal it now, verify it after the build.
-  python3 -B "$ROOT/vita/scripts/treedigest.py" seal "$SRC"
+  python3 -B "$ROOT/vita/scripts/treedigest.py" seal "$SRC" sdl2
 fi
 
 echo "==> cmake (VIDEO_VITA_VGL=ON) -> $PREFIX"
@@ -194,7 +202,7 @@ for lib in vitaGL vitashark mathneon; do
 done
 
 if [[ -z ${SDL2_VITAGL_SRC:-} ]]; then
-  python3 -B "$ROOT/vita/scripts/treedigest.py" verify "$SRC" || die "the SDL2 source tree changed during the build (built in tree?)"
+  python3 -B "$ROOT/vita/scripts/treedigest.py" verify "$SRC" sdl2 || die "the SDL2 source tree changed during the build (built in tree?)"
 fi
 receipt write
 receipt check || die "installed payload does not match its receipt"

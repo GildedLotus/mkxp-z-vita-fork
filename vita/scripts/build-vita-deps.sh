@@ -9,6 +9,7 @@
 #   vita/scripts/build-vita-deps.sh pixman
 #   vita/scripts/build-vita-deps.sh openal
 #   vita/scripts/build-vita-deps.sh pthread-embedded   # fetch the pinned source only (release source archive)
+#   vita/scripts/build-vita-deps.sh vdpm-sources       # fetch the pinned sources and recipes of the vdpm libraries the player links
 #   vita/scripts/build-vita-deps.sh wrapper      # (re)write pkg-config wrapper only
 #   vita/scripts/build-vita-deps.sh status       # what is installed in the side prefix
 #   vita/scripts/build-vita-deps.sh clean        # wipe build/vita-deps (sources + prefix)
@@ -26,15 +27,23 @@
 #     points meson at the wrapper above; nothing is copied into VitaSDK.
 #
 # Pins (match mkxp-z linux/Makefile where possible):
-#   Every download is pinned in vita/scripts/dep-pins.json (SHA-256 for tarballs, a full
-#   commit for git sources) and refused when it does not match. A fetched tarball tree is
-#   sealed with a content digest and re-verified before every build and before archiving,
-#   so a tree edited or built in place is rejected; nothing is built inside a source tree.
+#   The downloads this script makes are pinned in vita/scripts/dep-pins.json (SHA-256 for
+#   tarballs, a full commit for git sources) and refused when they do not match; the other
+#   pins are listed in THIRD-PARTY.md. A fetched tarball tree is sealed with the identity of
+#   what it was made from (URL, version, tarball digest, every patch and text transformation)
+#   and its content digest. It is reused only while that identity equals the current pins
+#   (otherwise it is extracted again) and is re-verified before every build and before
+#   archiving, so a tree edited or built in place is rejected; nothing is built inside a
+#   source tree.
 #   theora     libtheora-1.1.1 tarball (pregenerated configure; no automake needed)
 #   uchardet   freedesktop/uchardet v0.0.8, checked against its pinned commit
 #   SDL_sound  mkxp-z/SDL_sound @ cfb2533eb3bac3700015cbd87cc623bea1467239
 #   pthread-embedded  fetched for the source archive only (the VitaSDK libpthread is linked
 #              from the toolchain, not built here)
+#   vdpm-sources  the upstream sources and the vitasdk/packages recipes of the statically
+#              linked vdpm libraries (FreeType, SDL2_image, SDL2_ttf, libpng, zlib, bzip2,
+#              libwebp, libogg, libvorbis, PhysFS): fetched for the source archive only,
+#              each pinned by SHA-256 or commit in dep-pins.json
 #   pixman     0.42.2 release tarball — the exact Version in the vdpm sysroot's
 #              pixman-1.pc (the vdpm recipe itself is not recoverable offline).
 #              The sysroot archive is a debug-goal build ("Aggressive Debug"),
@@ -103,6 +112,14 @@ OPENAL_VITA_PATCH_SHA256=$(dep_pin openal patchSha256)
 OPENAL_DIR="$SRC/openal-soft-openal-soft-$OPENAL_VERSION"
 PTHREAD_URL=$(dep_pin pthreadEmbedded repo)
 PTHREAD_COMMIT=$(dep_pin pthreadEmbedded commit)
+PIXMAN_ASM_SED=$(dep_pin transforms pixmanArmAsmSed)
+OPENAL_SZFMT_SED=$(dep_pin transforms openalSzfmtSed)
+VDPM_RECIPES_URL=$(dep_pin vdpm recipes repo)
+VDPM_RECIPES_COMMIT=$(dep_pin vdpm recipes commit)
+VDPM_RECIPES_DIR="$SRC/vitasdk-packages"
+LIBPNG_URL=$(dep_pin vdpm packages libpng git repo)
+LIBPNG_COMMIT=$(dep_pin vdpm packages libpng git commit)
+LIBPNG_DIR="$SRC/libpng"
 
 # verify_git_checkout <dir> <commit>: the managed checkout is at the pinned commit with no tracked edits.
 verify_git_checkout() {
@@ -177,8 +194,7 @@ fetch_theora() {
   local tar="$DIST/libtheora-$THEORA_VERSION.tar.gz"
   need curl
   fetch_verified "$THEORA_URL" "$THEORA_SHA256" "$tar"
-  if [[ -x "$THEORA_DIR/configure" && -f "$THEORA_DIR/.mkxpz-tree-sha256" ]]; then
-    verify_tree "$THEORA_DIR"
+  if tree_reusable "$THEORA_DIR" theora && [[ -x "$THEORA_DIR/configure" ]]; then
     return 0
   fi
   echo "==> unpacking theora $THEORA_VERSION (sha256 verified)"
@@ -186,7 +202,7 @@ fetch_theora() {
   rm -rf "$SRC/libtheora-$THEORA_VERSION" "$THEORA_DIR"
   tar -C "$SRC" -xzf "$tar"
   mv "$SRC/libtheora-$THEORA_VERSION" "$THEORA_DIR"
-  seal_tree "$THEORA_DIR"
+  seal_tree "$THEORA_DIR" theora
 }
 
 # One -ffile-prefix-map per local root, general prefix first (GCC applies the last match): DWARF and
@@ -201,7 +217,7 @@ deps_path_maps() {
     lines="$lines${#from} -ffile-prefix-map=$from=$to
 "
   done
-  printf '%s' "$lines" | sort -u -n -k1,1 | cut -d' ' -f2-
+  printf '%s' "$lines" | sort -u | sort -n -k1,1 | cut -d' ' -f2-
 }
 
 build_theora() {
@@ -229,7 +245,7 @@ build_theora() {
     make install > "$BDIR/theora/install.log" 2>&1 \
       || { tail -20 "$BDIR/theora/install.log" >&2; die "theora install failed"; }
   )
-  verify_tree "$THEORA_DIR"
+  verify_tree "$THEORA_DIR" theora
   # Drop theora docs from the prefix (large, unused).
   rm -rf "$PREFIX/share/doc/libtheora-"*
   [[ -f "$PREFIX/lib/libtheora.a" ]] || die "theora: libtheora.a missing after install"
@@ -333,8 +349,7 @@ fetch_pixman() {
   local tar="$DIST/pixman-$PIXMAN_VERSION.tar.gz"
   need curl
   fetch_verified "$PIXMAN_URL" "$PIXMAN_SHA256" "$tar"
-  if [[ -f "$PIXMAN_DIR/meson.build" && -f "$PIXMAN_DIR/.mkxpz-tree-sha256" ]]; then
-    verify_tree "$PIXMAN_DIR"
+  if tree_reusable "$PIXMAN_DIR" pixman && [[ -f "$PIXMAN_DIR/meson.build" ]]; then
     return 0
   fi
   echo "==> unpacking pixman $PIXMAN_VERSION (sha256 verified)"
@@ -347,11 +362,11 @@ fetch_pixman() {
   # assembly for binutils change", 2024-07-12) strips the leading zeros in
   # exactly this file; apply the same two substitutions to the 0.42.2 tarball.
   # The ref form is anchored on whitespace (BSD sed has no \b) — operand
-  # tokens in these files are always space-delimited.
-  sed -i.bak -E 's/^([[:space:]]*)0([0-9]):/\1\2:/; s/(^|[[:space:]])0([0-9])([fb])/\1\2\3/g' \
-    "$PIXMAN_DIR/pixman/pixman-arm-simd-asm.S"
+  # tokens in these files are always space-delimited. The expression is
+  # transforms.pixmanArmAsmSed in dep-pins.json, part of the tree's sealed identity.
+  sed -i.bak -E "$PIXMAN_ASM_SED" "$PIXMAN_DIR/pixman/pixman-arm-simd-asm.S"
   rm -f "$PIXMAN_DIR/pixman/pixman-arm-simd-asm.S.bak"
-  seal_tree "$PIXMAN_DIR"
+  seal_tree "$PIXMAN_DIR" pixman
 }
 
 build_pixman() {
@@ -388,7 +403,7 @@ build_pixman() {
   PIXMAN_MAPS=""
   while IFS= read -r map_flag; do
     [[ -n "$map_flag" ]] && PIXMAN_MAPS="$PIXMAN_MAPS, '$map_flag'"
-  done <<< "$(printf '%s' "$PIXMAN_MAP_LINES" | sort -u -n -k1,1 | cut -d' ' -f2-)"
+  done <<< "$(printf '%s' "$PIXMAN_MAP_LINES" | sort -u | sort -n -k1,1 | cut -d' ' -f2-)"
   cat > "$BDIR/pixman/vita-cross.ini" << EOF
 # Generated by vita/scripts/build-vita-deps.sh — do not edit.
 [binaries]
@@ -428,7 +443,7 @@ EOF
     || { tail -40 "$BDIR/pixman/install.log" >&2; die "pixman install failed"; }
   [[ -f "$PREFIX/lib/libpixman-1.a" ]] || die "pixman: libpixman-1.a missing after install"
   [[ -f "$PREFIX/lib/pkgconfig/pixman-1.pc" ]] || die "pixman: pixman-1.pc missing after install"
-  verify_tree "$PIXMAN_DIR"
+  verify_tree "$PIXMAN_DIR" pixman
   echo "    libpixman-1.a  pixman-1.pc  (release -O2, function/data sections)"
 }
 
@@ -440,8 +455,7 @@ fetch_openal() {
   local vita_patch="$DIST/openal-soft-$OPENAL_VERSION-vita-1.patch"
   fetch_verified "$OPENAL_URL" "$OPENAL_SHA256" "$tar"
   fetch_verified "$OPENAL_VITA_PATCH_URL" "$OPENAL_VITA_PATCH_SHA256" "$vita_patch"
-  if [[ -f "$OPENAL_DIR/OpenAL32/Include/alMain.h" && -f "$OPENAL_DIR/.mkxpz-tree-sha256" ]]; then
-    verify_tree "$OPENAL_DIR"
+  if tree_reusable "$OPENAL_DIR" openal && [[ -f "$OPENAL_DIR/OpenAL32/Include/alMain.h" ]]; then
     return 0
   fi
   echo "==> unpacking openal-soft $OPENAL_VERSION + Vita backend patch (sha256 verified)"
@@ -455,13 +469,13 @@ fetch_openal() {
   # (device data abort in strlen from _vfprintf_r). alMain.h
   # hardcodes SZFMT "%zu" in the trailing #else of its Windows-only chain, so
   # no -D can select it — substitute in place, same policy as fetch_pixman's
-  # binutils sed. size_t is 32-bit on arm-vita-eabi.
-  sed -i.bak 's/^#define SZFMT "%zu"$/#define SZFMT "%u"/' \
-    "$OPENAL_DIR/OpenAL32/Include/alMain.h"
+  # binutils sed (transforms.openalSzfmtSed in dep-pins.json, part of the tree's
+  # sealed identity). size_t is 32-bit on arm-vita-eabi.
+  sed -i.bak "$OPENAL_SZFMT_SED" "$OPENAL_DIR/OpenAL32/Include/alMain.h"
   rm -f "$OPENAL_DIR/OpenAL32/Include/alMain.h.bak"
   grep -q '^#define SZFMT "%u"$' "$OPENAL_DIR/OpenAL32/Include/alMain.h" \
     || die "openal: SZFMT substitution did not land"
-  seal_tree "$OPENAL_DIR"
+  seal_tree "$OPENAL_DIR" openal
 }
 
 build_openal() {
@@ -513,24 +527,34 @@ build_openal() {
   fi
   grep -q 'Freed %u context property object%s' <<< "$openal_strings" \
     || die "openal: SZFMT %u did not reach the archive strings"
-  verify_tree "$OPENAL_DIR"
+  verify_tree "$OPENAL_DIR" openal
   echo "    libopenal.a  openal.pc  (SZFMT -> %u; vita/null/wave/loopback backends, NEON on)"
 }
 
 # Source only: the VitaSDK libpthread that the player links is a toolchain binary; the pinned
-# source is fetched so the release source archive can carry it.
+# source is fetched so the release source archive can carry it (the release build checks the
+# revision against $VITASDK/version_info.txt).
 fetch_pthread_embedded() {
   need git
-  if [[ ! -d "$PTHREAD_DIR/.git" ]]; then
-    echo "==> fetching pthread-embedded $PTHREAD_COMMIT"
-    mkdir -p "$SRC"
-    git clone --quiet --no-checkout "$PTHREAD_URL" "$PTHREAD_DIR"
-  fi
-  if ! git -C "$PTHREAD_DIR" cat-file -e "$PTHREAD_COMMIT^{commit}" 2>/dev/null; then
-    git -C "$PTHREAD_DIR" fetch --quiet origin "$PTHREAD_COMMIT"
-  fi
-  git -C "$PTHREAD_DIR" checkout --quiet --force --detach "$PTHREAD_COMMIT"
-  verify_git_checkout "$PTHREAD_DIR" "$PTHREAD_COMMIT"
+  echo "==> fetching pthread-embedded $PTHREAD_COMMIT"
+  fetch_git_pinned "$PTHREAD_DIR" "$PTHREAD_URL" "$PTHREAD_COMMIT"
+}
+
+# Source only: the statically linked vdpm libraries are VitaSDK binary packages. Their upstream
+# tarballs and patches are fetched into $DIST/vdpm/<package>/ (each refused unless its pinned
+# SHA-256 matches), libpng comes from its pinned commit, and the vitasdk/packages recipes at
+# their pinned commit. The release source archive carries all of it; it checks the installed
+# libraries against the digests pinned in dep-pins.json.
+fetch_vdpm_sources() {
+  need curl
+  need git
+  local package file url sha
+  echo "==> fetching the vdpm library sources (pinned by SHA-256 or commit)"
+  while IFS=$'\t' read -r package file url sha; do
+    fetch_verified "$url" "$sha" "$DIST/vdpm/$package/$file"
+  done < <(vdpm_downloads)
+  fetch_git_pinned "$LIBPNG_DIR" "$LIBPNG_URL" "$LIBPNG_COMMIT"
+  fetch_git_pinned "$VDPM_RECIPES_DIR" "$VDPM_RECIPES_URL" "$VDPM_RECIPES_COMMIT"
 }
 
 status() {
@@ -583,6 +607,7 @@ case "$MODE" in
     build_pixman
     build_openal
     fetch_pthread_embedded
+    fetch_vdpm_sources
     write_wrapper
     echo
     status
@@ -615,6 +640,9 @@ case "$MODE" in
   pthread-embedded)
     fetch_pthread_embedded
     ;;
+  vdpm-sources)
+    fetch_vdpm_sources
+    ;;
   wrapper)
     write_wrapper
     ;;
@@ -626,6 +654,6 @@ case "$MODE" in
     rm -rf "$DEPS_ROOT"
     ;;
   *)
-    die "unknown mode: $MODE (all|theora|uchardet|sdl2_sound|pixman|openal|pthread-embedded|wrapper|status|clean)"
+    die "unknown mode: $MODE (all|theora|uchardet|sdl2_sound|pixman|openal|pthread-embedded|vdpm-sources|wrapper|status|clean)"
     ;;
 esac
