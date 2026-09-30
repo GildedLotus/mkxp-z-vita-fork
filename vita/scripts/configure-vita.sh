@@ -499,20 +499,16 @@ RECEIPT_OBJ="$BUILD_DIR/mkxpz-build-receipt.o"
 RECEIPT_DEPS=("sdl2Vitagl=$SDL2_VITAGL_PREFIX/lib" "vitagl=$VITAGL_PREFIX/lib" "vitaDeps=$DEPS_PREFIX/lib")
 python3 - "$ROOT" "$BUILD_DIR" "$MKXPZ_PIN" "$MRI_LIBPATH/lib${MRI_LIBRARY}.a" "$OPTIONAL_SHADERS" \
   "$(arm-vita-eabi-gcc -dumpversion)" "$(meson --version)" "$HAVE_TSF:$TSF_PREFIX" \
-  "$VITA_GL_BACKEND" "${RECEIPT_DEPS[@]}" <<'PYRECEIPT'
+  "$VITA_GL_BACKEND" "$MKXPZ_LTO" "${RECEIPT_DEPS[@]}" <<'PYRECEIPT'
 import hashlib, json, subprocess, sys
 from pathlib import Path
 root, build = Path(sys.argv[1]), Path(sys.argv[2])
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(root / "vita/scripts"))
 import treedigest
-pin, archive, shaders, gcc, meson, tsf, backend = sys.argv[3:10]
+pin, archive, shaders, gcc, meson, tsf, backend, lto = sys.argv[3:11]
 sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-def tree_digest(files):
-    digest = hashlib.sha256()
-    for path in sorted(files):
-        digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
-    return digest.hexdigest()
+tree_digest = treedigest.lib_digest
 sources = [root / "vita/linker/armvita-1mb-data.ld", root / "vita/meson/vita-cross.ini"]
 for folder in ("glue", "swraster", "overlay", "textpanel", "launcher", "include"):
     sources += [p for p in (root / "vita" / folder).rglob("*") if p.suffix in (".c", ".cpp", ".h")
@@ -527,9 +523,10 @@ receipt = {
     "engineSourcesSha256": treedigest.digest(root, treedigest.ENGINE),
     "sources": {str(p.relative_to(root)): sha(p) for p in sorted(sources)},
     "rubyArchiveSha256": sha(Path(archive)),
-    "dependencies": {name: tree_digest(Path(lib).glob("*.a")) for name, lib in (a.split("=", 1) for a in sys.argv[10:])},
+    "dependencies": {name: tree_digest(Path(lib).glob("*.a")) for name, lib in (a.split("=", 1) for a in sys.argv[11:])},
     "tinysoundfont": tree_digest([Path(tsf_prefix, n) for n in ("tsf.h", "tml.h")]) if have_tsf == "1" else None,
     "toolchain": {"gcc": gcc, "meson": meson}, "optionalShaders": shaders == "true",
+    "mesonBuildtype": "release", "lto": lto == "1",
 }
 blob = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
 target = build / "mkxpz-build-receipt.json"

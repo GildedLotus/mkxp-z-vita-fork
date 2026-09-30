@@ -101,6 +101,12 @@ RUBY_PREFIX="${RUBY_PREFIX:-$ROOT/build/ruby-vita-prefix}"
 RUBY_LIB="$RUBY_PREFIX/lib/ruby/3.1.0"
 MKXP_JSON="${MKXP_JSON:-$ASSETS/mkxp.json}"
 FONTS_PREFIX="${FONTS_PREFIX:-$ROOT/build/fonts}"
+# The dependency prefixes the ELF was linked against (same defaults as configure-vita.sh): the receipt's
+# archive digests are compared with what these hold now.
+DEPS_PREFIX="${DEPS_PREFIX:-$ROOT/build/vita-deps/prefix}"
+SDL2_VITAGL_PREFIX="${SDL2_VITAGL_PREFIX:-$ROOT/build/sdl2-vitagl-prefix}"
+VITAGL_PREFIX="${VITAGL_PREFIX:-$ROOT/build/vitagl-prefix}"
+if [[ -z ${TSF_PREFIX+x} ]]; then TSF_PREFIX="$ROOT/build/third-party/tinysoundfont"; fi
 
 TITLE_ID="${TITLE_ID:-MKXPZ0001}"
 TITLE="${TITLE:-mkxp-z}"
@@ -228,7 +234,8 @@ mkdir -p "$OUT"
 BUILD_RECEIPT="$OUT/mkxpz-build-receipt.json"
 rm -f "$BUILD_RECEIPT"
 python3 - "$ELF_IN" "$ROOT" "$RUBY_PREFIX/lib/libruby-static.a" "$BUILD_RECEIPT" \
-	"${ALLOW_STALE_ELF:-0}" "${REQUIRE_BUILD_RECEIPT:-0}" "$VITA_GL_BACKEND" <<'RECEIPT' || die "player ELF build receipt rejected"
+	"${ALLOW_STALE_ELF:-0}" "${REQUIRE_BUILD_RECEIPT:-0}" "$VITA_GL_BACKEND" \
+	"$SDL2_VITAGL_PREFIX" "$VITAGL_PREFIX" "$DEPS_PREFIX" "$TSF_PREFIX" <<'RECEIPT' || die "player ELF build receipt rejected"
 import hashlib
 import json
 import struct
@@ -238,6 +245,7 @@ from pathlib import Path
 elf, root, archive, output = map(Path, sys.argv[1:5])
 allow_stale, require = sys.argv[5] == "1", sys.argv[6] == "1"
 backend = sys.argv[7]
+sdl2_prefix, vitagl_prefix, deps_prefix, tsf_prefix = map(Path, sys.argv[8:12])
 blob = elf.read_bytes()
 receipt = None
 if blob[:6] == b"\x7fELF\x01\x01":
@@ -275,6 +283,15 @@ if treedigest.digest(root, treedigest.ENGINE) != receipt.get("engineSourcesSha25
     stale.append("engine sources (src, binding, shader, assets, meson files)")
 if sha(archive) != receipt["rubyArchiveSha256"]:
     stale.append("Ruby archive (packed ruby/ is from a different build)")
+# The static archives the ELF linked must be the ones the managed prefixes hold now, and the TinySoundFont
+# headers likewise: a rebuilt or swapped dependency is a different executable.
+for name, prefix in (("sdl2Vitagl", sdl2_prefix), ("vitagl", vitagl_prefix), ("vitaDeps", deps_prefix)):
+    if treedigest.lib_digest((prefix / "lib").glob("*.a")) != receipt["dependencies"].get(name):
+        stale.append("dependency archives (%s)" % name)
+tsf_files = [tsf_prefix / "tsf.h", tsf_prefix / "tml.h"]
+tsf_now = treedigest.lib_digest(tsf_files) if all(p.is_file() for p in tsf_files) else None
+if tsf_now != receipt.get("tinysoundfont"):
+    stale.append("TinySoundFont headers")
 receipt["matchesPackagedTree"] = not stale
 output.write_text(json.dumps(receipt, sort_keys=True) + "\n")
 if stale:

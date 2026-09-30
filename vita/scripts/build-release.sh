@@ -2,15 +2,17 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # build-release.sh — stage the release under build/release/.
 #
-# Refuses a dirty tree. Reads vita/VERSION, runs the vitaGL build
+# Refuses a dirty tree. Re-executes itself under an environment allow-list
+# (PATH HOME TMPDIR VITASDK JOBS BASERUBY LANG): nothing else the caller has
+# exported reaches the build. Reads vita/VERSION, runs the vitaGL build
 # (vita/scripts/build-player.sh with VITA_GL_BACKEND=vitagl and MKXPZ_RELEASE=1,
-# the one path the packager lets pack MKXPZ0001; configure stamps the version
-# into the boot log line and the launcher header, the packager stamps
-# param.sfo APP_VER), verifies the product package, then stages:
+# the one path the packager lets pack MKXPZ0001, and only with the token this
+# script issues; configure stamps the version into the boot log line and the
+# launcher header, the packager stamps param.sfo APP_VER), verifies the product
+# package, then stages in a fresh directory beside build/release/ and swaps it
+# in only when everything, including the source archive, has passed:
 #   mkxp-z.vpk             the product launcher VPK (MKXPZ0001, unpinned, vitaGL:
 #                          shader_cache/ and licenses/, no module/ tree)
-#   mkxp-z.elf.unstripped  symbolisation copy for vita-parse-core; never
-#                          publish it
 #   eboot.bin              the packed executable, byte-identical to the VPK's
 #   manifest.json          SHA-256 of each artifact, git revision, dependency
 #                          patch-series hash, version, TITLE_ID, backend,
@@ -22,6 +24,8 @@
 #                          component list are recorded in manifest.json
 #   RELEASE-NOTES.md       generated from the vita/COMPATIBILITY.md rows,
 #                          < 120 lines
+# The unstripped ELF (symbolisation copy for vita-parse-core) is never staged
+# there: it is kept in build/release-private/ instead.
 # Staging only: this script publishes nothing, pushes nothing, tags nothing and
 # creates no branch. Licensing: GPL-3.0 combined work with GPL-3.0-or-later port
 # files (LICENSE, THIRD-PARTY.md, licenses/).
@@ -31,8 +35,28 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd -P)
 PKG="$ROOT/build/mkxp-z-vpk-release"
 RELEASE="$ROOT/build/release"
+PRIVATE="$ROOT/build/release-private"
 
 die() { echo "build-release: $*" >&2; exit 1; }
+
+# --- Environment allow-list --------------------------------------------------
+# The release is what a clean tree produces, never what the caller's last probe
+# left behind. Every build driver, the packager and the tools they run read
+# overrides from the environment (dependency prefixes, flags, package identity,
+# waivers), so the list of names to strip would never be complete: start over
+# from an allow-list instead. VITASDK, JOBS and BASERUBY select the toolchain,
+# not the package identity.
+if [[ ${1:-} != --clean-env ]]; then
+  [[ $# == 0 ]] || die "usage: $0 (no arguments)"
+  keep=()
+  for name in PATH HOME TMPDIR VITASDK JOBS BASERUBY LANG; do
+    [[ -z ${!name+x} ]] || keep+=("$name=${!name}")
+  done
+  dropped=$(env | cut -d= -f1 | /usr/bin/grep -E '^(ALLOW_|APP_VER$|ATTRIBUTE2$|BUILD|CC$|CXX$|CFLAGS$|CXXFLAGS$|CPPFLAGS$|LDFLAGS$|CONFIGURE_PREFIX$|DEPS_|EXTRA_|FONTS_|LIBERATION_|MKXP|MRI_|OUT_DIR$|PKG_CONFIG|REQUIRE_|RUBY_|SDL2_|TITLE|TSF_|VITA|VPK_)' | tr '\n' ' ' || true)
+  [[ -z $dropped ]] || echo "build-release: ignoring inherited build overrides: ${dropped% }"
+  exec env -i ${keep[@]+"${keep[@]}"} "$BASH" "$0" --clean-env
+fi
+shift
 
 # --- Refusals, before anything is built or wiped ----------------------------
 # rev-parse, not a -d .git test: a worktree's .git is a file.
@@ -54,6 +78,22 @@ VPK="$PKG/mkxp-z.vpk"
 UNSTRIPPED="$PKG/mkxp-z.elf.unstripped"
 EBOOT="$PKG/eboot.bin"
 
+# Everything is staged in a fresh sibling of build/release/ and swapped in at the end; a failure anywhere leaves
+# the previous build/release/ exactly as it was. The token lets the build drivers accept MKXPZ_RELEASE=1.
+mkdir -p "$ROOT/build"
+STAGE=$(mktemp -d "$ROOT/build/.release-staging.XXXXXX")
+chmod 755 "$STAGE"
+OLD=""
+TOKEN_FILE="$ROOT/build/.release-token"
+cleanup() {
+  rm -f "$TOKEN_FILE"
+  case "$STAGE" in "$ROOT"/build/.release-staging.*) rm -rf "$STAGE" ;; esac
+  case "$OLD" in "$ROOT"/build/.release-staging.*) rm -rf "$OLD" ;; esac
+}
+trap cleanup EXIT
+release_token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+(umask 077; printf '%s\n' "$release_token" > "$TOKEN_FILE")
+
 # Freshness witness: what each artifact's mtime was before the build, so the
 # verifier can refuse one a failed or skipped packager left stale.
 artifact_stamp() {
@@ -63,31 +103,21 @@ vpk_before=$(artifact_stamp "$VPK")
 elf_before=$(artifact_stamp "$UNSTRIPPED")
 eboot_before=$(artifact_stamp "$EBOOT")
 
-# The release is what a clean tree produces, never what the caller's last
-# probe left behind: strip every override the build drivers and the packager
-# read (vita/scripts/package-vpk.sh carries the list) from the inherited
-# environment. VITASDK, JOBS and BASERUBY stay — they select the toolchain,
-# not the package identity. MKXPZ_OPTIONAL_SHADERS (what configure builds)
-# shapes the ELF and the shader check, so it goes too. The release is vitaGL under the product id.
-echo "==> vitaGL release build (vita/scripts/build-player.sh, packaging overrides stripped)"
-env -u ALLOW_MISSING_FONTS -u ALLOW_MISSING_SHADERS -u ALLOW_PINNED_PRODUCT_ID \
-    -u ALLOW_STALE_ELF -u ALLOW_STUB -u APP_VER -u ATTRIBUTE2 -u BUILD_DIR \
-    -u EXTRA_VPK_ADD -u FONTS_PREFIX -u MKXP_JSON -u MKXPZ_ELF -u MKXPZ_OPTIONAL_SHADERS -u OUT_DIR \
-    -u REQUIRE_BUILD_RECEIPT -u RUBY_PREFIX -u TITLE -u TITLE_ID \
-    -u VITAGL_SHADERS_DIR -u VITAGL_TITLE_ID -u VPK_NAME \
-    VITA_GL_BACKEND=vitagl MKXPZ_RELEASE=1 \
-    "$ROOT/vita/scripts/build-player.sh"
+# The release is vitaGL under the product id.
+echo "==> vitaGL release build (vita/scripts/build-player.sh, allow-listed environment)"
+MKXPZ_RELEASE_TOKEN="$release_token" VITA_GL_BACKEND=vitagl MKXPZ_RELEASE=1 \
+  "$ROOT/vita/scripts/build-player.sh"
 
 for artifact in "$VPK" "$UNSTRIPPED" "$EBOOT"; do
   [[ -f $artifact ]] || die "build did not produce $artifact"
 done
 
 # --- Verify the product package, then stage everything in one pass ----------
-# Nothing is written until every check has passed: a refused release must not
-# leave a half-staged build/release/ behind.
+# Everything is written into $STAGE, never into build/release/: a refused release
+# must not leave a half-staged build/release/ behind.
 echo "==> verifying the product package"
 git_revision=$(git -C "$ROOT" rev-parse HEAD)
-python3 - "$ROOT" "$VPK" "$UNSTRIPPED" "$EBOOT" "$RELEASE" "$VERSION" "$APP_VER" "$git_revision" \
+python3 - "$ROOT" "$VPK" "$UNSTRIPPED" "$EBOOT" "$STAGE" "$VERSION" "$APP_VER" "$git_revision" \
     "$vpk_before" "$elf_before" "$eboot_before" <<'STAGE' || die "release verification failed; nothing staged"
 import hashlib
 import json
@@ -118,18 +148,21 @@ def die(message):
 def sfo_entries(blob):
     """Entries from a param.sfo: structural read, no SDK tool. String values
     (0x204) and integer values (0x0404, e.g. ATTRIBUTE2) are decoded."""
-    magic, sfo_version, keys, values, count = struct.unpack_from("<4sIIII", blob)
-    if magic != b"\0PSF" or sfo_version != 0x101 or not 20 + count * 16 <= keys <= values <= len(blob):
-        die("bad param.sfo inside the VPK")
-    found = {}
-    for index in range(count):
-        keyoff, fmt, length, capacity, valueoff = struct.unpack_from("<HHIII", blob, 20 + index * 16)
-        end = blob.index(b"\0", keys + keyoff, values)
-        name = blob[keys + keyoff:end].decode("ascii", "replace")
-        if fmt == 0x204:
-            found[name] = blob[values + valueoff:values + valueoff + length].rstrip(b"\0").decode("ascii", "replace")
-        elif fmt == 0x0404:
-            found[name] = struct.unpack_from("<i", blob, values + valueoff)[0]
+    try:
+        magic, sfo_version, keys, values, count = struct.unpack_from("<4sIIII", blob)
+        if magic != b"\0PSF" or sfo_version != 0x101 or not 20 + count * 16 <= keys <= values <= len(blob):
+            die("bad param.sfo inside the VPK")
+        found = {}
+        for index in range(count):
+            keyoff, fmt, length, capacity, valueoff = struct.unpack_from("<HHIII", blob, 20 + index * 16)
+            end = blob.index(b"\0", keys + keyoff, values)
+            name = blob[keys + keyoff:end].decode("ascii", "replace")
+            if fmt == 0x204:
+                found[name] = blob[values + valueoff:values + valueoff + length].rstrip(b"\0").decode("ascii", "replace")
+            elif fmt == 0x0404:
+                found[name] = struct.unpack_from("<i", blob, values + valueoff)[0]
+    except (ValueError, struct.error):
+        die("truncated or corrupt param.sfo inside the VPK")
     return found
 
 
@@ -169,6 +202,11 @@ with zipfile.ZipFile(vpk_path) as archive:
     if receipt.get("optionalShaders") is not False:
         die("the ELF was built with optional shaders (%r); the shipped GXP set covers the boot programs only"
             % receipt.get("optionalShaders"))
+    if receipt.get("mesonBuildtype") != "release" or receipt.get("lto") is not False:
+        die("the ELF was built as buildtype %r, lto %r; the release is buildtype release without LTO"
+            % (receipt.get("mesonBuildtype"), receipt.get("lto")))
+    if not receipt.get("tinysoundfont") or sorted(receipt.get("dependencies") or {}) != ["sdl2Vitagl", "vitaDeps", "vitagl"]:
+        die("the ELF's build receipt lacks its dependency or TinySoundFont digests")
     tracked_shaders = {path.relative_to(root / "vita/vitagl-shaders").as_posix(): path
                        for path in (root / "vita/vitagl-shaders").rglob("*.gxp")}
     packed_shaders = {name[len("shader_cache/"):] for name in names
@@ -223,10 +261,8 @@ for path in series:
     digest.update(str(path.relative_to(root)).encode() + b"\0" + path.read_bytes() + b"\0")
 
 release = Path(release)
-release.mkdir(parents=True, exist_ok=True)
 staged = {}
-for source, name in ((vpk_path, "mkxp-z.vpk"), (elf_path, "mkxp-z.elf.unstripped"),
-                     (eboot_path, "eboot.bin")):
+for source, name in ((vpk_path, "mkxp-z.vpk"), (eboot_path, "eboot.bin")):
     target = release / name
     target.write_bytes(Path(source).read_bytes())
     staged[name] = sha(target)
@@ -236,6 +272,9 @@ source_archive = json.loads(subprocess.run(
     [sys.executable, "-B", str(root / "vita/scripts/source-archive.py"), str(root),
      str(release / ("mkxp-z-source-%s.tar.xz" % version))],
     check=True, capture_output=True, text=True).stdout)
+# Every linked GPL/LGPL component of THIRD-PARTY.md must be in the archive that was just written.
+subprocess.run([sys.executable, "-B", str(root / "vita/scripts/check-corresponding-source.py"), str(root),
+                str(release / source_archive["file"])], check=True)
 manifest = {
     "schemaVersion": 1,
     "version": version,
@@ -256,7 +295,7 @@ STAGE
 
 # --- Release notes: generated, never hand-edited in build/ ------------------
 echo "==> generating RELEASE-NOTES.md"
-python3 - "$ROOT" "$RELEASE/RELEASE-NOTES.md" "$VERSION" "$git_revision" <<'NOTES'
+python3 - "$ROOT" "$STAGE/RELEASE-NOTES.md" "$VERSION" "$git_revision" <<'NOTES'
 import re
 import sys
 from pathlib import Path
@@ -324,6 +363,21 @@ out.write_text("\n".join(lines) + "\n", encoding="utf-8")
 print("==> %s (%d lines)" % (out, len(lines)))
 NOTES
 
+# --- Publish: swap the finished staging directory in --------------------------
+# Nothing above touched build/release/. The previous one is renamed aside and put back if the swap fails, so
+# it is never left half-replaced; stale files from an older release cannot survive the swap.
+mkdir -p "$PRIVATE"
+cp -f "$UNSTRIPPED" "$PRIVATE/mkxp-z-$VERSION.elf.unstripped"
+if [[ -e $RELEASE ]]; then
+  OLD="$STAGE.old"
+  mv "$RELEASE" "$OLD"
+fi
+if ! mv "$STAGE" "$RELEASE"; then
+  [[ -z $OLD ]] || mv "$OLD" "$RELEASE"
+  die "could not move the staged release into place"
+fi
+STAGE=""
+
 echo
-echo "release $VERSION staged under build/release/"
+echo "release $VERSION staged under build/release/ (symbolisation ELF: build/release-private/)"
 ls -l "$RELEASE"
