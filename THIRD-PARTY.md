@@ -101,6 +101,9 @@ part of their bytes). `libshacccg.suprx` is Sony's and is neither shipped nor li
 | `VL-Gothic-Regular.ttf`, `VL-PGothic-Regular.ttf` (VLGothic-20230918, v2.2306) | VL Gothic licence: BSD-style, from M+ FONTS and Sazanami Gothic terms | `licenses/VL-Gothic.txt` (the Japanese originals `LICENSE` and `LICENSE_J.mplus`, their English versions, and `README.sazanami`) |
 | `LiberationSans-Regular.ttf` (Liberation 2.00.1, byte-equal to the file in the pinned tarball) | SIL OFL 1.1 | `licenses/OFL-1.1-Liberation.txt` (byte-equal to the `LICENSE` of `liberation-fonts-ttf-2.00.1.tar.gz`) |
 
+The same Liberation Sans 2.00.1 file (`assets/liberation.ttf`) is also compiled into `eboot.bin` as the
+engine's built-in fallback face; it falls under the same OFL 1.1 text.
+
 Upstream: https://vlgothic.dicey.org/ (mirror https://github.com/daisukesuzuki/VLGothic) and
 https://github.com/liberationfonts/liberation-fonts.
 

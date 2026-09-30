@@ -62,8 +62,9 @@ VPK carries the font licence texts under `app0:/licenses/` (`VL-Gothic.txt`,
 to the `LICENSE` of the Liberation 2.00.1 tarball.
 
 Liberation 2.00.1 declares OFL 1.1 in its own `name` table (id 13, with
-<https://scripts.sil.org/OFL> as id 14); the mkxp-z checkout carries no
-separate copy of the licence text, so the script fetches one.
+<https://scripts.sil.org/OFL> as id 14). The licence text is
+`licenses/OFL-1.1-Liberation.txt` in this tree, and the script downloads only
+VL Gothic; the Liberation file itself is staged from `assets/liberation.ttf`.
 
 ## Adding a font
 

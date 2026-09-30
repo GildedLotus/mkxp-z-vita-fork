@@ -18,7 +18,7 @@
  *
  * Why a mode at all, instead of two binaries: MRI cannot be torn down and
  * re-initialised inside one process, so "quit to the launcher" has to be a
- * process replacement. And a second eboot would double a 45 MB package.
+ * process replacement. And a second eboot would double a 12.6 MB package.
  *
  * ---- the crash breadcrumb --------------------------------------------------
  *

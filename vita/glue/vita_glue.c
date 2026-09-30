@@ -1768,7 +1768,7 @@ int vita_glue_init_log(const char *log_path)
 	if (texture_trace_enabled)
 		vita_glue_trace("vita-texture: enabled; process clock in seconds; limit=2048");
 	if (gpu_telemetry_enabled)
-		vita_glue_trace("vita-gpu: telemetry enabled; per-scene counters + headroom canary + frame instrumentation");
+		vita_glue_trace("vita-gpu: telemetry enabled; per-scene counters + frame instrumentation");
 	if (vita_glue_frame_profile_interval)
 		glue_logf("vita-frame: enabled; interval=%u min_period_ms=1000 gc=reserved", vita_glue_frame_profile_interval);
 	if (gpu_seal_abort_enabled)
