@@ -35,7 +35,7 @@ text the entry says so under "Known gaps".
   (the section allows a later GPL version).
 - **Ruby 3.1.3**: Ruby licence *or* BSD-2-Clause. We elect **BSD-2-Clause** (`licenses/Ruby-BSD-2-Clause.txt`;
   `licenses/Ruby-LEGAL.txt` lists the notices of the parts bundled inside Ruby).
-- **mkxp-z**: GPL-2.0-or-later per its README, used under GPL-3.0. Its `assets/LICENSE.mkxp-z-with-https.txt`
+- **mkxp-z**: GPL-2.0-or-later per the upstream README (text in `COPYING`), used under GPL-3.0. Its `assets/LICENSE.mkxp-z-with-https.txt`
   is a GPL-3 notice for the HTTPS build; this build links no OpenSSL.
 - **stb_image, stb_vorbis, stb_dxt** (MIT or public domain), **dr_flac, dr_mp3** (public domain or MIT-0), **miniz**
   (public domain): used under their most permissive alternative; both texts ship.
