@@ -358,9 +358,12 @@ recovery, so a corrupt active file selects a valid `.bak`, and the write path
 never starts from the corrupt one. Publication follows the `vita_publish`
 commit order: only a valid active file moves to `.bak`, then the finished
 `.tmp` is renamed onto the free name. An invalid active file is quarantined as
-`settings.json.corrupt[.N]` and never replaces a good backup; the accepted
-cost is that newlib's non-atomic rename can drop the backup itself, never the
-active file.
+`settings.json.corrupt` (a second damaged file replaces `settings.json.corrupt.1`,
+so two copies at most) and never replaces a good backup. A write whose bytes
+the reader would refuse (over 64 KiB, or not a JSON object) is checked after the
+sync and raises `IOError` before anything is rotated, so a large `CFG[]=` value
+leaves the last valid settings active. The accepted cost is that newlib's
+non-atomic rename can drop the backup itself, never the active file.
 `settings.json.bak.keep` and `settings.json.bak.legacy*` files left by earlier
 builds are inert: nothing reads, writes or cleans them.
 

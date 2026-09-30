@@ -10,6 +10,9 @@ module VitaPreloads
     entry = entry.tr('\\', '/')
     if entry.match?(/\A[A-Za-z][A-Za-z0-9]*:\//)
       root, tail = entry.split(':/', 2)
+      unless %w[app0 ux0 uma0].include?(root)
+        raise ArgumentError, 'preloads need a game-relative or app0:/, ux0:/ or uma0:/ path'
+      end
       parts = []
       tail.split('/').each do |part|
         next if part.empty? || part == '.'

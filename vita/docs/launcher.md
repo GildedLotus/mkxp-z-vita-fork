@@ -164,9 +164,20 @@ The format is:
 mkxp-z-last-error v1
 kind: <script-error|init-error|stuck|unclean-exit|bad-argument>
 title: <one line>
+bytes: <ten digits>
 ---
 <text, any length>
 ```
+
+`bytes:` is the exact length of the text after the separator, zero-padded to a
+fixed width so the shutdown watchdog can extend a copy of a whole report and
+patch the length in place. The launcher shows a report only when the text is
+exactly that long; a torn or damaged file is not a report. A report from before
+the field existed carries none and is still read when its envelope is whole.
+The writer applies the same rule before it rotates: a whole active report moves
+to `last-error.txt.bak`, a damaged one to `last-error.txt.corrupt`, so damage
+can never displace a valid backup, and a retained `.tmp` is published only when
+it declares and matches its length.
 
 `script-error`, `init-error` and `stuck` are `src/vita_fatal.h`'s.
 `unclean-exit` (a breadcrumb was found) and `bad-argument` (a rejected `--game`,
