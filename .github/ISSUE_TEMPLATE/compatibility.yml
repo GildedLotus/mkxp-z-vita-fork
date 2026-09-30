@@ -49,7 +49,7 @@ body:
       description: Which RTP folders exist under ux0:/data/mkxp-z/rtp/?
       multiple: true
       options:
-        - None
+        - No RTP installed
         - XP
         - VX
         - VXAce
