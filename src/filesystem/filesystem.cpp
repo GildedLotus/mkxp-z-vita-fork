@@ -585,6 +585,13 @@ struct CacheEnumData {
   // PhysFS is C without unwind tables on the Vita: an exception must never
   // cross its frames. A callback parks it here and the C++ caller rethrows.
   std::exception_ptr error;
+  // The published cache lives for the session, so a huge loose
+  // tree gives up on it (uncached lookup still works) instead of growing it
+  // without bound. Bytes are an estimate: both path spellings, the listed
+  // name and a fixed per-entry overhead for the hash and vector nodes.
+  static constexpr size_t cacheEntryLimit = 65536;
+  static constexpr size_t cacheByteLimit = 16u * 1024u * 1024u;
+  size_t cacheEntries = 0, cacheBytes = 0;
 #ifdef __vita__
   struct Entry { std::string directory, name; int type; };
   // One bounded continuation stack replaces recursive native directory handles.
@@ -729,6 +736,13 @@ static PHYSFS_EnumerateCallbackResult cacheEnumCB(void *d, const char *origdir,
 
     std::string lowerFilename(fname);
     strTolower(lowerFilename);
+    data.cacheBytes += 2 * mixedCase.size() + lowerFilename.size() + 96;
+    if (++data.cacheEntries > CacheEnumData::cacheEntryLimit ||
+        data.cacheBytes > CacheEnumData::cacheByteLimit) {
+      Debug() << "Path cache over budget (" << data.cacheEntries << " entries, about "
+              << data.cacheBytes << " bytes).";
+      return PHYSFS_ENUM_ERROR;
+    }
     list.push_back(lowerFilename);
 
     /* Add the lower -> mixed mapping of the file's full path */
@@ -818,13 +832,20 @@ void FileSystem::createPathCache() {
   CacheEnumData data(&pending);
   data.io = &io;
   data.fileLists.push(&pending.fileLists[""]);
+  int result = 0;
+  try {
 #ifdef __vita__
-  const int result = walkCacheNative(data);
+    result = walkCacheNative(data);
 #else
-  const int result = PHYSFS_enumerate("", cacheEnumCB, &data);
+    result = PHYSFS_enumerate("", cacheEnumCB, &data);
 #endif
-  if (data.error)
-    std::rethrow_exception(data.error);
+    if (data.error)
+      std::rethrow_exception(data.error);
+  } catch (const std::bad_alloc &) {
+    // The cache is an optimisation: give its memory back and look up uncached.
+    Debug() << "Path cache out of memory.";
+    result = 0;
+  }
   if (!result) {
     Debug() << "Path cache failed; using uncached lookup.";
     return;

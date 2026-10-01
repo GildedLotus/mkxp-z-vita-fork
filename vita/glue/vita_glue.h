@@ -11,7 +11,8 @@
  *   2. boot clocks 444/222/222/166; log requested + applied
  *   3. log sceKernelGetFreeMemorySize (user/cdram/phycont) and the newlib
  *      heap's own occupancy (vita_glue_log_heap)
- *   4. point vitaGL at the shipped shader cache (app0:/shader_cache).
+ *   4. point vitaGL at a writable shader cache root per shipped GXP set and
+ *      at the shipped cache (app0:/shader_cache).
  *
  * Link notes:
  *   - vita_glue.c defines `sceLibcHeapSize`, `sceUserMainThreadStackSize`
@@ -111,16 +112,17 @@ extern "C" {
  * Newlib heap: the engine's heap (see above). VitaSDK's default when
  * _newlib_heap_size_user is left undefined is 0x8000000 — the weak symbol's
  * address is tested, not its value, so an absent definition silently selects
- * 128 MiB. Pinned here at that same value so the number the engine actually
- * runs on is a repo fact that boot logs, not a toolchain default that a
- * VitaSDK bump can move under us. Raising it is a separate decision and
- * needs vita_glue_log_heap() data first: this heap is taken before main, so
- * a size the kernel refuses leaves every malloc failing with no log of why
- * (vita-heap: arena=0 at boot is that failure).
+ * 128 MiB. Pinned here so the number the engine actually runs on is a repo
+ * fact that boot logs, not a toolchain default that a VitaSDK bump can move
+ * under us. 160 MiB: the vitaGL RAM pool shrank by 40 MiB
+ * (96 -> 56) and this heap takes 32 of it, keeping 8 MiB of margin (device
+ * measurement: about 89 MiB of user memory stayed free at 128 MiB). This heap is
+ * taken before main, so a size the kernel refuses leaves every malloc failing
+ * with no log of why (vita-heap: arena=0 at boot is that failure).
  *
  * Defined in vita_glue.c; consumers must not redefine it.
  */
-#define VITA_GLUE_NEWLIB_HEAP_BYTES (128u * 1024u * 1024u)
+#define VITA_GLUE_NEWLIB_HEAP_BYTES (160u * 1024u * 1024u)
 
 /* Main-thread stack headroom. Defined in vita_glue.c. */
 #define VITA_GLUE_MAIN_STACK_BYTES (1u * 1024u * 1024u)
@@ -318,6 +320,15 @@ void vita_glue_memory_ledger_log(const VitaMemoryResources *resources);
 #define VITA_GLUE_VGL_HINT_RAM     "SDL_VITA_VGL_RAM_POOL"
 #define VITA_GLUE_VGL_HINT_CDRAM   "SDL_VITA_VGL_CDRAM_POOL"
 #define VITA_GLUE_VGL_HINT_PHYCONT "SDL_VITA_VGL_PHYCONT_POOL"
+/* Defaults from device measurements (vita/docs/config.md "vitaGL pool
+ * sizes"): vglInit fixes 36.6 MiB of RAM, CDRAM peaked at 36.7 MiB. The
+ * launcher draws one textured quad, so it asks for less. */
+#define VITA_GLUE_VGL_RAM_MIB              56u
+#define VITA_GLUE_VGL_CDRAM_MIB            64u
+#define VITA_GLUE_VGL_PHYCONT_MIB          4u
+#define VITA_GLUE_VGL_LAUNCHER_RAM_MIB     40u
+#define VITA_GLUE_VGL_LAUNCHER_CDRAM_MIB   24u
+#define VITA_GLUE_VGL_LAUNCHER_PHYCONT_MIB 4u
 typedef struct VitaVglPools {
 	unsigned ram, cdram, phycont; /* bytes */
 } VitaVglPools;
@@ -325,8 +336,13 @@ unsigned vita_glue_vgl_pool_bytes(const char *name, int request_mib, unsigned de
                                   unsigned min_mib, unsigned max_mib,
                                   unsigned long long free_bytes);
 void vita_glue_vgl_pools(int ram_mib, int cdram_mib, int phycont_mib, VitaVglPools *out);
-/* One "vita-vgl-pool:" line per call when the memory ledger is enabled. */
+/* One "vita-vgl-pool:" line per call when the memory ledger is enabled; it ends
+ * with the circular vertex pool watermark (vitagl-0012). */
 void vita_glue_vgl_pool_ledger(const char *tag);
+/* gl_init split: end=0 just before SDL_CreateWindow (which runs vglInit and
+ * allocates the pools), end=1 just after; the second call always logs
+ * "vita-boot: vgl_init tag=<tag> window_us=<n>" and the pool totals. */
+void vita_glue_vgl_init_timing(const char *tag, int end);
 
 /* Opt-in: make a GPU-budget seal violation abort the process.
  *
@@ -437,6 +453,11 @@ int vita_glue_texture_scope_active(void);
  * marker requests an intentional diagnostic core before cleanup; abort is
  * allowed only after the marker is successfully removed. */
 #define VITA_GLUE_FBO_FAILURE_DUMP_MARKER "ux0:/data/mkxp-z/fbo-failure-dump.enabled"
+
+/* System.vita_kernel_object_headroom briefly takes every kernel semaphore it
+ * can (up to 512), so the engine registers it only when this marker exists at
+ * launch. Diagnostics test respond_to? first. */
+#define VITA_GLUE_KERNEL_PROBE_MARKER "ux0:/data/mkxp-z/kernel-object-probe.enabled"
 int vita_glue_fbo_failure_probe_begin(void);
 void vita_glue_fbo_failure_probe(int width, int height);
 

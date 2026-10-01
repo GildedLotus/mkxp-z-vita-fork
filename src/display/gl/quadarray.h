@@ -102,8 +102,9 @@ inline void replaceTileQuadBuffer(VBO::ID &current,
 		current = VBO::ID(0);
 		return;
 	}
-	if (gl.GetError() != GL_NO_ERROR)
-		throw Exception(Exception::MKXPError, "Tilemap: GL error before VBO allocation");
+	/* A pending error belongs to an earlier, unrelated call (vitaGL keeps one
+	 * sticky flag); log and drain it so only this allocation's own fail. */
+	TEX::drainStaleErrors("tilemap-vbo");
 	const VBO::ID fresh = VBO::gen();
 	try
 	{

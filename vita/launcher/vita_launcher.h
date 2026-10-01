@@ -12,8 +12,10 @@
  * so it must not invent a second boot sequence):
  *
  *   1. vita_glue_boot(log_path, NULL)            — log, clocks, shader cache path
- *   2. SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1")
- *   3. SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER)
+ *   2. SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER)
+ *
+ * (src/main.cpp sets SDL_HINT_OPENGL_ES_DRIVER only off-Vita: SDL's Vita
+ * backend never reads it.)
  *
  * What this file then owns: TTF_Init, one window, one GL context, the GL set
  * of launcher_gl.c, the canvas of launcher_view.c, joystick 0, and the
@@ -21,10 +23,10 @@
  *
  * The GPU budget is the reason the structure looks the way it does. The
  * launcher is not a separate program that exits before the game starts: it
- * IS the game's process, re-executed. Every GL object alive when
- * sceAppMgrLoadExec is called is a firmware sync object the player may not
- * get back, so the launcher holds one texture, one VBO
- * and one program, and releases all three before the call. That claim was
+ * IS the game's process, re-executed. On an earlier GL driver every GL
+ * object alive when sceAppMgrLoadExec was called was a firmware sync object
+ * the player might not get back. The launcher still holds one texture, one
+ * VBO and one program, and releases all three before the call; that was
  * measured on hardware.
  *
  * C99 + SDL2 + SDL2_ttf + the launcher core library. No mkxp-z headers, no

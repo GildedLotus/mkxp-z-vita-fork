@@ -37,7 +37,7 @@
 #     0x81000000 and the loader then placed RW at ALIGN_1MB(RX_end) instead
 #     of the linked address, so absolute .bss symbols (_newlib_heap_*)
 #     pointed into unmapped space. -na keeps RX at the preferred address; the
-#     custom linker script (vita/linker/armvita-1mb-data.ld) places RW at ALIGN_1MB(RX_end) so
+#     custom linker script (vita/linker/armvita-1mb-data.ld) places RW at ALIGN_1MB(RX_end + SCE data) so
 #     either loader policy matches.
 #
 # Host-only. Does not deploy or boot: copy the VPK to the device and install it
@@ -606,7 +606,13 @@ echo "==> arm-vita-eabi-strip -g"
 arm-vita-eabi-strip -g --remove-section=.mkxpz.build_receipt "$OUT/mkxp-z.elf"
 
 echo "==> vita-elf-create"
-vita-elf-create "$OUT/mkxp-z.elf" "$OUT/mkxp-z.velf"
+if ! vita-elf-create "$OUT/mkxp-z.elf" "$OUT/mkxp-z.velf"; then
+	echo "error: vita-elf-create failed; an SCE-data overlap means __mkxpz_sce_reserve in vita/linker/armvita-1mb-data.ld is too small" >&2
+	exit 1
+fi
+# RW placement and SCE-data reserve margin.
+python3 "$ROOT/vita/scripts/check-sce-headroom.py" "$OUT/mkxp-z.elf" "$OUT/mkxp-z.velf" \
+	"$ROOT/vita/linker/armvita-1mb-data.ld"
 
 echo "==> vita-make-fself (unsafe + -na disable ASLR; needed to write ux0:data)"
 vita-make-fself -na "$OUT/mkxp-z.velf" "$OUT/eboot.bin"

@@ -22,7 +22,7 @@ ux0:/data/mkxp-z/mkxp-z/mkxp.json    user config under customDataPath
 All of them are JSON5 (comments and trailing commas are legal) and are parsed
 as UTF-8. A `_comment` key is tolerated everywhere: it lands in the merged
 object, is never read by the engine, and reaches Ruby as part of
-`System::CONFIG`.
+`CFG.to_hash` (the Ruby surfaces are `CFG[]`, `CFG[]=`, `CFG.to_hash` and `ARGV`).
 
 The engine's config reader limits each file to **64 KiB (65,536 bytes)**,
 including any UTF-8 BOM, comments and whitespace, and **32 nested objects or arrays**, counting the
@@ -30,7 +30,12 @@ root object as level 1. The reader checks bytes before appending them and
 the parser checks depth before descending. A file exceeding either limit
 is logged with `Failed to parse <path>` and the limit error, then ignored;
 the other layers retain their usual precedence. These limits also apply to
-the root and custom-data configs when layers are off.
+the root and custom-data configs when layers are off. **That is not the whole
+story for a game's own files:** the mandatory preload wrapper
+(`vita/mkxp-z-vpk/preload/game_preloads.rb`, see Compatibility preloads)
+re-reads `<game>/mkxp.json` and `<game>/mkxp-vita.json` without these limits
+and raises on malformed JSON or a value that is not an object, which stops the
+game before its scripts run.
 
 ## Load order
 
@@ -106,9 +111,15 @@ dataPathApp         iconPath                preferMetalRenderer   dumpAtlas
 A game that genuinely has something to say about one of them says it in
 `<game>/mkxp-vita.json` (layer 5), from which only `gameFolder`, `maxTextureSize` and
 `enableHires` are removed (they size window bases and GL surfaces).
-Everything else a game ships — `RTP`, `customScript`, `preloadScript`,
-`patches`, `fontSub`, `windowTitle`, `SESourceCount` … — is honoured from
-layer 4 as-is.
+`enableHires` set by any remaining layer is logged
+(`vita-config: enableHires is not supported on this platform; ignored`) and
+forced off: the software Bitmap backend cannot build a high-resolution Bitmap.
+Everything else a game ships — `RTP`, `preloadScript`, `patches`, `fontSub`,
+`windowTitle`, `SESourceCount` … — is honoured from layer 4 as-is, except where
+a higher layer sets the same key. In launcher (product) builds the root
+`app0:/mkxp.json` sets `customScript: ""` and `rgssVersion: 0` and is layer 6,
+above the game's files, so a game's own `customScript` and `rgssVersion` are
+overridden there (`Game.ini` still decides the RGSS version).
 
 ## Compatibility preloads
 
@@ -212,8 +223,11 @@ discards the entire file with a single `Debug` line. Config files on this
 device are UTF-8 by construction, so the reader strips a UTF-8 byte-order mark
 — the one thing json5pp cannot parse — and hands the bytes over unchanged.
 
-A file that is missing, unreadable, unparsable, or that parses to something
-that is not an object, contributes nothing and does not stop the boot.
+For the native reader, a file that is missing, unreadable, unparsable, or that
+parses to something that is not an object contributes nothing and does not stop
+the boot. A game's own `mkxp.json` and `mkxp-vita.json` are the exception: the
+preload wrapper reads them again and raises on malformed JSON or a non-object
+(Compatibility preloads), so a broken one stops the game before its scripts run.
 
 ## What the log says
 
@@ -237,6 +251,18 @@ Always emitted. `integer=` is `integerScalingActive`/`integerScalingLastMile`.
 `frameSkip=0 fixedFramerate=0` is the device default; see **Frame pacing**
 below for what the two of them do.
 
+A game boot also logs where `System.data_directory` points, and, when the
+shared folder holds files that are neither bindings nor the settings file,
+a pointer at saves written by 1.0.1 and earlier:
+
+```
+vita-config: data directory='ux0:/data/mkxp-z/games/Blank Dream'
+vita-config: legacy shared data in 'ux0:/data/mkxp-z/mkxp-z' (first: 'Game.rxdata'); move a game's files into its own folder
+```
+
+Nothing is moved, copied or deleted; see the saves note under *Keys that
+matter on this device*.
+
 ## `--game`
 
 ```
@@ -256,7 +282,7 @@ decoration: the string crosses a process boundary and then reaches `chdir` and
 `fopen`.
 
 `--game` and its value are stripped out of `launchArgs`, so a game script never
-sees the launcher's own flag in `System.launch_args`.
+sees the launcher's own flag in `ARGV`.
 
 The player deliberately does **not** link the launcher core library for this:
 ten lines are not worth a build dependency from the engine onto the launcher.
@@ -280,7 +306,9 @@ sceAppMgrLoadExec("app0:/eboot.bin",
 stripped from `launchArgs` with it. The value is a basename, not a path:
 nonempty, at most 255 bytes, no control byte and no `/` or `\`, because
 `readGameINI()` opens `execName + ".ini"` and SharedState opens
-`execName + <archive ext>` inside the game folder. An unusable name is never
+`execName + <archive ext>` inside the game folder. The launcher is stricter
+than the engine: it lists only games whose executable name is at most 127 bytes, so a
+longer one never reaches this flag from the list. An unusable name is never
 half-applied: the flag is ignored and the layers' `execName` stands.
 
 It merges as part of layer 7, above the game's own `mkxp.json` — the name
@@ -307,6 +335,11 @@ Integer 1× centred instead of the smooth stretch:
   "integerScalingActive": true
 }
 ```
+
+The integer-scale surface is reserved at boot only when the config enables
+integer scaling. Without it, a game script's `Graphics.integer_scaling = true`
+is refused: the attribute stays `false` and the log says once
+`vita-gpu: integer scaling needs integerScaling in config at boot`.
 
 Show the frame counter and keep the log quiet:
 
@@ -340,7 +373,8 @@ ordinary files to the player: nothing reads, consumes or cleans them.
 about.** Every save call shape gives the same result as on plain MRI 3.1.3.
 
 The engine's own files are ours and keep one generation: the settings file at
-`userConfPath` (written to `.tmp`, flushed, synced and closed before the rename
+`userConfPath` (`<customDataPath>/mkxp.json`, normally
+`ux0:/data/mkxp-z/mkxp-z/mkxp.json`; written to `.tmp`, flushed, synced and closed before the rename
 publishes it, recovered at binding initialization by
 `vita/mkxp-z-vpk/preload/settings_file.rb`) and the fatal report (`.bak` until
 the launcher consumes it). Those are regenerable-by-us bookkeeping, not a
@@ -354,15 +388,15 @@ recovery, so a corrupt active file selects a valid `.bak`, and the write path
 never starts from the corrupt one. Publication follows the `vita_publish`
 commit order: only a valid active file moves to `.bak`, then the finished
 `.tmp` is renamed onto the free name. An invalid active file is quarantined as
-`settings.json.corrupt`; the next damaged file is kept as `settings.json.corrupt.1`
+`mkxp.json.corrupt`; the next damaged file is kept as `mkxp.json.corrupt.1`
 and every later one replaces that second slot, so a fresh install holds two
 copies at most. It never replaces a good backup. A write whose bytes the reader would refuse (over 64 KiB,
 or not a JSON object) is checked after the sync and raises `IOError` before
 anything is rotated, so a large `CFG[]=` value leaves the last valid settings
 active. The accepted cost is that newlib's
 non-atomic rename can drop the backup itself, never the active file.
-Files named `settings.json.bak.keep` or `settings.json.bak.legacy*` are ordinary
-files: nothing reads, writes or cleans them.
+Files named `mkxp.json.bak.keep` or `mkxp.json.bak.legacy*` beside the settings
+file are ordinary files: nothing reads, writes or cleans them.
 
 The player deliberately does not intercept a game's own writes: an interception
 layer can lose saves (case aliases, garbage-collected writers, recovery
@@ -382,7 +416,9 @@ responsive. The menu uses the boot-reserved overlay, without another window.
 Up/Down chooses a row, Left/Right one of four slots, Cross captures a binding,
 Triangle clears it, Circle cancels, and Start accepts. Scroll down for Reset
 defaults, Cancel and Accept. Capture waits for release, then uses the configured
-stick deadzone. Circle cancels capture; Start and Select cannot be bound.
+stick deadzone for direction rows and triggers and the action gate (see
+Handheld controller defaults) for stick input on other rows. Circle cancels
+capture; Start and Select cannot be bound.
 Mapped RGSS navigation works alongside raw d-pad and face buttons, so even an
 empty binding set can reach Reset defaults and Accept. Duplicate actions show a
 warning. Cancel discards the draft; Reset defaults takes effect only on Accept.
@@ -436,15 +472,15 @@ not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 | `frameSkip` | bool | `false` | — |
 | `syncToRefreshrate` | bool | `false` | — |
 | `solidFonts` | array of string | `[]` | — |
-| `preferMetalRenderer` | bool | `false` | — |
+| `preferMetalRenderer` † | bool | `false` | — |
 | `subImageFix` | bool | `false` | — |
 | `enableBlitting` | bool | `true` | — |
 | `integerScalingActive` | bool | `false` | `false` |
 | `integerScalingLastMile` | bool | `true` | `false` |
 | `maxTextureSize` | int | `0` | — |
 | `gameFolder` | string | `""` | — |
-| `anyAltToggleFS` | bool | `false` | — |
-| `enableReset` | bool | `true` | — |
+| `anyAltToggleFS` † | bool | `false` | — |
+| `enableReset` † | bool | `true` | — |
 | `enableSettings` | bool | `true` | — |
 | `allowSymlinks` | bool | `true` | — |
 | `dataPathOrg` | string | `""` | `"mkxp-z"` |
@@ -452,8 +488,8 @@ not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 | `iconPath` | string | `""` | — |
 | `execName` | string | `"Game"` | — |
 | `midiSoundFont` | string | `""` | — |
-| `midiChorus` | bool | `false` | — |
-| `midiReverb` | bool | `false` | — |
+| `midiChorus` † | bool | `false` | — |
+| `midiReverb` † | bool | `false` | — |
 | `SESourceCount` | int | `6` | — |
 | `BGMTrackCount` | int | `1` | — |
 | `customScript` | string | `""` | — |
@@ -470,13 +506,13 @@ not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 | `fontHeightReporting` | int | `0` | — |
 | `fontOutlineCrop` | bool | `true` | — |
 | `rubyLoadpath` | array of string | `[]` | — |
-| `JITEnable` | bool | `false` | — |
-| `JITVerboseLevel` | int | `0` | — |
-| `JITMaxCache` | int | `100` | — |
-| `JITMinCalls` | int | `10000` | — |
-| `YJITEnable` | bool | `false` | — |
-| `dumpAtlas` | bool | `false` | — |
-| `bindingNames` | object of 8 strings | `a`…`r` → `"A"`…`"R"` | — |
+| `JITEnable` † | bool | `false` | — |
+| `JITVerboseLevel` † | int | `0` | — |
+| `JITMaxCache` † | int | `100` | — |
+| `JITMinCalls` † | int | `10000` | — |
+| `YJITEnable` † | bool | `false` | — |
+| `dumpAtlas` † | bool | `false` | — |
+| `bindingNames` † | object of 8 strings | `a`…`r` → `"A"`…`"R"` | — |
 | `vitaConfigLayers` | bool | `false` | — (set it in `app0:/mkxp.json`) |
 | `vitaAutoRTP` | bool | `true` | — |
 | `vitaTouchMouse` | bool | `true` | — |
@@ -484,16 +520,23 @@ not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 | `vitaGamesRoot` | string | — (not a ConfDef key; the launcher reads it from `app0:/mkxp.json` only) | — |
 | `vitaglRamPoolMiB` / `vitaglCdramPoolMiB` / `vitaglPhycontPoolMiB` | int | `0` | — (vitaGL builds only; see below) |
 
+† **No effect on this build.** The JIT keys: Ruby is built with
+`--disable-jit-support --disable-yjit`, so it only warns. `bindingNames`: the
+Vita binding menu has fixed labels; only the desktop settings window reads
+them. `midiChorus`, `midiReverb`: the TinySoundFont synth has neither effect.
+`preferMetalRenderer`, `dumpAtlas`: desktop-only. `anyAltToggleFS`,
+`enableReset`: only a keyboard can trigger what they gate (Alt+Enter, F12).
+
 `xbrzScalingFactor` exists only in an `MKXPZ_SSL` build and is not compiled
 here.
 
 ### Keys that matter on this device
 
-* **`fontSub` entries: two rules if you add one** (the built-in table
-  skips any family `fontSub` already defines, and an entry here
-  still WINS). (1) Both sides must be lower-case — the registry is keyed by
-  the lower-cased face name and every lookup lower-cases its request, so
-  `Arial>Liberation Sans` matches nothing on either side. (2) A substitution applies ONLY when nothing is registered under `From`,
+* **`fontSub` entries: one rule to know and one to follow** (the built-in
+  table skips any family `fontSub` already defines, and an entry here still
+  WINS). Case is handled for you: every entry is lower-cased before it is
+  registered, so `Arial>Liberation Sans` works the same as
+  `arial>liberation sans`. The rule to follow: a substitution applies ONLY when nothing is registered under `From`,
   so an installed family always wins, and a `To` that is itself unregistered
   is skipped rather than obeyed. Never list a family an RTP supplies:
   `VL Gothic>Liberation Sans` once hid the VX Ace RTP's own
@@ -508,27 +551,44 @@ here.
   resolution (`src/main.cpp` `SDL_CreateWindow`, `graphics.cpp` `winSize`).
   `960x544` is the panel. The RGSS screen size still comes from the RGSS
   version.
-* **`dataPathOrg`/`dataPathApp` must both be `"mkxp-z"`.**
-  `Encoding::convertString` fails for every encoding here, so `game.title`
-  always falls back to `"mkxp-z"`; with the stock defaults (`org` `"."`, `app`
-  = the title) `SDL_GetPrefPath` returns `ux0:/data/./mkxp-z/`, which
-  normalises onto `ux0:/data/mkxp-z/` — the directory holding the logs, the
-  marker files and `config.json` itself. Stock would then read
-  `ux0:/data/mkxp-z/mkxp.json` as its layer-8 user config, in the middle of the
-  layer stack's own data. Pinning both names puts bindings and user config in
-  `ux0:/data/mkxp-z/mkxp-z/` and keeps the two apart.
+* **`dataPathOrg`/`dataPathApp` must both be `"mkxp-z"`.** They give the key
+  bindings and the settings file (`CFG[]=`, `mkxp.json`) one shared place for
+  every game, `ux0:/data/mkxp-z/mkxp-z/`, apart from `ux0:/data/mkxp-z/`, which
+  holds the logs, the marker files and `config.json` itself. With the stock
+  defaults (`org` `"."`, `app` = the `Game.ini` title) `SDL_GetPrefPath` would
+  return a different folder per title outside `mkxp-z/`, and, for a game with
+  no usable title (the fallback title is `mkxp-z`), `ux0:/data/mkxp-z/` itself,
+  where stock would read `ux0:/data/mkxp-z/mkxp.json` as its layer-8 user config
+  in the middle of the layer stack's own data.
+* **Saves are per game, not under `customDataPath`.** `System.data_directory`
+  returns the running game's own folder (for example
+  `ux0:/data/mkxp-z/games/<Name>`), so a game that saves through it (Pokémon
+  Essentials writes `System.data_directory + "/Game.rxdata"`) keeps its saves
+  next to the game like stock games; with no game (the launcher) it returns
+  `customDataPath`. Key bindings and the `CFG[]=` settings file stay in
+  `ux0:/data/mkxp-z/mkxp-z/`. Up to 1.0.1 it returned that shared folder
+  for every game, so a save such a game wrote there
+  (`ux0:/data/mkxp-z/mkxp-z/Game.rxdata`) is not moved automatically, because
+  the player cannot tell which game owns it. The player logs `vita-config:
+  legacy shared data in '<dir>' (first: '<name>')`; move the file into the
+  game's own folder by hand.
 * **Bindings are a file, not a config key.** `loadBindings` reads
   `<customDataPath>/keybindings.mkxp<rgssVersion>` and only falls back to the
   built-in defaults when that file is absent — a stored file silently overrides
-  `bindingNames` and everything the defaults set. Delete it first when a
-  binding mystery survives a rebuild.
+  `bindingNames` and everything the defaults set. To reset it, open the
+  binding menu (Start), choose Reset defaults and Accept; or, with the game
+  closed, delete both the file **and** its `.bak`: the reader falls back to
+  the `.bak` when the file is missing or invalid, so deleting the file alone
+  restores the previous mapping.
 * **`smoothScaling` is an integer**: `0` Nearest, `1` Bilinear, `2` Bicubic,
   `3` Lanczos3, `4` xBRZ. **The release package offers only `0` and `1`.** It is
   built without the optional shaders (the Bicubic and Lanczos3 programs), and
   xBRZ exists only in a build with HTTPS support (`MKXPZ_SSL`), which the Vita
-  build turns off. On such a build every value of `2` or higher is silently treated as `1` (Bilinear), for
+  build turns off. On such a build every value of `2` or higher is treated as `1` (Bilinear), for
   `smoothScaling`, `smoothScalingDown`, `bitmapSmoothScaling` and
-  `bitmapSmoothScalingDown` alike.
+  `bitmapSmoothScalingDown` alike; the log says so once
+  (`vita-gfx: smoothScaling N is not built`) for the first two, and nothing for
+  the Bitmap keys, which choose the sampling of scaled or rotated sprites.
 * **`midiSoundFont`** is either a file name, or `"off"` to disable MIDI. A name is
   opened as written, so it is relative to the game folder or an absolute device
   path such as `ux0:/data/mkxp-z/sf2/GM.sf2`. The default, an empty string,
@@ -556,15 +616,21 @@ Once pressed, the action stays held until the stick returns to 75% of that gate
 or below (or reverses direction); jitter near the press gate cannot retrigger it.
 These cached per-binding gates also apply to saved stick-to-button mappings;
 direction bindings, trigger axes, raw-axis queries and binding-file contents are
-unchanged. Settings capture still uses the movement gate described below.
+unchanged. The binding menu's capture uses this action gate for stick input
+when the row is anything but a direction; direction rows and triggers use the
+movement gate described below.
 Y/Z cannot be held together on this default axis. Desktop defaults still use clicks.
 The handheld mapping has not been tested on a device.
 
-A stored binding file replaces the RGSS rows above. Back up and remove it to use
+A stored binding file replaces the RGSS rows above. Reset it from the binding
+menu (Reset defaults, then Accept), or remove both it and its `.bak`, to use
 these defaults. `bindingNames` only changes labels, not the controls. To isolate an existing format-3 binding file per game,
 set `"dataPathOrg": "mkxp-z", "dataPathApp": "MyGame"` in that game's
-`mkxp-vita.json`, then put `keybindings.mkxp1`, `.mkxp2` or `.mkxp3` (for XP,
-VX or Ace) in `ux0:/data/mkxp-z/MyGame/`. Use a binding file saved by mkxp-z's
+`mkxp-vita.json` (a game's own `mkxp.json` cannot: layer 4 removes both keys),
+then put `keybindings.mkxp1`, `.mkxp2` or `.mkxp3` (for XP, VX or Ace) in
+`ux0:/data/mkxp-z/MyGame/`. That folder also becomes the game's settings-file
+folder (`CFG[]=`); `System.data_directory` is unaffected and stays the game's
+own folder. Use a binding file saved by mkxp-z's
 binding editor with the desired controller mapping; do not enable the desktop
 settings window on Vita. Keep both path names nonempty. This overrides the common
 path described above only when config layers are enabled and the packaged
@@ -594,7 +660,8 @@ inactivity have not been checked on hardware.
 16-bit axis range. SDL's Vita response curve is nonlinear; `0.30` means about 37% physical
 travel at the pinned SDL revision, not 30%. `0.5` restores the stock gate `0x4000`.
 The threshold is resolved once, when bindings are applied, and cached per axis binding. The binding
-menu's capture uses the same threshold. The binding file format is unchanged, and stored bindings
+menu's capture uses the same threshold for direction rows and triggers; stick
+capture for any other row uses the action gate above. The binding file format is unchanged, and stored bindings
 still win over defaults.
 
 ### Frame pacing
@@ -648,9 +715,43 @@ effective … frameSkip= fixedFramerate=` line above.
 ### vitaGL pool sizes
 
 `vitaglRamPoolMiB`, `vitaglCdramPoolMiB` and `vitaglPhycontPoolMiB` (whole MiB,
-`0` = default 96 / 64 / 16) become the `SDL_VITA_VGL_*_POOL` hints before
+`0` = default 56 / 64 / 4) become the `SDL_VITA_VGL_*_POOL` hints before
 `SDL_CreateWindow`, where SDL's VGL backend calls `vglInitWithCustomSizes`. A
 request outside 16..200 / 16..112 / 4..26 MiB, or larger than the boot free
 memory of its kernel pool, is logged as `vita-vgl-pool: <pool> request=… rejected`
-and replaced by the default. An `SDL_VITA_VGL_*_POOL` environment variable still
-wins over the config.
+and replaced by the default. SDL also honours an `SDL_VITA_VGL_*_POOL`
+environment variable ahead of the config, but nothing in the player sets one,
+so on an installed build the config keys are the only choice.
+
+The defaults come from device measurements: vglInit takes 36.6 MiB of RAM and
+use never moved afterwards, and CDRAM peaked at 36.7 MiB in a 30-minute play
+session; PhyCont was never touched. The newlib heap is 160 MiB, which leaves
+about 97 MiB of user memory free during play. When every pool is full, vitaGL
+allocates from newlib itself, so that heap is also the GPU's last resort. The
+launcher draws one textured quad and asks for RAM 40 / CDRAM 24 / PhyCont 4 MiB;
+it reads no config, but the environment variables still override it.
+
+Every boot logs `vita-boot: vgl_init tag=<game|launcher> window_us=<n> ram=…
+cdram=… phycont=… cdlg=…`: the time `SDL_CreateWindow` spent (vglInit and its
+pool memory included) and the pool totals vitaGL actually got (0 for a pool
+that failed).
+
+With the marker file `ux0:/data/mkxp-z/memory-ledger.enabled` present, the log
+also gets `vita-vgl-pool: tag=… scene=… ram=… cdram=… phycont=… cdlg=…
+vtx=last/peak/slice` lines (`free/total` bytes per pool) after GL init, after
+the shader phase and with each memory sample. `vtx` is the circular vertex pool
+watermark: bytes the last presented frame reserved, the most any frame has
+reserved since boot, and one per-frame slice (the 32 MiB pool divided by the
+display buffer count). A peak above the slice means frames spilled into ad-hoc
+allocations; size the pool from the peak of a long run (slice >= peak plus
+headroom, times the buffer count).
+
+### Display buffering
+
+The display is double-buffered: 2 buffers and at most 1 pending flip. vitaGL's
+own default of 3 buffers and 2 pending flips lets a 60 fps game settle two
+frames ahead of the panel, which adds about 16-33 ms of input latency. The
+SDL2 backend reads an `SDL_VITA_VGL_TRIPLE_BUFFER` hint that would restore
+triple buffering, but there is no config key and nothing on an installed build
+sets it, so the player is always double-buffered. Frame pacing (above) is
+unchanged by this.

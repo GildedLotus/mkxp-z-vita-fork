@@ -189,6 +189,12 @@ struct Config {
     
     /* Internal */
     std::string customDataPath;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* Absolute game folder (CWD after Config::read entered it); empty with
+     * no game. System.data_directory returns it, so saves stay per game;
+     * bindings and CFG[]= settings stay under customDataPath. */
+    std::string gameDataPath;
+#endif
     
     Config();
     

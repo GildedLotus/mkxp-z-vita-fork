@@ -72,8 +72,8 @@ typedef struct VitaLoadExecConfig {
      * Release everything the caller owns: texture/VBO/program,
      * SDL_GL_DeleteContext, SDL_DestroyWindow, TTF_Quit, SDL_Quit. Runs
      * after pre_exec and before the flush. May be NULL (the kernel would
-     * reclaim it all anyway; doing it explicitly is what keeps the driver's
-     * firmware sync pool from being a question at the hand-over).
+     * reclaim it all anyway; doing it explicitly is what keeps the GL
+     * driver's state from being a question at the hand-over).
      */
     void (*shutdown)(void *ctx);
 

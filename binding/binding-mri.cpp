@@ -52,6 +52,9 @@
 #include <SDL_mutex.h>
 #include <stdio.h>
 #endif
+#ifdef __vita__
+#include <psp2/io/stat.h>
+#endif
 
 #include <vector>
 #include "util/rapidcsv.h"
@@ -296,11 +299,14 @@ static void mriBindingInit() {
 #if defined(MKXPZ_HOST_PORT_LOGIC) && !defined(__vita__)
     _rb_define_module_function(mod, "vita_telemetry", mkxpVitaTelemetry); _rb_define_module_function(mod, "vita_heap", mkxpVitaHeap);
 #elif defined(__vita__)
-    // The semaphore census measures device kernel headroom only.
+    // The semaphore census measures device kernel headroom only, and drains
+    // the pool while workers run, so a game script never sees it unasked.
     _rb_define_module_function(mod, "vita_telemetry", mkxpVitaTelemetry);
     _rb_define_module_function(mod, "vita_heap", mkxpVitaHeap);
-    _rb_define_module_function(mod, "vita_kernel_object_headroom",
-                               mkxpVitaKernelObjectHeadroom);
+    SceIoStat probeMarker;
+    if (sceIoGetstat(VITA_GLUE_KERNEL_PROBE_MARKER, &probeMarker) >= 0)
+        _rb_define_module_function(mod, "vita_kernel_object_headroom",
+                                   mkxpVitaKernelObjectHeadroom);
 #endif
     _rb_define_module_function(mod, "reload_cache", mkxpReloadPathCache);
     _rb_define_module_function(mod, "mount", mkxpAddPath);
@@ -435,7 +441,14 @@ RB_METHOD(mkxpDelta) {
 RB_METHOD_GUARD(mkxpDataDirectory) {
     RB_UNUSED_PARAM;
     
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* The running game's folder; customDataPath with none. */
+    const Config &conf = shState->config();
+    const std::string &path = conf.gameDataPath.empty() ? conf.customDataPath
+                                                         : conf.gameDataPath;
+#else
     const std::string &path = shState->config().customDataPath;
+#endif
     const char *s = path.empty() ? "." : path.c_str();
     
     /* Same shape as mkxpDesensitize: a raise while s_nml is alive would

@@ -269,6 +269,34 @@ static int fingerIndex(const SDL_Event &event)
     return (int) id;
 }
 
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+/* SDL_WaitEventTimeout without SDL's fallback: the Vita video backend has no
+ * WaitEventTimeout/SendWakeupEvent hook, so SDL pumps every 1 ms (about
+ * 1 kHz of controller/touch reads on this thread). Poll every 4 ms instead,
+ * well inside one 16.7 ms frame. Same contract: 1 with an event; 0 on timeout
+ * or on an SDL error, which SDL_GetError then reports. */
+static const Uint64 VITA_EVENT_POLL_MS = 4;
+
+static int vitaWaitEventTimeout(SDL_Event *event, Uint64 timeoutMs)
+{
+    const Uint64 start = SDL_GetTicks64();
+
+    for (;;)
+    {
+        if (SDL_PollEvent(event))
+            return 1;
+
+        const Uint64 waited = SDL_GetTicks64() - start;
+
+        if (waited >= timeoutMs || *SDL_GetError())
+            return 0;
+
+        const Uint64 left = timeoutMs - waited;
+        SDL_Delay((Uint32)(left < VITA_EVENT_POLL_MS ? left : VITA_EVENT_POLL_MS));
+    }
+}
+#endif
+
 void EventThread::process(RGSSThreadData &rtData)
 {
     SDL_Event event;
@@ -610,7 +638,7 @@ void EventThread::process(RGSSThreadData &rtData)
             break;
         /* A quiet queue must not strand the hold when RGSS has stopped. */
         SDL_ClearError();
-        if (!SDL_WaitEventTimeout(&event, 50))
+        if (!vitaWaitEventTimeout(&event, 50))
         {
             if (*SDL_GetError())
             {

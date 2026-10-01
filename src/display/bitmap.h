@@ -172,11 +172,6 @@ public:
     
     bool getRaw(void *output, int output_size);
     void replaceRaw(void *pixel_data, int size);
-#ifdef MKXPZ_SOFTWARE_BITMAPS
-	/* Movie frames: push the just-replaced CPU pixels into a texture the
-	 * previous frame never sampled; see BitmapPrivate::refreshFrameNow. */
-    void refreshFrame();
-#endif
     void saveToFile(const char *filename);
 
 	void hueChange(int hue);

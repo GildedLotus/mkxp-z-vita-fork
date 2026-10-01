@@ -117,6 +117,25 @@ static bool integerScaleReserved = false;
 static bool fixedStorageValid[SurfaceCount] = {};
 static bool fixedResizeComplete = true;
 
+/* The window-base atlas: not screen-sized, so outside
+ * fixedSurface[] and its resize; never released. The slot table is leaked so
+ * a window disposed during exit never meets a destroyed allocator. */
+static TEXFBO windowBaseSurface;
+static const int kWindowBaseAtlasSize = 1024; /* 4 MiB */
+
+static BaseAtlas &windowBaseSlots()
+{
+	static BaseAtlas *slots = new BaseAtlas;
+	return *slots;
+}
+
+/* The VX/Ace tile atlas: reserved for RGSS2/3 only, where
+ * the atlas is always ATLASVX_W x ATLASVX_H; an XP atlas is sized by its
+ * tileset and stays on the CPU. One tilemap owns it at a time. */
+static TEXFBO tileAtlasSurface;
+static bool tileAtlasClaimed = false;
+static const int kTileAtlasW = 1024, kTileAtlasH = 2048; /* 8 MiB */
+
 bool fixedSurfacesValid()
 {
 	if (!fixedReserved)
@@ -214,20 +233,25 @@ static double nowMs()
 
 /* ---- Deferred release --------------------------------------------------- */
 
-/* N = 2: the window has two flip buffers and exactly one flip may be in
- * flight, so after swap k returns, swap k-1's render is complete and swap k's
- * may not be. Two swaps is the first safe point. */
-unsigned deferSwaps[DeferKindCount] = { 2, 2, 2 };
-bool syncBeforeRespecify[DeferKindCount] = { true, true, true };
+/* vitaGL already keeps every deleted or re-specified store alive until the
+ * GPU is done with it: a texture is freed at once only if no frame sampled it
+ * in the last FRAME_PURGE_FREQ (4) frames, else it goes on the purge list,
+ * and render targets always do (gpu_utils.h, framebuffers.c). The queue
+ * would only hold storage longer, so releases go straight to the driver; the
+ * queue stays for the ledger. Re-specification allocates new storage before
+ * freeing the old (gpu_utils.c gpu_alloc_texture), so it needs no drain. */
+unsigned deferSwaps[DeferKindCount] = { 0, 0, 0 };
+bool syncBeforeRespecify[DeferKindCount] = { false, false, false };
 
-/* The GPU drain. vitaGL's glFinish is a real sceGxmFinish fence: it waits for
- * every submitted render, including an in-flight upload into a texture the
- * driver no longer tracks. Nothing is read back and no framebuffer is
- * rebound, so it is safe to call mid-composite. */
+/* The GPU drain. Nothing is read back and no framebuffer is rebound, so it
+ * is safe to call mid-composite. */
 static void drainGPU()
 {
-	/* vitaGL's glFinish is a real sceGxmFinish fence: no 1x1 read-back and
-	 * no FBO rebind. */
+	/* Not a full fence: vitaGL's glFinish calls sceGxmFinish only after a
+	 * mid-frame scene change set scene_not_flushed (gxm.c glFinish), so
+	 * draws to the same target since the last fence are not waited on.
+	 * Storage safety comes from vitaGL deferring each free while the object
+	 * was used in the last FRAME_PURGE_FREQ (4) frames. */
 	glFinish();
 }
 
@@ -414,6 +438,11 @@ static void recycleRetire(GLuint id, uint64_t bytes)
 
 GLuint texRecycleTake(int width, int height)
 {
+#ifdef MKXPZ_VITAGL_BACKEND
+	/* Pool off: vitaGL never re-specifies in place (every glTexImage2D
+	 * allocates fresh storage), so a parked name only pins memory. */
+	return 0;
+#endif
 	if (width <= 0 || height <= 0)
 		return 0;
 
@@ -440,6 +469,10 @@ GLuint texRecycleTake(int width, int height)
 
 void texRecycleOffer(GLuint id, int width, int height)
 {
+#ifdef MKXPZ_VITAGL_BACKEND
+	recycleRetire(id, 0);
+	return;
+#endif
 	++recycleOffers;
 	recycleStatsDirty = true;
 
@@ -553,11 +586,17 @@ void logMemoryLedger()
 
 void deferDrain(const char *why, bool waitForGPU)
 {
-	/* The wait comes first and happens even on an empty queue: at freeze it
-	 * is the point of the call, and it is the highest-value instrument in
-	 * this drain -- the driver retries a wait for a render for a very long
-	 * time, so a render that never completes turns a silent process stop into a
-	 * log that ends at this call's own BEGIN line. */
+#ifdef MKXPZ_VITAGL_BACKEND
+	/* A wait with nothing queued frees nothing sooner: vitaGL frees purged
+	 * storage in vglSwapBuffers, and a failed allocation has already run
+	 * sceGxmFinish and every purge cycle before GL_OUT_OF_MEMORY reaches the
+	 * engine (gpu_utils.c, unsafe allocators). So freeze and the upload
+	 * retries skip it; shutdown keeps it as the last fence before teardown. */
+	if (deferCount == 0 && (!why || strcmp(why, "shutdown") != 0))
+		waitForGPU = false;
+#endif
+	/* The wait comes first: a render that never completes turns a silent
+	 * process stop into a log that ends at this call's own BEGIN line. */
 	if (waitForGPU)
 	{
 		/* A failed read proves no completion. Retain ownership and retry;
@@ -690,9 +729,11 @@ void respecify(Slot slot, DeferKind kind, uint64_t bytes)
 	}
 
 	if (it->second == bytes)
-		/* Same-size whole-level refresh. The driver reuses the storage in
-		 * place, and this is the per-frame upload traffic the whole backend
-		 * is built on -- it has to stay free. */
+		/* Same-size whole-level refresh: the per-frame upload traffic the
+		 * whole backend is built on, so it has to stay free. vitaGL does not
+		 * reuse the storage: it allocates a new store and defers the old one
+		 * (gpu_utils.c gpu_alloc_texture), a transient second copy this
+		 * ledger does not count. */
 		return;
 
 	/* Size changes release storage the GPU may still reference. Unchanged
@@ -762,8 +803,8 @@ void noteGLError(const char *at, GLenum err)
 }
 
 /* A frame at 40 fps is 25 ms and at 60 fps 16.7 ms; the FPS limiter has
- * already slept before the swap, so anything past this is the driver waiting
- * for a render rather than for the display. */
+ * already slept before the swap, so a swap this long was held far past one
+ * display interval. */
 static const double SWAP_WARN_MS = 200.0;
 static double swapStartMs = 0.0;
 static RateLimit swapWarnRate;
@@ -791,8 +832,8 @@ void swapEnd()
 
 	char line[192];
 	snprintf(line, sizeof(line),
-	         "vita-gpu: slow swap ms=%d.%02d frame=%u suppressed=%u; the "
-	         "previous frame's render had not completed",
+	         "vita-gpu: slow swap ms=%d.%02d frame=%u suppressed=%u; "
+	         "display queue back-pressure, cause not measured",
 	         whole, hundredths, (unsigned)realSwaps, swapWarnRate.take());
 	syncedLine(line);
 }
@@ -888,7 +929,7 @@ bool isReservedFBO(GLuint fbo)
 		if (fixedSurface[i].fbo.gl == fbo)
 			return true;
 
-	return false;
+	return windowBaseSurface.fbo.gl == fbo || tileAtlasSurface.fbo.gl == fbo;
 }
 
 void fixedSurfaceLost(GLuint fbo)
@@ -932,7 +973,7 @@ void creationSite(const char *what)
 		char line[192];
 		snprintf(line, sizeof(line),
 		         "vita-gpu: BUG: %s created after boot was sealed (frame=%u); "
-		         "the firmware sync pool is first come first served",
+		         "platform rule 1 reserves these at boot",
 		         what ? what : "?", (unsigned)realSwaps);
 		syncedLine(line);
 	}
@@ -1070,7 +1111,37 @@ void reserveFixedSurfaces(const Config &conf, int rgssVersion)
 
 	/* Order inside this function is irrelevant -- order of the function is
 	 * everything. It runs before the global IBO, before ShaderSet compiles a
-	 * program, before the first Quad's VBO and before any game asset. */
+	 * program, before the first Quad's VBO and before any game asset.
+	 * The window-base atlas is optional: a refusal costs GPU window
+	 * composition, not the boot. */
+	try
+	{
+		TEXFBO::initChecked(windowBaseSurface, kWindowBaseAtlasSize,
+		                    kWindowBaseAtlasSize, "window base atlas");
+		windowBaseSlots().reset(windowBaseSurface.width, windowBaseSurface.height);
+		Debug() << "vita-gpu: window base atlas reserved at 1024x1024";
+	}
+	catch (const Exception &)
+	{
+		Debug() << "vita-gpu: window base atlas refused; windows compose on the CPU";
+	}
+
+	/* Not extra memory: the CPU-built atlas it replaces is the same 8 MiB,
+	 * kept by requestAtlasTex() from the first map on. */
+	if (rgssVersion >= 2)
+	{
+		try
+		{
+			TEXFBO::initChecked(tileAtlasSurface, kTileAtlasW, kTileAtlasH,
+			                    "tile atlas");
+			Debug() << "vita-gpu: tile atlas reserved at 1024x2048";
+		}
+		catch (const Exception &)
+		{
+			Debug() << "vita-gpu: tile atlas refused; tilemaps compose on the CPU";
+		}
+	}
+
 	TEXFBO::initChecked(fixedSurface[PingPong0], w, h, "ping-pong 0");
 	TEXFBO::initChecked(fixedSurface[PingPong1], w, h, "ping-pong 1");
 	TEXFBO::initChecked(fixedSurface[FrozenScene], w, h, "frozenScene");
@@ -1123,6 +1194,88 @@ TEXFBO &reservedMutable(Surface which)
 bool haveIntegerScaleSurface()
 {
 	return integerScaleReserved;
+}
+
+bool placeWindowBase(BaseSlot &slot, int w, int h)
+{
+	if (slot.valid() && slot.innerW() == w && slot.innerH() == h)
+		return true;
+
+	windowBaseSlots().release(slot);
+
+	return windowBaseSlots().alloc(w, h, slot);
+}
+
+void releaseWindowBase(BaseSlot &slot)
+{
+	windowBaseSlots().release(slot);
+}
+
+const TEXFBO &windowBaseAtlas()
+{
+	return windowBaseSurface;
+}
+
+bool claimTileAtlas(int w, int h, TEXFBO &out)
+{
+	if (tileAtlasClaimed || tileAtlasSurface.fbo == FBO::ID(0) ||
+	    w != tileAtlasSurface.width || h != tileAtlasSurface.height)
+		return false;
+
+	tileAtlasClaimed = true;
+	out = tileAtlasSurface;
+	return true;
+}
+
+void releaseTileAtlas(TEXFBO &held)
+{
+	if (held.fbo == FBO::ID(0) || held.fbo != tileAtlasSurface.fbo)
+		return;
+
+	tileAtlasClaimed = false;
+	held = TEXFBO();
+}
+
+void composeWindowBase(const BaseSlot &slot,
+                       void (*draw)(void *ctx, const Vec2i &origin), void *ctx)
+{
+	assert(slot.valid());
+
+	/* Composition runs in prepareDraw, before the frame's first draw, so
+	 * every window composed this frame shares one atlas scene. The state is
+	 * put back even if a draw throws (a skin upload can). */
+	struct Restore
+	{
+		FBO::ID previous;
+		~Restore()
+		{
+			glState.scissorBox.pop();
+			glState.scissorTest.pop();
+			glState.viewport.pop();
+			FBO::bind(previous);
+		}
+	};
+
+	const FBO::ID previous = FBO::boundFramebufferID;
+	FBO::bind(windowBaseSurface.fbo);
+	glState.viewport.pushSet(IntRect(0, 0, windowBaseSurface.width,
+	                                 windowBaseSurface.height));
+	glState.scissorTest.pushSet(true);
+	glState.scissorBox.pushSet(IntRect(slot.x, slot.y, slot.w, slot.h));
+	const Restore restore = { previous };
+	glState.clearColor.pushSet(Vec4());
+	FBO::clear();
+	glState.clearColor.pop();
+
+	const int x = slot.innerX(), y = slot.innerY();
+	const int w = slot.innerW(), h = slot.innerH();
+
+	glState.scissorBox.set(IntRect(x, y, w, h));
+	draw(ctx, Vec2i(x, y));
+	glState.scissorBox.set(IntRect(x, y - 1, w, 1));
+	draw(ctx, Vec2i(x, y - 1));
+	glState.scissorBox.set(IntRect(x, y + h, w, 1));
+	draw(ctx, Vec2i(x, y + 1));
 }
 
 void resizeFixedSurfaces(const Vec2i &size, const Vec2i &integerSize)
@@ -1198,6 +1351,14 @@ void warmUpPrograms()
 
 	const FBO::ID targets[2] =
 	    { fixedSurface[PingPong0].fbo, FBO::ID(0) };
+#ifdef MKXPZ_VITAGL_BACKEND
+	/* vitaGL keys a fragment variant on blend state and float-target only
+	 * (custom_shaders.c setup_frag_program), so the window would repeat the
+	 * render surface's variants. */
+	const size_t targetN = 1;
+#else
+	const size_t targetN = 2;
+#endif
 
 	const double startMs = nowMs();
 
@@ -1227,7 +1388,7 @@ void warmUpPrograms()
 
 	unsigned draws = 0;
 
-	for (size_t t = 0; t < 2; ++t)
+	for (size_t t = 0; t < targetN; ++t)
 	{
 		FBO::bind(targets[t]);
 
@@ -1304,7 +1465,7 @@ void warmUpPrograms()
 	{
 		ShaderBase &flat = shState->shaders().flatColor;
 
-		for (size_t t = 0; t < 2; ++t)
+		for (size_t t = 0; t < targetN; ++t)
 		{
 			FBO::bind(targets[t]);
 
@@ -1366,14 +1527,20 @@ void warmUpPrograms()
 	char line[224];
 	snprintf(line, sizeof(line),
 	         "vita-gpu: shader warm-up ok programs=%u blend_modes=%u states=%u "
-	         "raw_blends=%u targets=2 draws=%u ms=%d.%02d",
+	         "raw_blends=%u targets=%u draws=%u ms=%d.%02d",
 	         (unsigned)programs.size(), (unsigned)blendModeN, (unsigned)stateN,
-	         (unsigned)rawBlendN, draws, whole, hundredths);
+	         (unsigned)rawBlendN, (unsigned)targetN, draws, whole, hundredths);
 	syncedLine(line);
 }
 
 void headroomCanary(const char *where)
 {
+#ifdef MKXPZ_VITAGL_BACKEND
+	/* Retired: it measured a firmware sync-object pool vitaGL does not
+	 * have, and its probes stayed on the purge list while freeze stopped
+	 * swaps, so it distorted its own readings. */
+	return;
+#endif
 	if (headroomMarkerState < 0)
 		headroomMarkerState = headroomCanaryMarker() ? 1 : 0;
 	if (!headroomMarkerState)
@@ -1476,8 +1643,7 @@ static void surfaceFailed(TEXFBO &obj, int width, int height,
 	throw Exception(Exception::MKXPError,
 	                "software_bitmaps: render surface '%s' (%dx%d) is not "
 	                "usable: framebuffer status 0x%x, GL error 0x%x. The "
-	                "GPU surface pool is exhausted or the size was "
-	                "refused.",
+	                "driver is out of memory or refused the size.",
 	                what, width, height, (unsigned)status, (unsigned)err);
 }
 
@@ -1508,8 +1674,8 @@ void TEXFBO::initChecked(TEXFBO &obj, int width, int height, const char *what)
 		throw Exception(Exception::MKXPError,
 		                "software_bitmaps: render surface '%s' (%dx%d) was "
 		                "requested after boot was sealed. Every render surface "
-		                "this backend can use is reserved at boot; the GPU "
-		                "pool has nothing left to build another from.",
+		                "this backend can use is reserved at boot; none can be "
+		                "created after the seal.",
 		                what, width, height);
 
 	TEXFBO::init(obj);
@@ -1739,7 +1905,29 @@ void vaoUnbind(VAO &vao)
 	}
 }
 
-#define HAVE_NATIVE_BLIT (gl.BlitFramebuffer && shState->config().smoothScaling <= Bilinear && shState->config().smoothScalingDown <= Bilinear)
+/* Bicubic, Lanczos3 and xBRZ are not built without optional shaders: they
+ * draw as Bilinear, which is said once in the log. */
+static int availableScalingMethod(int method)
+{
+#ifdef MKXPZ_NO_OPTIONAL_SHADERS
+	if (method >= Bicubic)
+	{
+		static bool logged = false;
+		if (!logged)
+		{
+			logged = true;
+			char line[128];
+			snprintf(line, sizeof(line), "vita-gfx: smoothScaling %d is not built; "
+			         "drawing Bilinear (this build supports 0-1)", method);
+			GPUBudget::syncedLine(line);
+		}
+		return Bilinear;
+	}
+#endif
+	return method;
+}
+
+#define HAVE_NATIVE_BLIT (gl.BlitFramebuffer && availableScalingMethod(shState->config().smoothScaling) <= Bilinear && availableScalingMethod(shState->config().smoothScalingDown) <= Bilinear)
 
 int blitScaleIsSpecial(TEXFBO &target, bool targetPreferHires, const IntRect &targetRect, TEXFBO &source, const IntRect &sourceRect)
 {
@@ -1796,14 +1984,8 @@ int smoothScalingMethod(int scaleIsSpecial)
 		break;
 	}
 
-#ifdef MKXPZ_NO_OPTIONAL_SHADERS
-	/* Bicubic / Lanczos3 shaders are not built; clamp to Bilinear.
-	 * Callers fall through to the SimpleShader default case. */
-	if (method >= Bicubic)
-		method = Bilinear;
-#endif
-
-	return method;
+	/* Callers fall through to the SimpleShader default case. */
+	return availableScalingMethod(method);
 }
 
 static void _blitBegin(FBO::ID fbo, const Vec2i &size, int scaleIsSpecial)

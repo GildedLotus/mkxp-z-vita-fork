@@ -168,14 +168,19 @@ static void swGuardHires()
 
 // libnsgif loading callbacks, taken pretty much straight from their tests
 
-/* Bound both the input and the retained decoded frames of one GIF. */
+/* One budget for everything a GIF holds at its peak: the input bytes, the
+ * decoder canvas, libnsgif's previous-frame copy and every retained frame
+ * (three separate limits allowed about 192 MiB). */
 static const size_t gifByteLimit = 64u * 1024u * 1024u;
+/* What the canvas callback may still take; the RGSS thread sets it before
+ * gif_initialise, since libnsgif's callbacks carry no context. */
+static size_t gifCanvasBudget = gifByteLimit;
 
 static void *gif_bitmap_create(int width, int height)
 {
     if (width <= 0 || height <= 0 || width > glState.caps.maxTexSize ||
         height > glState.caps.maxTexSize ||
-        (size_t)width > gifByteLimit / 4 / (size_t)height)
+        (size_t)width > gifCanvasBudget / 4 / (size_t)height)
         return nullptr;
     return calloc((size_t)width * (size_t)height, 4);
 }
@@ -238,64 +243,44 @@ static void gif_bitmap_modified(void *bitmap)
  * -- about 1 ms + 13 ns/px, i.e. 3.0 ms for a full 544x416 screen and 4.2 ms
  * for a 256x256 sheet.
  *
- * THE BUDGET, and why these three numbers (all measured on the device):
+ * THE BUDGET (a vitaGL texture is one of 16384 names, not a kernel object,
+ * so bytes bind, not the count):
  *
- *   The firmware sync-object pool is about 64 per process and is shared by
- *   textures, VBOs and render surfaces, first come first served; 8 render
- *   surfaces x (3 + 1 texture) = 32 sync objects is everything the
- *   application gets after context infrastructure, and with 64 resident
- *   textures alive the measured number of render surfaces still obtainable is
- *   ZERO. What makes that survivable: everything
- *   that fails HARD on an empty pool -- render surfaces, shader code-heap
- *   segments, the default VAO -- is claimed at boot, and
- *   textures created after the pool empties run
- *   with a NULL sync object and are measured to render and update correctly.
+ *   kTexCacheMaxTextures = 128: the count cap is only the backstop against
+ *   the union-over-time the Cache module would otherwise reach. Device logs
+ *   recorded at most 22 live entries and no count evictions, so a busy map
+ *   scene stays well clear of it. A frame that does sample more distinct
+ *   Bitmaps than this evicts something it is still drawing; that is counted
+ *   as hot= in the telemetry line below.
  *
- *   So this budget is NOT trying to keep the pool from emptying: the Blank
- *   Dream crash log shows it already over-subscribed in a game that had
- *   barely started (textures=10 vbos=22 surfaces=3, about 44 sync objects
- *   wanted out of about 32). What it does is end the UNBOUNDED half of that
- *   -- the union-over-time, which the Cache module guarantees will otherwise
- *   reach every graphic in the game.
+ *   kTexCacheMaxBytes = 24 MiB: the GPU-side mirror of the CPU pixels. The
+ *   measured vitaGL pool peak was 36.7 MiB of the 64 MiB CDRAM pool with
+ *   12.1 MiB fixed at boot, and RAM is the 56 MiB pool's second tier, so 24
+ *   MiB of cache plus atlases and render targets stays inside CDRAM. A
+ *   single Bitmap larger than the whole budget is admitted over it rather
+ *   than emptying the cache for nothing (see cacheMakeRoom).
  *
- *   kTexCacheMaxTextures = 48 (a map scene with many events samples far more distinct Bitmaps
- *   than a title screen; retune from the hot= counter): about 5x the live count that same log recorded
- *   for a running scene, so an ordinary frame never reaches the cap, while a
- *   long session cannot grow past it. A frame that really does sample more
- *   than 32 distinct Bitmaps will evict something it is still drawing; that
- *   case is counted separately as hot= in the telemetry line below precisely
- *   so this number can be retuned from the log instead of guessed.
- *
- *   kTexCacheMaxBytes = 24 MiB: the GPU-side mirror of the CPU pixels.
- *   cpu_bitmap_bytes was 2.7 MiB in that log and 32 full-screen 544x416
- *   pictures would be 29 MiB, so this binds only when the working set is
- *   unusually large; it bounds what the cache can cost against the 96 MiB
- *   USER_MAIN_RW / 96 MiB CDRAM ceilings. A single Bitmap larger
- *   than the whole budget is admitted over it rather than emptying the cache
- *   for nothing (see cacheMakeRoom).
- *
- *   kTexCacheIdleFrames = 240: at the 20-30 fps this port measures, 8 to 12
- *   seconds of never being drawn. Long enough that nothing in a scene the
- *   game is still showing ages out, short enough that the graphics of a scene
- *   the game has LEFT are gone before the next one fills the cache. Being
- *   wrong costs exactly one re-upload.
+ *   kTexCacheIdleFrames = 480 real swaps: 8 s at 60 fps, 16 s at 30. Long
+ *   enough that nothing in a scene the game is still showing ages out, short
+ *   enough that the graphics of a scene the game has LEFT go before the next
+ *   one fills the cache. Being wrong costs exactly one re-upload.
  *
  *   The idle sweep is pressure-gated: Blank Dream held a
  *   menu 6 s, the sweep dropped the whole map working set under the idle
  *   horizon, and closing the menu re-uploaded 12.9 MB in one frame.
  *   kTexCacheIdleFloorBytes and kTexCacheIdleFloorCount are what an idle
- *   stretch defends: at or under EITHER floor -- resident bytes or entry
- *   count -- aged entries stay resident, and the sweep drops them only
- *   while the cache is over a floor. The hard caps, the pressure drain and
- *   shutdown are unchanged.
+ *   stretch defends: aged entries stay resident only while the cache is at
+ *   or under BOTH floors -- resident bytes and entry count -- and the sweep
+ *   drops them while it is over either. The hard caps, the pressure drain
+ *   and shutdown are unchanged.
  */
 struct BitmapPrivate;
 
-static const unsigned kTexCacheMaxTextures = 48;
+static const unsigned kTexCacheMaxTextures = 128;
 static const uint64_t kTexCacheMaxBytes    = 24u * 1024u * 1024u;
-static const uint64_t kTexCacheIdleFrames  = 240;
+static const uint64_t kTexCacheIdleFrames  = 480;
 static const uint64_t kTexCacheIdleFloorBytes = 12u * 1024u * 1024u;
-static const unsigned kTexCacheIdleFloorCount = 36;
+static const unsigned kTexCacheIdleFloorCount = 96;
 
 /* The LRU itself. 'newest' is the most recently sampled Bitmap, 'oldest' is
  * the first victim; every entry's lruNewer/lruOlder walk that order, which is
@@ -520,11 +505,13 @@ struct BitmapPrivate
      * keeps the stock mega restrictions (not drawable, no texture at all). */
     bool trueMega;
 
-    /* The sampling cache in 'gl' is stale. Whole-level dirty is what the
-     * upload actually honours; dirtyRect is kept alongside purely so a later
-     * change can turn this into a sub-upload. */
+    /* The sampling cache in 'gl' is stale. dirtyRect bounds every pixel
+     * changed since the last upload; a cold level re-uploads only that.
+     * dirtyMarked: markDirty() ran since the last onModified(), which
+     * otherwise widens dirtyRect to the whole level. */
     bool texDirty;
     IntRect dirtyRect;
+    bool dirtyMarked;
 
     /* Animation frame currently held by the cache texture; -1 = none. */
     int cachedFrame;
@@ -553,6 +540,7 @@ struct BitmapPrivate
     trueMega(false),
     texDirty(false),
     dirtyRect(0, 0, 0, 0),
+    dirtyMarked(false),
     cachedFrame(-1),
     lruNewer(0),
     lruOlder(0),
@@ -686,11 +674,45 @@ struct BitmapPrivate
         return swraster::Surface{ (uint8_t *)s->pixels, s->w, s->h, s->pitch };
     }
 
-    void markDirty(const IntRect &)
+    /* Union the rect, clipped to the level, into dirtyRect. Negative
+     * extents (mirrored blits) are normalised; 64-bit so extreme hints
+     * cannot overflow. */
+    void markDirty(const IntRect &r)
     {
-        /* Uploads are whole-level; extreme sub-rectangle hints need no arithmetic. */
         texDirty = true;
-        dirtyRect = IntRect(0, 0, gl.width, gl.height);
+        dirtyMarked = true;
+
+        int64_t x0 = r.x, y0 = r.y;
+        int64_t x1 = x0 + r.w, y1 = y0 + r.h;
+        if (x1 < x0) std::swap(x0, x1);
+        if (y1 < y0) std::swap(y0, y1);
+        if (dirtyRect.w > 0 && dirtyRect.h > 0)
+        {
+            x0 = std::min<int64_t>(x0, dirtyRect.x);
+            y0 = std::min<int64_t>(y0, dirtyRect.y);
+            x1 = std::max<int64_t>(x1, (int64_t)dirtyRect.x + dirtyRect.w);
+            y1 = std::max<int64_t>(y1, (int64_t)dirtyRect.y + dirtyRect.h);
+        }
+        x0 = std::max<int64_t>(x0, 0);
+        y0 = std::max<int64_t>(y0, 0);
+        x1 = std::min<int64_t>(x1, gl.width);
+        y1 = std::min<int64_t>(y1, gl.height);
+        if (x1 <= x0 || y1 <= y0)
+            return;
+        dirtyRect = IntRect((int)x0, (int)y0, (int)(x1 - x0), (int)(y1 - y0));
+    }
+
+    /* setPixel's end state of markDirty(1x1) + onModified(false). dirtyRect
+     * is always clipped to the fixed level, so a pixel inside it leaves the
+     * union unchanged and skips it; any other pixel takes markDirty. */
+    void pixelModified(int x, int y)
+    {
+        if (x < dirtyRect.x || y < dirtyRect.y ||
+            x >= dirtyRect.x + dirtyRect.w || y >= dirtyRect.y + dirtyRect.h)
+            markDirty(IntRect(x, y, 1, 1));
+        texDirty = true;
+        dirtyMarked = false;
+        self->modified();
     }
 
     bool uploadWholeLevel(SDL_Surface *src)
@@ -711,6 +733,39 @@ struct BitmapPrivate
                    (const uint8_t *)src->pixels + (size_t)y * src->pitch,
                    (size_t)src->w * 4);
         return TEX::uploadImageChecked(src->w, src->h, packed.data(), GL_RGBA);
+    }
+
+    /* Upload dirtyRect into the existing level; *bytes gets what was sent.
+     * Rects over kSubUploadPackBytes go up as full-width rows, which need
+     * no packing copy; smaller ones are packed. */
+    bool uploadDirtyRect(SDL_Surface *src, uint64_t *bytes)
+    {
+        static const size_t kSubUploadPackBytes = 64 * 1024;
+
+        IntRect r = dirtyRect;
+        *bytes = 0;
+        if (r.w <= 0 || r.h <= 0)
+            return true;
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        FrameProfile::Scope profileUpload(FrameProfile::Upload, 0, false, false);
+#endif
+        if ((size_t)r.w * (size_t)r.h * 4 > kSubUploadPackBytes)
+        {
+            r.x = 0;
+            r.w = src->w;
+        }
+        *bytes = (uint64_t)r.w * (uint64_t)r.h * 4u;
+
+        const uint8_t *first = (const uint8_t *)src->pixels
+                             + (size_t)r.y * src->pitch + (size_t)r.x * 4;
+        if (r.w == src->w && src->pitch == src->w * 4)
+            return TEX::uploadSubImageChecked(0, r.y, r.w, r.h, first);
+
+        std::vector<uint8_t> packed((size_t)r.w * (size_t)r.h * 4);
+        for (int y = 0; y < r.h; ++y)
+            memcpy(&packed[(size_t)y * r.w * 4], first + (size_t)y * src->pitch,
+                   (size_t)r.w * 4);
+        return TEX::uploadSubImageChecked(r.x, r.y, r.w, r.h, packed.data());
     }
 
     /* ---- texture cache bookkeeping --------------------
@@ -1037,6 +1092,7 @@ struct BitmapPrivate
          * sampled for kTexCacheIdleFrames, so nothing in flight is drawing
          * with it. */
         const uint64_t now = GPUBudget::frameCounter();
+        const uint64_t sampledBefore = lastSampledFrame;
 
         if (texCacheSweptFrame != now)
         {
@@ -1073,6 +1129,16 @@ struct BitmapPrivate
             ::gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
         }
 
+        /* A level not sampled for more than vitaGL's
+         * FRAME_PURGE_FREQ (4) swaps is written in place, so only dirtyRect
+         * goes up. A hot level is re-specified whole instead: vitaGL would
+         * copy the entire old level before a sub-update. The margin of one
+         * swap covers counter ordering; misjudging only costs that copy. */
+        static const uint64_t kSubUploadColdFrames = 5;
+        const bool cold = gl.tex.gl && !animation.enabled && cachedFrame == frame
+                       && src->w == gl.width && src->h == gl.height
+                       && now - sampledBefore > kSubUploadColdFrames;
+
         TEX::ScopedBinding binding(prevTex);
         TEX::drainStaleErrors("texture-prepare");
         if (!gl.tex.gl)
@@ -1102,67 +1168,17 @@ struct BitmapPrivate
          * name exists -- before the upload, which can throw. */
         cacheNote(bytes);
 
-        if (!uploadWholeLevel(src))
+        uint64_t uploaded = bytes;
+        if (!(cold ? uploadDirtyRect(src, &uploaded) : uploadWholeLevel(src)))
             throw TEX::UploadError();
 
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
-        FrameProfile::assetUpload(assetToken, bytes);
+        FrameProfile::assetUpload(assetToken, uploaded);
 #endif
         texDirty = false;
         cachedFrame = frame;
         dirtyRect = IntRect(0, 0, 0, 0);
 
-    }
-
-    /* The movie loop replaces the CPU pixels every frame and needs the new
-     * frame sampled immediately. ensureTexture() would re-specify the very
-     * level the previous frame drew; on the device a
-     * same-name per-frame respecify kept the picture at frame 1. So
-     * each frame uploads into a name this owner has never written and the sampled name goes back through the
-     * one drop policy, whose pool retires what it cannot hold two real
-     * swaps behind. Bounded: one live name plus the pool's fixed
-     * caps, and this method exists for the one Bitmap the movie loop
-     * drives. */
-    void refreshFrameNow()
-    {
-        if (trueMega)
-            return;
-
-        SDL_Surface *src = pixels();
-        if (!src)
-            return;
-
-        texDirty = true;
-        GLint prevTex = 0;
-        ::gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
-
-        const uint64_t bytes = (uint64_t)src->w * (uint64_t)src->h * 4u;
-
-        if (cacheMakeRoom(bytes, this, (GLuint)prevTex))
-            ::gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
-
-        TEX::ScopedBinding binding(prevTex);
-        /* The single drop policy hands the sampled name to the recycle
-         * pool; the replacement is a name nothing has ever sampled. */
-        cacheDrop();
-
-        TEX::drainStaleErrors("texture-refresh");
-        gl.tex = TEX::gen();
-        if (!gl.tex.gl)
-            throw TEX::UploadError();
-
-        TEX::bind(gl.tex);
-        TEX::setRepeat(false);
-        TEX::setSmooth(false);
-
-        cacheNote(bytes);
-
-        if (!uploadWholeLevel(src))
-            throw TEX::UploadError();
-
-        texDirty = false;
-        cachedFrame = animation.enabled ? (int)animation.currentFrameI() : 0;
-        dirtyRect = IntRect(0, 0, 0, 0);
     }
 #endif
 
@@ -1413,9 +1429,11 @@ struct BitmapPrivate
     void onModified(bool freeSurface = true)
     {
 #ifdef MKXPZ_SOFTWARE_BITMAPS
-        /* Safety net: every mutation invalidates the sampling cache even if a
-         * call site forgot markDirty(). Uploads are whole-level, so only the
-         * sub-upload hint (dirtyRect) degrades, never correctness. */
+        /* Safety net: a mutation whose call site forgot markDirty() dirties
+         * the whole level, so a sub-upload can never miss a pixel. */
+        if (!dirtyMarked)
+            markDirty(IntRect(0, 0, gl.width, gl.height));
+        dirtyMarked = false;
         texDirty = true;
 #endif
         if (surface && freeSurface)
@@ -1493,6 +1511,7 @@ struct BitmapOpenHandler : FileSystem::OpenHandler
             gif_bitmap_set_opaque, gif_bitmap_test_opaque, gif_bitmap_modified
         };
         gif_create(decoded.get(), &callbacks);
+        gifCanvasBudget = gifByteLimit - (size_t)length;
         int status;
         do {
             status = gif_initialise(decoded.get(), (size_t)length, data.get());
@@ -1502,9 +1521,14 @@ struct BitmapOpenHandler : FileSystem::OpenHandler
             }
         } while (status != GIF_OK);
 
+        /* The canvas fit gifCanvasBudget, so this cannot underflow. What is
+         * left after the canvas and the previous-frame copy pays for the
+         * retained frames (a single-frame GIF keeps one CPU copy too). */
         const size_t frameBytes = (size_t)decoded->width * (size_t)decoded->height * 4;
+        const size_t frameRoom = frameBytes && gifCanvasBudget >= 2 * frameBytes ?
+            gifCanvasBudget - 2 * frameBytes : 0;
         if (!frameBytes || !decoded->frame_count || !decoded->frame_count_partial ||
-            decoded->frame_count_partial > gifByteLimit / frameBytes) {
+            decoded->frame_count_partial > frameRoom / frameBytes) {
             error = "Invalid or oversized GIF animation";
             return false;
         }
@@ -3809,10 +3833,170 @@ void Bitmap::blur()
 #endif
 }
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+/* Visits a w x h bitmap as tw x th tiles, row-major, each clipped to the
+ * bitmap: visit(x, y, width, height). */
+template <typename Visit> static void forEachRadialTile(int w, int h, int tw, int th, Visit visit)
+{
+    for (int ty = 0; ty < h; ty += th)
+        for (int tx = 0; tx < w; tx += tw)
+            visit(tx, ty, std::min(tw, w - tx), std::min(th, h - ty));
+}
+
+/* Stock's GL radial blur (below), rendered tile by tile into a scratch slot
+ * of the boot-reserved window-base atlas and read back into the CPU pixels
+ *: no surface is created after the seal. False, with the
+ * pixels untouched, when the atlas has no room or GL fails; the caller then
+ * runs swraster. The RGBA8 target quantises each division as stock does. */
+static bool radialBlurGpu(BitmapPrivate *p, int angle, int divisions)
+{
+    const TEXFBO &atlas = GPUBudget::windowBaseAtlas();
+    const int w = p->gl.width, h = p->gl.height;
+    if (!atlas.fbo.gl || w <= 0 || h <= 0 || !p->pixels())
+        return false;
+
+    static const int kTiles[] = { 0, 512, 256, 128 }; /* 0: the whole bitmap */
+    BaseSlot slot;
+    int tw = 0, th = 0;
+    for (int edge : kTiles)
+    {
+        tw = edge && edge < w ? edge : w;
+        th = edge && edge < h ? edge : h;
+        if (GPUBudget::placeWindowBase(slot, tw, th))
+            break;
+        tw = 0;
+    }
+    if (!tw)
+        return false;
+
+    /* Puts back the GL state (if pushed), the binding and the slot, also
+     * when a draw or the upload throws. */
+    struct Restore
+    {
+        BaseSlot &slot;
+        FBO::ID previous;
+        bool pushed, smooth;
+        ~Restore()
+        {
+            if (smooth)
+                TEX::setSmooth(false);
+            if (pushed)
+            {
+                glState.scissorBox.pop();
+                glState.scissorTest.pop();
+                glState.clearColor.pop();
+                glState.blendMode.pop();
+                glState.blend.pop();
+                glState.viewport.pop();
+            }
+            FBO::bind(previous);
+            GPUBudget::releaseWindowBase(slot);
+        }
+    } restore = { slot, FBO::boundFramebufferID, false, false };
+
+    angle     = clamp<int>(angle, 0, 359);
+    divisions = clamp<int>(divisions, 2, 100);
+    const float angleStep = (float) angle / (divisions-1);
+    const float baseAngle = -((float) angle / 2);
+
+    std::vector<uint8_t> out, tile;
+    ColorQuadArray qArray;
+    try
+    {
+        out.resize((size_t)w * h * 4);
+        tile.resize((size_t)tw * th * 4);
+        qArray.resize(5);
+
+        /* Stock's cross: the bitmap and its mirror across each edge. */
+        const FloatRect texRect(0, 0, w, h);
+        const FloatRect posRects[5] = {
+            FloatRect(0, 0, w, h), FloatRect(0, 0, w, -h), FloatRect(0, h*2, w, -h),
+            FloatRect(0, 0, -w, h), FloatRect(w*2, 0, -w, h) };
+        for (int i = 0; i < 5; ++i)
+            Quad::setTexPosRect(&qArray.vertices[i*4], texRect, posRects[i]);
+        for (int i = 0; i < 4*5; ++i)
+            qArray.vertices[i].color = Vec4(1, 1, 1, 1.0f / divisions);
+        qArray.commit();
+
+        GLRenderErrorScope errors;
+        SimpleMatrixShader &shader = shState->shaders().simpleMatrix;
+        shader.bind();
+        p->bindTexture(shader, false);
+        TEX::setSmooth(true);
+        restore.smooth = true;
+
+        const int sx = slot.innerX(), sy = slot.innerY();
+        FBO::bind(atlas.fbo);
+        glState.viewport.pushSet(IntRect(sx, sy, tw, th));
+        glState.blend.pushSet(true);
+        glState.blendMode.pushSet(BlendAddition);
+        glState.clearColor.pushSet(Vec4());
+        glState.scissorTest.pushSet(true);
+        glState.scissorBox.pushSet(IntRect(sx, sy, tw, th));
+        restore.pushed = true;
+
+        Transform trans;
+        trans.setOrigin(Vec2(w / 2.0f, h / 2.0f));
+
+        forEachRadialTile(w, h, tw, th, [&](int tx, int ty, int cw, int ch)
+            {
+                const IntRect target(sx, sy, cw, ch);
+                glState.viewport.set(target);
+                /* Not set(): the cache would skip glScissor for a same-size
+                 * tile. The previous tile's read reset the scene on this FBO,
+                 * and vitaGL then re-applies the tile clip at the display-space
+                 * y (V:gxm.c:751-753), clipping every draw and the clear out;
+                 * glScissor marks the scissor dirty so the next draw rebuilds
+                 * it with the FBO y (V:tests.c:389-391,343-348). */
+                glState.scissorBox.init(target);
+                FBO::clear();
+                shader.applyViewportProj();
+                trans.setPosition(Vec2(w / 2.0f - tx, h / 2.0f - ty));
+
+                for (int i = 0; i < divisions; ++i)
+                {
+                    trans.setRotation(baseAngle + i*angleStep);
+                    shader.setMatrix(trans.getMatrix());
+                    qArray.draw();
+                }
+
+#ifdef MKXPZ_VITAGL_BACKEND
+                /* vitaGL starts a sub-rect FBO read at row H-y-h and walks
+                 * down (V:framebuffers.c:678,783-787), so pass the mirrored
+                 * y to get rows sy.. in order. */
+                const int readY = atlas.height - sy - ch;
+#else
+                const int readY = sy;
+#endif
+                gl.ReadPixels(sx, readY, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE, tile.data());
+                errors.check("Bitmap radial blur");
+
+                for (int y = 0; y < ch; ++y)
+                    memcpy(&out[((size_t)(ty + y) * w + tx) * 4],
+                           &tile[(size_t)y * cw * 4], (size_t)cw * 4);
+            });
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    const swraster::Surface cpu = p->swSurface();
+    for (int y = 0; y < h; ++y)
+        memcpy(cpu.px + (size_t)y * cpu.stride, &out[(size_t)y * w * 4], (size_t)w * 4);
+
+    char line[96];
+    snprintf(line, sizeof(line), "vita-gpu: radial_blur %dx%d on the GPU, tile %dx%d",
+             w, h, tw, th);
+    Debug() << line;
+    return true;
+}
+#endif
+
 void Bitmap::radialBlur(int angle, int divisions)
 {
     guardDisposed();
-    
+
     GUARD_MEGA;
     GUARD_ANIMATED;
 
@@ -3827,12 +4011,12 @@ void Bitmap::radialBlur(int angle, int divisions)
      * Stock RGSS2 Spriteset_Battle#create_battleback calls this with
      * (90, 12) and RGSS3 create_blurry_background_bitmap with (120, 16)
      * whenever a map has no battleback, so it must work, not raise. It is
-     * hundreds of milliseconds on the device at those sizes, but it runs
-     * once per battle start, not per frame. */
+     * about 1 s on the device at those sizes, so the GPU path goes first. */
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     FrameProfile::Scope profileRaster(FrameProfile::Raster);
 #endif
-    swraster::radial_blur(p->swSurface(), angle, divisions);
+    if (!radialBlurGpu(p, angle, divisions))
+        swraster::radial_blur(p->swSurface(), angle, divisions);
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     profileRaster.stop();
 #endif
@@ -4077,15 +4261,10 @@ Color Bitmap::getPixel(int x, int y) const
         return Vec4();
 
 #ifdef MKXPZ_SOFTWARE_BITMAPS
-    /* Never touches GL: no readback, no render target, no GFX lock needed. */
+    /* Never touches GL: no readback, no render target, no GFX lock needed.
+     * Unprofiled like setPixel; swraster counts the call. */
     {
-#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
-        FrameProfile::Scope profileRaster(FrameProfile::Raster);
-#endif
         swraster::Color c = swraster::get_pixel(p->swSurface(), x, y);
-#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
-        profileRaster.stop();
-#endif
         return Color(c.r, c.g, c.b, c.a);
     }
 #else
@@ -4142,18 +4321,12 @@ void Bitmap::setPixel(int x, int y, const Color &color)
     };
     
 #ifdef MKXPZ_SOFTWARE_BITMAPS
-    /* Bounds-checked and GL-free; the 1x1 texture sub-upload is gone. */
-#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
-    FrameProfile::Scope profileRaster(FrameProfile::Raster);
-#endif
+    /* Bounds-checked and GL-free; the 1x1 texture sub-upload is gone. No
+     * frame-profile scope: two clock reads cost more than the write, and
+     * swraster still counts the call. */
     swraster::set_pixel(p->swSurface(), x, y,
                         swraster::Color{ pixel[0], pixel[1], pixel[2], pixel[3] });
-#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
-    profileRaster.stop();
-#endif
-    p->addTaintedArea(IntRect(x, y, 1, 1));
-    p->markDirty(IntRect(x, y, 1, 1));
-    p->onModified(false);
+    p->pixelModified(x, y);
     return;
 #else
     if (!p->megaSurface)
@@ -4271,15 +4444,6 @@ void Bitmap::replaceRaw(void *pixel_data, int size)
     taintArea(IntRect(0,0,w,h));
     p->onModified();
 }
-
-#ifdef MKXPZ_SOFTWARE_BITMAPS
-void Bitmap::refreshFrame()
-{
-    guardDisposed();
-
-    p->refreshFrameNow();
-}
-#endif
 
 void Bitmap::saveToFile(const char *filename)
 {
@@ -4481,6 +4645,30 @@ static std::string fixupString(const char *str)
     return s;
 }
 
+/* q = n / F and rem = n % F for 1 <= F <= 65025, n <= 255 * F, without a
+ * divide (Cortex-A9 has none). The seed underestimates
+ * 2^(32+e) / F (F's top bit is e) by less than 1/257, so est is q or q - 1
+ * and one compare finishes it; the bound holds for every F. */
+static inline uint32_t textDivide(uint32_t n, uint32_t F, uint32_t &rem)
+{
+    struct Seed {
+        uint32_t v[256];
+        constexpr Seed() : v() {
+            for (int i = 0; i < 256; ++i)
+                v[i] = (uint32_t)((uint64_t(1) << 40) / (257 + i));
+        }
+    };
+    static constexpr Seed seed;
+    const int s = __builtin_clz(F);
+    uint32_t est = (uint32_t)(((uint64_t)n * seed.v[((F << s) >> 23) - 256]) >> 32) >> (31 - s);
+    rem = n - est * F;
+    if (rem >= F) {
+        ++est;
+        rem -= F;
+    }
+    return est;
+}
+
 static void applyShadow(SDL_Surface *&in, const SDL_PixelFormat &fm, const SDL_Color &c, int offset)
 {
     SDL_Surface *out = SDL_CreateRGBSurface
@@ -4490,10 +4678,6 @@ static void applyShadow(SDL_Surface *&in, const SDL_PixelFormat &fm, const SDL_C
     if (!out)
         throw Exception(Exception::SDLError, "Error creating text shadow: %s",
                         SDL_GetError());
-    
-    float fr = c.r / 255.0f;
-    float fg = c.g / 255.0f;
-    float fb = c.b / 255.0f;
     
     /* We allocate an output surface one pixel wider and higher than the input,
      * (implicitly) blit a copy of the input with RGB values set to black into
@@ -4547,23 +4731,19 @@ static void applyShadow(SDL_Surface *&in, const SDL_PixelFormat &fm, const SDL_C
                 continue;
             }
             
-            float fSrcA = srcA / 255.0f;
-            float fShdA = shdA / 255.0f;
-            
-            /* Because opacity == 1, co1 == fSrcA */
-            float co2 = fShdA * (1.0f - fSrcA);
-            /* Result alpha */
-            float fa = fSrcA + co2;
-            /* Temp value to simplify arithmetic below */
-            float co3 = fSrcA / fa;
-            
+            /* Stock's float blend in exact integers (scaled by 65025):
+             * colour = c * co1 / fa, alpha = fa / 255, both truncated. */
+            uint32_t co1 = srcA * 255;
+            uint32_t fa = co1 + shdA * (255 - srcA);
+            uint32_t rem;
+
             /* Result colors */
             uint8_t r, g, b, a;
-            
-            r = clamp<float>(fr * co3, 0, 1) * 255.0f;
-            g = clamp<float>(fg * co3, 0, 1) * 255.0f;
-            b = clamp<float>(fb * co3, 0, 1) * 255.0f;
-            a = clamp<float>(fa, 0, 1) * 255.0f;
+
+            r = textDivide(c.r * co1, fa, rem);
+            g = textDivide(c.g * co1, fa, rem);
+            b = textDivide(c.b * co1, fa, rem);
+            a = fa / 255;
             
             *outP = SDL_MapRGBA(&fm, r, g, b, a);
         }
@@ -4584,12 +4764,12 @@ static inline void blendText(SDL_Surface *txtSrf, const SDL_Rect &inRect, const 
     uint8_t *outStart = (uint8_t*)outSrf->pixels + offset;
     
     // SDL_TTF sets every pixel to the same RGB value and just adjusts the alpha
-    float txtR = inColor.r;
-    float txtG = inColor.g;
-    float txtB = inColor.b;
-    float outR = outColor.r;
-    float outG = outColor.g;
-    float outB = outColor.b;
+    uint32_t txtR = inColor.r;
+    uint32_t txtG = inColor.g;
+    uint32_t txtB = inColor.b;
+    uint32_t outR = outColor.r;
+    uint32_t outG = outColor.g;
+    uint32_t outB = outColor.b;
     
     /* SDL_ttf blends the glyphs together, which causes overlapping
      * transparent pixels to get too opaque. RGSS probably does it, too,
@@ -4638,10 +4818,6 @@ static inline void blendText(SDL_Surface *txtSrf, const SDL_Rect &inRect, const 
                 /* Result colors */
                 uint8_t r, g, b, a;
                 
-                float faInv = 1.0f / fa;
-                float co3 = co1 * faInv;
-                float co4 = co2 * faInv;
-
                 if (hasShadow)
                 {
                     txtR = (*txtPixel >> txtSrf->format->Rshift) & 0xFF;
@@ -4649,10 +4825,16 @@ static inline void blendText(SDL_Surface *txtSrf, const SDL_Rect &inRect, const 
                     txtB = (*txtPixel >> txtSrf->format->Bshift) & 0xFF;
                 }
 
-                // Adding a small number to combat floating point errors.
-                r = std::min<int>((txtR * co3 + outR * co4) + 0.001f, 255);
-                g = std::min<int>((txtG * co3 + outG * co4) + 0.001f, 255);
-                b = std::min<int>((txtB * co3 + outB * co4) + 0.001f, 255);
+                /* Stock truncated (txt * co1 + out * co2) / fa + 0.001 in
+                 * float; exactly: round up when the remainder is >= 0.999 fa. */
+                const uint32_t up = 999u * fa;
+                uint32_t rem, q;
+                q = textDivide(txtR * co1 + outR * co2, fa, rem);
+                r = std::min<uint32_t>(q + (rem * 1000u >= up), 255);
+                q = textDivide(txtG * co1 + outG * co2, fa, rem);
+                g = std::min<uint32_t>(q + (rem * 1000u >= up), 255);
+                q = textDivide(txtB * co1 + outB * co2, fa, rem);
+                b = std::min<uint32_t>(q + (rem * 1000u >= up), 255);
                 
                 /* RGSS seems to not round, but our blit shader seemingly does. */
                 a = (uint32_t)(((uint64_t)(uint32_t)fa * alphaRecip) >> 32);
@@ -4789,7 +4971,7 @@ void Bitmap::drawText(const IntRect &rect, const char *str, int align)
                 // Adding a small number to combat floating point errors.
                 c.r = std::min<int>((c.r * co3 + co.r * co4) + 0.001f, 255);
                 c.g = std::min<int>((c.g * co3 + co.g * co4) + 0.001f, 255);
-                c.b = std::min<int>((c.b * co3 + co.g * co4) + 0.001f, 255);
+                c.b = std::min<int>((c.b * co3 + co.b * co4) + 0.001f, 255);
                 
                 c.a = (fa + 1 + (fa >> 8)) >> 8;
                 /* Use this instead if we decide we want to round 

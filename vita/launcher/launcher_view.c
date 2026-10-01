@@ -486,7 +486,7 @@ int launcher_view_init(LauncherView *v, const char *fonts_dir,
         return 0;
     }
 
-    /* The canvas is a source for one glTexSubImage2D, never a blit source:
+    /* The canvas is a source for one glTexImage2D, never a blit source:
      * blending it onto anything would be a second full-screen composite. */
     SDL_SetSurfaceBlendMode(v->canvas, SDL_BLENDMODE_NONE);
     fill(v->canvas, 0, 0, LAUNCHER_VIEW_W, LAUNCHER_VIEW_H, kBackground);

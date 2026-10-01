@@ -1,0 +1,32 @@
+# sdl2-0003: double-buffered vitaGL display by default.
+# vitaGL starts with 3 display buffers and displayQueueMaxPendingCount 2
+# (gxm.c:48,392). A 60.000 Hz frame limiter runs slightly faster than the
+# panel, fills that queue and settles two frames ahead: about 16-33 ms of
+# extra input latency. LoadLibrary now calls vglUseTripleBuffering before
+# vglInitWithCustomSizes: 2 buffers / 1 pending unless the hint (or env var)
+# SDL_VITA_VGL_TRIPLE_BUFFER is true. The circular vertex pool is split per
+# buffer, so each frame's slice grows from 1/3 to 1/2 of the same total.
+diff --git a/src/video/vita/SDL_vitagles_vgl.c b/src/video/vita/SDL_vitagles_vgl.c
+index 8a8b7a8..6adb496 100644
+--- a/src/video/vita/SDL_vitagles_vgl.c
++++ b/src/video/vita/SDL_vitagles_vgl.c
+@@ -39,6 +39,10 @@
+ #define SDL_HINT_VITA_VGL_CDRAM_POOL   "SDL_VITA_VGL_CDRAM_POOL"
+ #define SDL_HINT_VITA_VGL_PHYCONT_POOL "SDL_VITA_VGL_PHYCONT_POOL"
+ #define SDL_HINT_VITA_VGL_CDLG_POOL    "SDL_VITA_VGL_CDLG_POOL"
++/* vitaGL defaults to 3 display buffers with 2 pending flips, so a 60 fps
++   loop settles two frames ahead of the panel. 2 buffers / 1 pending unless
++   this hint is "1". */
++#define SDL_HINT_VITA_VGL_TRIPLE_BUFFER "SDL_VITA_VGL_TRIPLE_BUFFER"
+ 
+ #define VITAGL_DEFAULT_RAM_POOL     (96 * 1024 * 1024)
+ #define VITAGL_DEFAULT_CDRAM_POOL   (64 * 1024 * 1024)
+@@ -108,6 +112,8 @@ VITA_GLES_LoadLibrary(_THIS, const char *path)
+         int cdlg = VITA_VGL_PoolSize(SDL_HINT_VITA_VGL_CDLG_POOL, VITAGL_DEFAULT_CDLG_POOL, VITAGL_MAX_CDLG_POOL);
+ 
+         sceSysmoduleLoadModule(SCE_SYSMODULE_IME);
++        /* Read by vglInit only (gxm.c displayQueueMaxPendingCount). */
++        vglUseTripleBuffering(SDL_GetHintBoolean(SDL_HINT_VITA_VGL_TRIPLE_BUFFER, SDL_FALSE) ? GL_TRUE : GL_FALSE);
+         /* The result is not a status: GL_TRUE only reports that vitaGL fell
+            back to the display's maximum resolution (vgl.c res_fallback). */
+         (void)vglInitWithCustomSizes(0, 960, 544, ram, cdram, phycont, cdlg,

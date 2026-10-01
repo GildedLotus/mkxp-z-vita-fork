@@ -1,0 +1,102 @@
+# vitagl-0012: circular vertex pool watermark in every build, read through a cheap getter.
+# - gxm.c: vglSwapBuffers records the bytes the finished frame reserved from its slice and the
+#   all-time maximum; upstream did this only with HAVE_DEBUG_INTERFACE. Two loads, a subtract and a
+#   compare per frame. Demand past the slice (spilled to ad-hoc allocations) is still counted.
+# - vgl.c, vitaGL.h: vglGetCircularPoolPeak(last_frame, peak, slice); the glue memory ledger logs it.
+#   The counters move from debug.c to vgl.c; shared.h exports them without the debug interface.
+# - vglMalloc keeps upstream's newlib-first order: the RAM pool is USER_RW_UNCACHE here.
+# - Shader output is unchanged: shipped GXPs stay valid (MANIFEST re-attested for the new patch hash only).
+diff --git a/source/debug.c b/source/debug.c
+index a3fc760..87c1077 100644
+--- a/source/debug.c
++++ b/source/debug.c
+@@ -40,10 +40,6 @@ void glPopGroupMarker(void) {
+ #include "utils/font_utils.h"
+ static int dbg_y = -18;
+ static uint32_t *frame_buf;
+-#if !defined(DISABLE_CIRCULAR_POOL) && !defined(CIRCULAR_POOL_SPEEDHACK)
+-uint32_t vgl_circular_pool_frame_peak = 0;
+-uint32_t vgl_circular_pool_global_peak = 0;
+-#endif
+ 
+ #ifdef HAVE_DEVKIT
+ int metrics_mode = SCE_RAZOR_GPU_LIVE_METRICS_GROUP_PBUFFER_USAGE; // Current live metrics to show
+diff --git a/source/gxm.c b/source/gxm.c
+index 788037b..20f5229 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -845,12 +845,10 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ 
+ 	vgl_framecount++;
+ #if !defined(DISABLE_CIRCULAR_POOL) && !defined(CIRCULAR_POOL_SPEEDHACK)
+-#ifdef HAVE_DEBUG_INTERFACE
+ 	vgl_circular_pool_frame_peak = (uint32_t)circular_data_pool_ptr[vgl_circular_idx] - (uint32_t)circular_data_pool[vgl_circular_idx];
+ 	if (vgl_circular_pool_frame_peak > vgl_circular_pool_global_peak) {
+ 		vgl_circular_pool_global_peak = vgl_circular_pool_frame_peak;
+ 	}
+-#endif
+ #ifdef LOG_ERRORS
+ 	if (circular_data_pool_ptr[vgl_circular_idx] > circular_data_pool_limit[vgl_circular_idx]) {
+ 		vgl_log("%s:%d Circular pool overrun on frame %u (Total of %u bytes). This can cause performance issues. Consider increasing its size with vglSetCircularPoolSize.\n", __FILE__, __LINE__, vgl_framecount - 1, circular_data_pool_ptr[vgl_circular_idx] - circular_data_pool_limit[vgl_circular_idx]);
+diff --git a/source/shared.h b/source/shared.h
+index d31b287..897e568 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -99,12 +99,10 @@ extern uint8_t *circular_data_pool[DISPLAY_MAX_BUFFER_COUNT];
+ extern uint8_t *circular_data_pool_ptr[DISPLAY_MAX_BUFFER_COUNT];
+ extern uint8_t *circular_data_pool_limit[DISPLAY_MAX_BUFFER_COUNT];
+ extern int vgl_circular_idx;
+-#ifdef HAVE_DEBUG_INTERFACE
+ extern uint32_t vgl_circular_pool_frame_peak;
+ extern uint32_t vgl_circular_pool_global_peak;
+ extern uint32_t circular_data_pool_size;
+ #endif
+-#endif
+ #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
+ extern GLboolean vgl_dynamic_wants_scratch;
+ extern GLboolean vgl_stream_wants_scratch;
+diff --git a/source/vgl.c b/source/vgl.c
+index 82cfab8..b4aa252 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -123,6 +123,8 @@ uint8_t *circular_data_pool[DISPLAY_MAX_BUFFER_COUNT];
+ uint8_t *circular_data_pool_ptr[DISPLAY_MAX_BUFFER_COUNT];
+ uint8_t *circular_data_pool_limit[DISPLAY_MAX_BUFFER_COUNT];
+ int vgl_circular_idx = 0;
++uint32_t vgl_circular_pool_frame_peak = 0;
++uint32_t vgl_circular_pool_global_peak = 0;
+ #else
+ static uint8_t *circular_data_pool;
+ static uint8_t *circular_data_pool_ptr;
+@@ -739,6 +741,16 @@ void vglSetCircularPoolSize(uint32_t size) {
+ #endif
+ }
+ 
++void vglGetCircularPoolPeak(uint32_t *last_frame, uint32_t *peak, uint32_t *slice) {
++#if !defined(DISABLE_CIRCULAR_POOL) && !defined(CIRCULAR_POOL_SPEEDHACK)
++	*last_frame = vgl_circular_pool_frame_peak;
++	*peak = vgl_circular_pool_global_peak;
++	*slice = (uint32_t)circular_data_pool_limit[0] - (uint32_t)circular_data_pool[0];
++#else
++	*last_frame = *peak = *slice = 0;
++#endif
++}
++
+ void vglUseCachedMem(GLboolean use) {
+ 	has_cached_mem = use;
+ }
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 89dca56..55f5e9b 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1244,6 +1244,10 @@ void *vglRealloc(void *ptr, uint32_t size);
+ // Change the total memory to use for internal circular pools to use in vitaGL. Disabled with NO_CIRCULAR_POOL. Default value: 32 * 1024 * 1024.
+ void vglSetCircularPoolSize(uint32_t size);
+ 
++// Circular vertex pool use: bytes reserved by the last finished frame, the most any frame reserved, and the
++// size of one per-frame slice. Usage past the slice spilled into ad-hoc allocations. All 0 without the pool.
++void vglGetCircularPoolPeak(uint32_t *last_frame, uint32_t *peak, uint32_t *slice);
++
+ // Sets the number of buffers to use for the display swapchain. Default value: 3.
+ void vglSetDisplayBufferCount(int count);
+ 

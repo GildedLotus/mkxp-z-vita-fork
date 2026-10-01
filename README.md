@@ -27,7 +27,7 @@ a problem.
 
 ## Status
 
-Version 1.0.1. Six free games across all three engines reach gameplay on a retail PS Vita, three of
+Version 1.0.2. Six free games across all three engines reach gameplay on a retail PS Vita, three of
 them with save, quit and reload verified. That is not yet a claim that whole games play through to the
 end; the per-game results and the port's known limits are in [COMPATIBILITY.md](vita/COMPATIBILITY.md).
 

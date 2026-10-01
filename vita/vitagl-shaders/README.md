@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # vitaGL precompiled shaders
 
-`v2/{v,f}/XX/<HEX>.gxp`: the vitaGL shader-cache binaries (30 stages, 24 programs, 38,012 bytes) that the
+`v2/{v,f}/XX/<HEX>.gxp`: the vitaGL shader-cache binaries (22 stages, 17 programs, 28,280 bytes) that the
 vitaGL backend loads from `app0:/shader_cache/` at boot. They are compiler output: the Sony shader compiler
 (`libshacccg.suprx`) built them on a Vita from this tree's GLSL (`shader/`). Cache keys are XXH3_64
 hashes of the shader source, so a changed source is a different file.

@@ -32,6 +32,8 @@
 #include "glstate.h"
 #include "texpool.h"
 #include "util.h"
+#include "quad.h"
+#include "shader.h"
 
 #include <assert.h>
 #include <vector>
@@ -338,6 +340,146 @@ static void buildCPU(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
 #undef EXEC_BLITS
 
 	softAtlasUpload(atlas, tf.tex);
+}
+
+/* The shadow set never changes: one 32x512 texture for the process. */
+static TEX::ID shadowSetTex()
+{
+	static TEX::ID tex;
+
+	if (tex == TEX::ID(0))
+	{
+		SDL_Surface *shadow = createShadowSet();
+		TEX::ID t = TEX::gen();
+		TEX::bind(t);
+		TEX::setRepeat(false);
+		TEX::setSmooth(false);
+		TEX::drainStaleErrors("tile-atlas-shadow");
+		const bool ok = TEX::uploadImageChecked(shadow->w, shadow->h,
+		                                        shadow->pixels, GL_RGBA);
+		SDL_FreeSurface(shadow);
+		if (!ok)
+		{
+			TEX::del(t);
+			return TEX::ID(0);
+		}
+		tex = t;
+	}
+
+	return tex;
+}
+
+/* G12: a draw that could not allocate leaves an error, not an atlas. Checked
+ * after each source, before the next upload drains errors as stale. */
+static bool drawFailed()
+{
+	bool failed = false;
+	for (GLenum err; (err = gl.GetError()) != GL_NO_ERROR;)
+	{
+		GPUBudget::noteGLError("tile-atlas", err);
+		failed = true;
+	}
+
+	return failed;
+}
+
+static void drawSource(SimpleShader &shader, Quad &quad, TEX::ID tex,
+                       const Vec2i &size, const IntRect &src, const Vec2i &dst)
+{
+	TEX::bind(tex);
+	TEX::setSmooth(false);
+	shader.setTexSize(size);
+	quad.setTexPosRect(src, IntRect(dst.x, dst.y, src.w, src.h));
+	quad.draw();
+}
+
+/* GLMeta's blits are not usable here: with the native blit they read the
+ * source's framebuffer, and a software Bitmap has none. So each stock blit is
+ * one SimpleShader quad, blending off: a 1:1 REPLACE copy like doBlitCPU. */
+bool buildGPU(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT])
+{
+	assert(tf.fbo != FBO::ID(0) && tf.selfHires == nullptr);
+
+	struct Restore
+	{
+		FBO::ID previous;
+		~Restore()
+		{
+			glState.blend.pop();
+			glState.scissorTest.pop();
+			glState.viewport.pop();
+			FBO::bind(previous);
+		}
+	};
+
+	TEX::ScopedBinding binding;
+	TEX::drainStaleErrors("tile-atlas");
+
+	const TEX::ID shadow = rgssVer >= 3 ? shadowSetTex() : TEX::ID(0);
+	if (rgssVer >= 3 && shadow == TEX::ID(0))
+		return false;
+
+	const FBO::ID previous = FBO::boundFramebufferID;
+	FBO::bind(tf.fbo);
+	glState.viewport.pushSet(IntRect(0, 0, tf.width, tf.height));
+	glState.scissorTest.pushSet(false);
+	glState.blend.pushSet(false);
+	const Restore restore = { previous };
+
+	glState.clearColor.pushSet(Vec4());
+	FBO::clear();
+	glState.clearColor.pop();
+
+	SimpleShader &shader = shState->shaders().simple;
+	shader.bind();
+	shader.applyViewportProj();
+	shader.setTranslation(Vec2i());
+	Quad &quad = shState->gpQuad();
+
+	if (rgssVer >= 3)
+		drawSource(shader, quad, shadow, Vec2i(32, 512), IntRect(0, 0, 32, 512),
+		           Vec2i(shadowArea.x*32, shadowArea.y*32));
+
+	for (int part = 0; part < BM_COUNT; ++part)
+	{
+		Bitmap *bm = bitmaps[part];
+		if (nullOrDisposed(bm))
+			continue;
+
+		/* Uploads the CPU pixels if they changed; throws on failure. A huge
+		 * Bitmap with no texture comes back with name 0. */
+		TEXFBO *src;
+		try { src = &bm->getGLTypes(); }
+		catch (const TEX::UploadError &) { return false; }
+		if (src->tex == TEX::ID(0))
+			return false;
+
+		const Vec2i size(src->width, src->height);
+		const IntRect bmr(0, 0, bm->width(), bm->height());
+		const Blit *ops = 0;
+		size_t opsN = 0;
+
+		switch (part)
+		{
+#define PART(p) case BM_##p: ops = blits##p; opsN = blits##p##N; break;
+		PART(A1) PART(A2) PART(A3) PART(A4) PART(A5) PART(B) PART(C) PART(D) PART(E)
+#undef PART
+		}
+
+		for (size_t i = 0; i < opsN; ++i)
+		{
+			IntRect r(ops[i].src.x*32, ops[i].src.y*32, ops[i].src.w*32, ops[i].src.h*32);
+			if (!SDL_IntersectRect(&r, &bmr, &r))
+				continue;
+			drawSource(shader, quad, src->tex, size, r,
+			           Vec2i(ops[i].dst.x*32, ops[i].dst.y*32));
+		}
+
+		if (drawFailed())
+			return false;
+	}
+
+	return !drawFailed();
 }
 #endif
 

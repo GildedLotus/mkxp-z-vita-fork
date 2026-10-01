@@ -745,7 +745,8 @@ static int mkxp_main(int argc, char *argv[]) {
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
     SDL_SetHint(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, "0");
 
-#ifdef GLES2_HEADER
+    /* SDL's Vita backend never reads this hint. */
+#if defined(GLES2_HEADER) && !defined(__vita__)
     SDL_SetHint(SDL_HINT_OPENGL_ES_DRIVER, "1");
 #endif
 
@@ -924,9 +925,15 @@ static int mkxp_main(int argc, char *argv[]) {
 #endif
     
     BootProfile::begin(BootProfile::GLInit);
+#ifdef MKXPZ_VITAGL_BACKEND
+    vita_glue_vgl_init_timing("game", 0);
+#endif
     win = SDL_CreateWindow(conf.windowTitle.c_str(), SDL_WINDOWPOS_UNDEFINED,
                            SDL_WINDOWPOS_UNDEFINED, conf.defScreenW,
                            conf.defScreenH, winFlags);
+#ifdef MKXPZ_VITAGL_BACKEND
+    vita_glue_vgl_init_timing("game", 1);
+#endif
 
     if (!win) {
       showInitError(std::string("Error creating window: ") + SDL_GetError());
@@ -937,7 +944,7 @@ static int mkxp_main(int argc, char *argv[]) {
       return 0;
     }
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
-    vita_glue_trace("trace: SDL_CreateWindow ok (EGL display path)");
+    vita_glue_trace("trace: SDL_CreateWindow ok (vitaGL display path)");
 #endif
     
 #ifdef MKXPZ_BUILD_XCODE

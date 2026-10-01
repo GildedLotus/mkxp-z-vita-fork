@@ -104,6 +104,21 @@ before, with no second argument. The decision comes from the directory
 listing alone — two readdir passes over the one folder, never a per-entry
 stat.
 
+### Scan limits
+
+* **256 games.** With more folders than that, the list holds the first 256 the
+  directory scan returned (in the card's own order, sorted only afterwards) and
+  the rest are missing, with no on-screen notice: only the `launcher: scan …
+  truncated=1` log line says so.
+* **8 `.ini` files.** A folder with more than eight `.ini` files is rejected as
+  ambiguous.
+* **4096 bytes.** A `Game.ini` larger than that drops the game from the list;
+  the log names the folder.
+* **BOM or leading whitespace.** The launcher's parser skips a UTF-8 BOM and
+  trims each line, so a `Game.ini` that starts with either is listed. The
+  engine's parser recognises a section only when the line starts with `[`, so
+  such a game starts and stops with "No script file has been specified".
+
 ## The files
 
 ```
@@ -145,6 +160,12 @@ game, points at the log (still intact), and deletes the file.
 This is the **only** crash handling in scope. No `atexit`, no signal handler, no
 watchdog thread — a GPU fault or a kernel kill defeats all three, and each
 would be one more thing running while the process is being replaced.
+
+Any exit that is not that hand-over produces the same report: closing the app
+from LiveArea or losing power is indistinguishable from a crash, so the next
+launcher start shows "The last game did not exit cleanly", under the raw kind
+`unclean-exit`. Holding Start and Select for two seconds is the way to quit a
+game cleanly.
 
 A **pinned** boot neither writes a breadcrumb nor consumes one. The evidence of
 a crash belongs to the launcher, and a diagnostic run must not eat it.
@@ -262,7 +283,6 @@ mkxp-z.log     vita-boot: mode=game reason=arg config=absent game='ux0:/…/Blan
 mkxp-z.log     vita-boot: breadcrumb 'ux0:/data/mkxp-z/launch-in-progress.txt'
 mkxp-z.log     vita-config: layers default=ok global=… root=… arg=ok
 mkxp-z.log     vita-gpu: fixed render surfaces reserved=3 at 640x480 (rgss3, …)
-mkxp-z.log     vita-gpu: boot headroom surfaces=<n> (about <4n> sync objects)
 mkxp-z.log     vita-boot: returning to launcher (rc=0)
 launcher.log   vita-boot: mode=launcher …
 ```
@@ -278,12 +298,13 @@ launcher.log   launcher: last-error consumed bytes=…
 `config=` is `ok`, `absent`, `unreadable` or `too-large`. Together they say
 which of the four rules above fired and what the root config had to do with it.
 
-The two `vita-gpu:` lines are the sync-object gate. A launcher-started boot has
+The `vita-gpu:` line is the render-surface gate. A launcher-started boot has
 to report the same numbers as a pinned direct boot of the *same ELF*: the port
 reserves its render surfaces at boot, and a hand-over must leave the same
 budget.
-The headroom line only exists when `ux0:/data/mkxp-z/gpu-headroom.enabled` is
-on the card; that is a separate marker, and `gpu-telemetry.enabled` does not turn it on.
+Earlier builds also logged `vita-gpu: boot headroom surfaces=<n>` after it,
+from a canary enabled by `gpu-headroom.enabled`; that canary returns at once on
+vitaGL, so the line cannot occur on this build.
 
 ## Preflight sidecar
 

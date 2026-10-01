@@ -237,6 +237,10 @@ struct WindowVXPrivate
 		 * dirties. */
 		Vec4 bakedTone;
 		bool bakedValid;
+
+		/* Atlas slot of a GPU-composed base; invalid
+		 * while the base lives in 'pixels'/'tex' instead. */
+		BaseSlot slot;
 #endif
 		ColorQuadArray vert;
 		size_t bgTileQuads;
@@ -346,6 +350,7 @@ struct WindowVXPrivate
 		 * if it was ever composed. Nothing to give back to a pool. */
 		if (base.tex.tex != TEX::ID(0))
 			TEX::del(base.tex.tex);
+		GPUBudget::releaseWindowBase(base.slot);
 #else
 		shState->texPool().release(base.tex);
 #endif
@@ -474,6 +479,7 @@ struct WindowVXPrivate
 				TEX::del(base.tex.tex);
 
 			base.tex.tex = TEX::ID(0);
+			GPUBudget::releaseWindowBase(base.slot);
 		}
 
 		return;
@@ -733,20 +739,116 @@ struct WindowVXPrivate
 
 		/* opacity is base.quad's vertex alpha, so at zero the quad is a
 		 * no-op draw of a texture nothing can see. */
-		if (base.texDirty || base.tex.tex == TEX::ID(0) || opacity == 0)
+		if (base.texDirty || opacity == 0 ||
+		    (!base.slot.valid() && base.tex.tex == TEX::ID(0)))
 			return;
+
+		if (base.slot.valid())
+		{
+			const TEXFBO &atlas = GPUBudget::windowBaseAtlas();
+			shader.setTexSize(Vec2i(atlas.width, atlas.height));
+			TEX::bind(atlas.tex);
+			TEX::setSmooth(true);
+			base.quad.draw();
+			return;
+		}
 
 		shader.setTexSize(Vec2i(base.tex.width, base.tex.height));
 
 		TEX::bind(base.tex.tex);
 		base.quad.draw();
 	}
+
+	/* The stock pass below, drawn into this window's atlas slot instead of
+	 * a pooled render target. False when there is no
+	 * slot to be had; the CPU twin then composes as before. */
+	bool composeBaseGpu()
+	{
+		if (nullOrDisposed(windowskin) || geo.w <= 4 || geo.h <= 4 ||
+		    base.vert.count() == 0 ||
+		    !GPUBudget::placeWindowBase(base.slot, geo.w, geo.h))
+		{
+			GPUBudget::releaseWindowBase(base.slot);
+			updateBaseQuad();
+			return false;
+		}
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::Scope profileCompose(FrameProfile::Compose);
+#endif
+		GPUBudget::composeWindowBase(base.slot, drawBaseLayers, this);
+		updateBaseQuad();
+		base.bakedTone = tone->norm;
+		base.bakedValid = true;
+
+		if (base.tex.tex != TEX::ID(0))
+			TEX::del(base.tex.tex);
+		base.tex.tex = TEX::ID(0);
+		std::vector<uint8_t>().swap(base.pixels);
+
+		return true;
+	}
+
+	static void drawBaseLayers(void *ctx, const Vec2i &origin)
+	{
+		WindowVXPrivate *p = static_cast<WindowVXPrivate*>(ctx);
+		ShaderBase *shader;
+
+		if (p->backOpacity < 255 || p->tone->hasEffect())
+		{
+			PlaneShader &planeShader = shState->shaders().plane;
+			planeShader.bind();
+
+			planeShader.setColor(Vec4());
+			planeShader.setFlash(Vec4());
+			planeShader.setTone(p->tone->norm);
+			planeShader.setOpacity(p->backOpacity.norm);
+
+			shader = &planeShader;
+		}
+		else
+		{
+			shader = &shState->shaders().simple;
+			shader->bind();
+		}
+
+		p->windowskin->bindTex(*shader);
+		TEX::setSmooth(true);
+
+		shader->setTranslation(origin);
+		shader->applyViewportProj();
+
+		glState.blend.pushSet(false);
+		p->base.vert.draw(0, 1);
+
+		glState.blend.set(true);
+		glState.blendMode.pushSet(BlendKeepDestAlpha);
+		p->base.vert.draw(1, p->base.bgTileQuads);
+
+		glState.blendMode.set(BlendNormal);
+
+		if (shader != &shState->shaders().simple)
+		{
+			shader = &shState->shaders().simple;
+			shader->bind();
+			shader->setTranslation(origin);
+			shader->applyViewportProj();
+			p->windowskin->bindTex(*shader);
+		}
+
+		p->base.vert.draw(1 + p->base.bgTileQuads, p->base.borderQuads);
+
+		TEX::setSmooth(false);
+		glState.blendMode.pop();
+		glState.blend.pop();
+	}
 #endif
 
 	void redrawBaseTex()
 	{
 #ifdef MKXPZ_SOFTWARE_BITMAPS
-		composeBase();
+		if (!composeBaseGpu())
+			composeBase();
 		return;
 #else
 		if (nullOrDisposed(windowskin))
@@ -824,7 +926,12 @@ struct WindowVXPrivate
 
 	void updateBaseQuad()
 	{
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		const FloatRect tex(base.slot.valid() ? base.slot.innerX() : 0,
+		                    base.slot.valid() ? base.slot.innerY() : 0, geo.w, geo.h);
+#else
 		const FloatRect tex(0, 0, geo.w, geo.h);
+#endif
 		const FloatRect pos(0, (geo.h / 2.0f) * (1.0f - openness.norm),
 		                    geo.w, geo.h * openness.norm);
 

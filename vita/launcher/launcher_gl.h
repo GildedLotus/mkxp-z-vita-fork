@@ -3,14 +3,12 @@
  * launcher_gl.h — the launcher's entire GPU footprint.
  *
  * One texture, one VBO, one program, no FBO, no per-frame readback. The
- * contract dates from an earlier GL driver, which took a
- * firmware sync object for every resident texture, every VBO and three more
- * per render surface, out of a pool of about 64 for the whole process, first
- * come first served, and the footprint stays this small on vitaGL. The
- * launcher runs in the SAME
- * eboot as the player and hands the process to it with sceAppMgrLoadExec, so
- * every object the launcher holds at that moment is a question mark over the
- * game that follows. Three sync objects is the whole bill:
+ * contract dates from an earlier GL driver, which took a firmware sync
+ * object per texture, VBO and render surface from a small process-wide pool.
+ * It is kept on vitaGL because the launcher runs in the SAME eboot as the
+ * player and hands the process to it with sceAppMgrLoadExec, so every object
+ * the launcher holds at that moment is a question mark over the game that
+ * follows. Three objects is the whole bill:
  *
  *     texture 1  +  VBO 1  +  program (code-heap segments)  =  0 surfaces
  *
@@ -19,16 +17,15 @@
  *
  * Rules this module keeps, each measured rather than assumed:
  *
- *  - Whole-level uploads only. A 32x32 sub-rect glTexSubImage2D on a texture
- *    that was sampled last frame cost 16.1 ms on hardware — a full frame —
- *    against 4.2 ms for the whole 256x256 level. The
- *    launcher composes its 960x544 canvas on the CPU and uploads all of it,
- *    or nothing.
+ *  - Whole-level uploads only, as glTexImage2D. The canvas texture is
+ *    sampled every frame, and vitaGL copies such a level before any
+ *    glTexSubImage2D. The launcher composes its 960x544 canvas on the CPU
+ *    and uploads all of it, or nothing.
  *  - Upload only when the view is dirty. The list changes on a keypress, not
  *    on a frame, so a still screen costs one draw and a swap.
- *  - No FBO and no per-frame readback. A render surface is three sync objects the
- *    player will want, and the failure mode of a refused one is a driver
- *    use-after-free, not an error code.
+ *  - No FBO and no per-frame readback. The launcher has one full-screen
+ *    quad to draw and no reason to hold a render surface across the
+ *    hand-over.
  *
  * C99 + <GLES2/gl2.h> only. No SDL, no Vita headers, no allocation, so
  * this file compiles on the host against any gl2.h.

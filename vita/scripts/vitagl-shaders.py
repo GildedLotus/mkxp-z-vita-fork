@@ -67,16 +67,21 @@ def _define(cpp, name):
 
 
 def boot_classes(header):
-    """ShaderSet members before the first optional-shader block, in declaration order."""
+    """ShaderSet members before the first optional-shader block, in declaration order, without the
+    GPU-bitmap-only block (#ifndef MKXPZ_SOFTWARE_BITMAPS), which the software-bitmap player never builds."""
     m = re.search(r"struct ShaderSet\s*\{(.*?)\n\};", header, re.S)
     if not m:
         raise ShaderError("shader.h: no ShaderSet")
-    names = []
+    names, gpu_bitmaps_only = [], False
     for line in m.group(1).splitlines():
         if line.startswith("#ifndef MKXPZ_NO_OPTIONAL_SHADERS"):
             break
+        if line.startswith("#ifndef MKXPZ_SOFTWARE_BITMAPS"):
+            gpu_bitmaps_only = True
+        elif gpu_bitmaps_only and line.startswith("#endif"):
+            gpu_bitmaps_only = False
         member = re.match(r"\s+(\w+)\s+\w+;", line)
-        if member:
+        if member and not gpu_bitmaps_only:
             names.extend(BLUR if member.group(1) == "BlurShader" else (member.group(1),))
     return names
 
@@ -234,6 +239,14 @@ def manifest_inputs(repo):
     return lines
 
 
+def device_cache_dir(title, root):
+    """The writable device cache a build stamped with root's MANIFEST uses (vita_glue.c shader_cache_root)."""
+    try:
+        return "%s-%s" % (title, _sha256((Path(root) / MANIFEST_NAME).read_bytes())[:16])
+    except OSError as error:
+        raise ShaderError("--ftp needs the stamped set's MANIFEST in --dir (%s); pull by hand and use --from-dir" % error)
+
+
 def set_digest(root):
     digest = hashlib.sha256()
     base = Path(root) / ("v%d" % SHADER_CACHE_MAGIC)
@@ -307,7 +320,7 @@ def main(argv=None):
     cap = sub.choices["capture"]
     cap.add_argument("--from-dir", help="a device cache already pulled (holds v%d/)" % SHADER_CACHE_MAGIC)
     cap.add_argument("--ftp", help="host:port of the device FTP server")
-    cap.add_argument("--title", help="test title id whose ux0:data/shader_cache/<id> is pulled")
+    cap.add_argument("--title", help="test title id whose ux0:data/shader_cache/<id>-<set> is pulled (set from --dir's MANIFEST)")
     args = ap.parse_args(argv)
     pulled = None
     try:
@@ -325,7 +338,8 @@ def main(argv=None):
                 if not args.title or not re.fullmatch(r"MKXPZ00[0-9A-Z]{2}", args.title) or args.title == "MKXPZ0001":
                     raise ShaderError("--title must be a test title id (MKXPZ00xx, not the product id)")
                 src = pulled = tempfile.mkdtemp(prefix="vitagl-pull-")
-                print("pulled %d files" % ftp_pull(args.ftp, "ux0:/data/shader_cache/%s" % args.title, src))
+                remote = "ux0:/data/shader_cache/%s" % device_cache_dir(args.title, args.dir)
+                print("pulled %d files" % ftp_pull(args.ftp, remote, src))
             if Path(src).resolve() == Path(args.dir).resolve():
                 raise ShaderError("--dir must differ from the pulled cache")
             want, have = expected(progs), present(src)

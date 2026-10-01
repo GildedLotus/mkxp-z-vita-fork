@@ -58,6 +58,13 @@ struct Reader
 
 void build(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT]);
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+/* The same atlas drawn into tf's framebuffer. False when
+ * a source cannot be sampled or GL reports an error; the caller then builds
+ * on the CPU into a plain texture. */
+bool buildGPU(TEXFBO &tf, Bitmap *bitmaps[BM_COUNT]);
+#endif
+
 void readTiles(Reader &reader, const Table &data,
                const Table *flags, int ox, int oy, int w, int h);
 }

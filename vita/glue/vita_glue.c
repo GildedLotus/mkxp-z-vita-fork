@@ -21,6 +21,11 @@
 #ifndef MKXPZ_VITA_VERSION
 #define MKXPZ_VITA_VERSION "dev"
 #endif
+/* Shipped GXP set identity: configure -D stamps the first 16
+ * hex digits of sha256(vita/vitagl-shaders/MANIFEST). */
+#ifndef VITA_SHADER_SET_ID
+#define VITA_SHADER_SET_ID "dev"
+#endif
 
 #include <psp2/gxm.h>
 #include <psp2/io/fcntl.h>
@@ -1327,7 +1332,7 @@ void vita_glue_memory_ledger_log(const VitaMemoryResources *r)
 	 * Storage records describe requested bytes, not driver residency. */
 	snprintf(line, sizeof(line),
 	         "vita-memory: scene=%u ms=%llu newlib=%u/%u/%u/%u/%u/na "
-	         "libc=na/na services=na/na driver=na/na kernel=%s krc=%d "
+	         "kernel=%s krc=%d "
 	         "cpu_px=%llu tex=%llu buf=%llu gpu=%u/%u/%u retire=%u/%llu fibers=%s",
 	         memory_ledger_scene, memory_ledger_last_us / 1000ull,
 	         (unsigned)heap.uordblks, (unsigned)heap.fordblks, arena,
@@ -1370,23 +1375,44 @@ void vita_glue_vgl_pools(int ram_mib, int cdram_mib, int phycont_mib, VitaVglPoo
 		phycont = (unsigned)info.size_phycont;
 	}
 	/* RAM max is vitaGL's uncached-RAM cap (mem_utils.c). */
-	out->ram = vita_glue_vgl_pool_bytes("ram", ram_mib, 96, 16, 200, user);
-	out->cdram = vita_glue_vgl_pool_bytes("cdram", cdram_mib, 64, 16, 112, cdram);
-	out->phycont = vita_glue_vgl_pool_bytes("phycont", phycont_mib, 16, 4, 26, phycont);
+	out->ram = vita_glue_vgl_pool_bytes("ram", ram_mib, VITA_GLUE_VGL_RAM_MIB, 16, 200, user);
+	out->cdram = vita_glue_vgl_pool_bytes("cdram", cdram_mib, VITA_GLUE_VGL_CDRAM_MIB, 16, 112, cdram);
+	out->phycont = vita_glue_vgl_pool_bytes("phycont", phycont_mib, VITA_GLUE_VGL_PHYCONT_MIB, 4, 26, phycont);
+}
+
+static unsigned long long vgl_init_begin_us;
+
+void vita_glue_vgl_init_timing(const char *tag, int end)
+{
+	char line[200];
+	unsigned long long now = sceKernelGetProcessTimeWide();
+	if (!end) {
+		vgl_init_begin_us = now;
+		return;
+	}
+	snprintf(line, sizeof(line),
+	         "vita-boot: vgl_init tag=%s window_us=%llu ram=%llu cdram=%llu phycont=%llu cdlg=%llu",
+	         tag ? tag : "?", now - vgl_init_begin_us,
+	         (unsigned long long)vglMemTotal(VGL_MEM_RAM), (unsigned long long)vglMemTotal(VGL_MEM_VRAM),
+	         (unsigned long long)vglMemTotal(VGL_MEM_PHYCONT), (unsigned long long)vglMemTotal(VGL_MEM_BUDGET));
+	vita_glue_trace(line);
 }
 
 void vita_glue_vgl_pool_ledger(const char *tag)
 {
 	char line[256];
+	uint32_t vtx_last, vtx_peak, vtx_slice;
 	if (!vita_glue_memory_ledger_enabled) return;
+	vglGetCircularPoolPeak(&vtx_last, &vtx_peak, &vtx_slice); /* vitagl-0012 */
 	snprintf(line, sizeof(line),
 	         "vita-vgl-pool: tag=%s scene=%u ram=%llu/%llu cdram=%llu/%llu "
-	         "phycont=%llu/%llu cdlg=%llu/%llu",
+	         "phycont=%llu/%llu cdlg=%llu/%llu vtx=%u/%u/%u",
 	         tag ? tag : "?", memory_ledger_scene,
 	         (unsigned long long)vglMemFree(VGL_MEM_RAM), (unsigned long long)vglMemTotal(VGL_MEM_RAM),
 	         (unsigned long long)vglMemFree(VGL_MEM_VRAM), (unsigned long long)vglMemTotal(VGL_MEM_VRAM),
 	         (unsigned long long)vglMemFree(VGL_MEM_PHYCONT), (unsigned long long)vglMemTotal(VGL_MEM_PHYCONT),
-	         (unsigned long long)vglMemFree(VGL_MEM_BUDGET), (unsigned long long)vglMemTotal(VGL_MEM_BUDGET));
+	         (unsigned long long)vglMemFree(VGL_MEM_BUDGET), (unsigned long long)vglMemTotal(VGL_MEM_BUDGET),
+	         (unsigned)vtx_last, (unsigned)vtx_peak, (unsigned)vtx_slice);
 	vita_glue_trace(line);
 }
 
@@ -1725,7 +1751,7 @@ int vita_glue_init_log(const char *log_path)
 	/* Both configurable heaps, every run, before anything can fail: which
 	 * allocator a later number belongs to is not inferable from the build. */
 	snprintf(line, sizeof(line),
-		 "vita_glue: sceLibcHeapSize = %u bytes (%u MiB) — SceLibc, the GLES2 driver's host heap\n",
+		 "vita_glue: sceLibcHeapSize = %u bytes (%u MiB) — SceLibc, unused (nothing loads libc.suprx)\n",
 		 sceLibcHeapSize, sceLibcHeapSize / MIB);
 	boot_log_line(path, line);
 	snprintf(line, sizeof(line),
@@ -2029,9 +2055,26 @@ void vita_glue_log_heap(const char *tag)
 	vita_glue_trace(line);
 }
 
+/*
+ * vitaGL reads its writable cache before the shipped app0:/shader_cache, and
+ * both are keyed by the GLSL text alone, so a GXP an older vitaGL or
+ * translator compiled on the device would shadow the newer shipped one. One
+ * writable root per shipped set keeps old entries out of reach (they are left
+ * in place). A direct child of ux0:data/shader_cache, the only parent vitaGL
+ * creates; at most 127 bytes, vitaGL's root buffer. Returns 0 when it fits.
+ */
+static int shader_cache_root(char *out, unsigned size, const char *title,
+                             const char *set_id)
+{
+	int n = snprintf(out, size, "ux0:data/shader_cache/%s-%s", title, set_id);
+
+	return n > 0 && (unsigned)n < size ? 0 : -1;
+}
+
 int vita_glue_boot(const char *log_path, const char *module_dir)
 {
 	int rc;
+	char title[16], cache_root[128];
 
 	(void)module_dir; /* no driver modules to load; the engine's boot call still passes NULL */
 
@@ -2055,6 +2098,12 @@ int vita_glue_boot(const char *log_path, const char *module_dir)
 	glue_fflush();
 
 	/* Shipped GXP live in the VPK; must run before vglInit (SDL_Init). */
+	app_title_id(title, sizeof(title));
+	if (shader_cache_root(cache_root, sizeof(cache_root), title,
+	                      VITA_SHADER_SET_ID) == 0) {
+		vglSetShaderCachePath(cache_root);
+		glue_logf("vita_glue: writable shader cache %s", cache_root);
+	}
 	vglSetShaderCacheFallbackPath("app0:/shader_cache");
 	glue_logf("vita_glue: vitaGL backend, shaders from app0:/shader_cache");
 	glue_fflush();

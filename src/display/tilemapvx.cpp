@@ -91,6 +91,9 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 	uint8_t flashAlphaIdx;
 
 	bool atlasDirty;
+	/* atlas is GPUBudget's reserved surface, drawn by buildGPU();
+	 * false: a plain texture built on the CPU. */
+	bool gpuAtlas;
 	bool buffersDirty;
 	bool mapViewportDirty;
 
@@ -131,6 +134,7 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 	      frameIdx(0),
 	      flashAlphaIdx(0),
 	      atlasDirty(true),
+	      gpuAtlas(false),
 	      buffersDirty(false),
 	      mapViewportDirty(false),
 	      above(this, viewport)
@@ -152,7 +156,9 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 #ifdef MKXPZ_SOFTWARE_BITMAPS
 		{
 			TEX::ScopedBinding binding;
-			shState->requestAtlasTex(ATLASVX_W, ATLASVX_H, atlas);
+			gpuAtlas = GPUBudget::claimTileAtlas(ATLASVX_W, ATLASVX_H, atlas);
+			if (!gpuAtlas)
+				shState->requestAtlasTex(ATLASVX_W, ATLASVX_H, atlas);
 		}
 #else
 		shState->requestAtlasTex(ATLASVX_W, ATLASVX_H, atlas);
@@ -190,6 +196,11 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 		GLMeta::vaoFini(vao);
 		VBO::del(vbo);
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		if (gpuAtlas)
+			GPUBudget::releaseTileAtlas(atlas);
+		else
+#endif
 		shState->releaseAtlasTex(atlas);
 #ifndef MKXPZ_SOFTWARE_BITMAPS
 		if (shState->config().enableHires) {
@@ -231,6 +242,17 @@ struct TilemapVXPrivate : public ViewportElement, TileAtlasVX::Reader
 	{
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
 		FrameProfile::Scope profileAtlas(FrameProfile::Compose);
+#endif
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		if (gpuAtlas && !TileAtlasVX::buildGPU(atlas, bitmaps))
+		{
+			/* For good: the next claimant clears the surface anyway. */
+			Debug() << "vita-gpu: tile atlas compose failed; this tilemap composes on the CPU";
+			GPUBudget::releaseTileAtlas(atlas);
+			gpuAtlas = false;
+			shState->requestAtlasTex(ATLASVX_W, ATLASVX_H, atlas);
+		}
+		if (!gpuAtlas)
 #endif
 		TileAtlasVX::build(atlas, bitmaps);
 

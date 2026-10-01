@@ -7,9 +7,8 @@
  * framebuffer. Everything — background, header, rows, selection bar, glyphs
  * — is blitted into it by the CPU, and launcher_gl.c uploads the result as
  * one whole texture level. There is no second surface, no render target and
- * no per-row texture, because a render surface costs three firmware sync
- * objects out of a process-wide pool of about 64 and
- * the launcher has to hand that pool to the game intact.
+ * no per-row texture: the launcher hands the GPU to the game with as little
+ * held as possible (see launcher_gl.h).
  *
  * The CPU cost that buys is real but bounded, and it is why row text is
  * cached: SDL_ttf rendering a line is far more expensive than blitting the

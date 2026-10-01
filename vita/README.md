@@ -65,9 +65,8 @@ turn the page. A game whose `Game.ini` names an RTP that is not installed under
 `ux0:/data/mkxp-z/rtp/` is tagged "RTP missing".
 
 Launcher limits: at most 256 games are listed; folders whose names start with
-`.` are ignored; a game whose full path exceeds 255 bytes is skipped; and the
-folder name is shown up to 127 bytes (a Japanese name is about 42 characters
-in UTF-8).
+`.` are ignored; a game whose full path exceeds 255 bytes is skipped; and a
+title or folder name too wide for its column is shortened with an ellipsis.
 
 ## 4. The folder layout on the card
 
@@ -93,16 +92,23 @@ Each `games/<Name>/` is the game folder **as shipped**: `Game.ini`, `Data/` (or
 parent. Things that are easy to get wrong:
 
 - **The RGSS version is read from the `Scripts=` line of `Game.ini`, not from
-  `Library=`.** `.rxdata` means XP, `.rvdata` VX and `.rvdata2` VX Ace.
+  `Library=`.** `.rxdata` means XP, `.rvdata` VX and `.rvdata2` VX Ace. The
+  launcher falls back to `Library=` only for the engine tag it displays when
+  `Scripts=` is missing.
 - **Saves are written next to the game**, in the same `games/<Name>/` tree, as
-  MRI `Marshal` files: the same format a PC copy writes. Nothing recovers,
-  rotates or protects a game's save; copy saves off the card yourself.
+  MRI `Marshal` files: the same format a PC copy writes. That includes games
+  that save through `System.data_directory` (Pokémon Essentials), which returns
+  the running game's own folder. Nothing recovers, rotates or protects a game's
+  save; copy saves off the card yourself. Key bindings and the settings file a
+  game writes with `CFG[]=` stay shared in `ux0:/data/mkxp-z/mkxp-z/`.
 - **`app0:` is read-only.** It is the contents of the installed VPK (fonts, the
   device config profile, the Ruby standard library).
 
 The player reads a layered set of configuration files, of which
-`ux0:/data/mkxp-z/config.json` is the one that belongs to you. The full load
-order and every key is in [docs/config.md](docs/config.md).
+`ux0:/data/mkxp-z/config.json` is the one that belongs to you. It is read for
+every game started from the launcher, so it must not name a `gameFolder`, a
+`customScript`, an `rgssVersion` or an `RTP`. The full load order and every key
+is in [docs/config.md](docs/config.md).
 
 ## 5. Installing an RTP
 
@@ -164,6 +170,9 @@ like an engine bug. FTP is fine for pulling logs off the device afterwards.
   transitions such as loading a save. Script-heavy scenes run slightly slower
   rather than dropping frames, as in RPG Maker itself; `"frameSkip": true`
   (see [config.md](docs/config.md#frame-pacing)) trades that for dropped frames.
+  Window frames are composed on the GPU, which shortens the pause when a menu
+  or message window opens, and VX and VX Ace build each map's tile atlas there too. The display is double-buffered, so the picture runs
+  at most one frame behind the game ([config.md](docs/config.md#display-buffering)).
 - **Movies** (`Graphics.play_movie`, VX Ace) play in real time with synced audio
   (Theora/Vorbis `.ogv`). XP and VX have no engine movie call.
 
@@ -204,11 +213,18 @@ Default controls, over the Vita pad:
 | Front touch screen | mouse: the first finger moves the pointer and presses the left button (`vitaTouchMouse`, on by default) |
 
 The launcher's own controls are listed in [§3](#3-adding-games). Start (or F1)
-opens an in-game binding menu, and Select toggles the FPS counter. Holding
-Start and Select together for two seconds quits the game cleanly (back to the
-launcher when it was started from there). A stored binding file under
-`ux0:/data/mkxp-z/mkxp-z/` silently overrides these defaults; delete it if a
-control does not match the table above.
+opens an in-game binding menu, and Select toggles the FPS counter. **To quit,
+hold Start and Select together for two seconds**: the game exits cleanly (back
+to the launcher when it was started from there). Closing the app from LiveArea,
+or losing power, looks the same as a crash, so the next launcher start shows
+"The last game did not exit cleanly".
+
+A stored binding file under `ux0:/data/mkxp-z/mkxp-z/` silently overrides these
+defaults. To reset it, open the binding menu (Start), choose Reset defaults,
+then Accept; or, with the game closed, delete both `keybindings.mkxp<N>` and
+`keybindings.mkxp<N>.bak` (deleting only the first restores the previous
+mapping from the `.bak`). In the menu Circle cannot be assigned (it cancels
+capture), and Start and Select are reserved.
 
 ## 8. Logs, and reporting a problem
 
@@ -220,8 +236,12 @@ ux0:/data/mkxp-z/logs/mkxp-z.1.log   the previous run
 ux0:/data/mkxp-z/logs/mkxp-z.2.log   …and the two before that
 ux0:/data/mkxp-z/logs/mkxp-z.3.log
 ux0:/data/mkxp-z/logs/launcher.log   a launcher boot writes here instead
-ux0:/data/mkxp-z/last-error.txt      the last error the player managed to write
+ux0:/data/mkxp-z/logs/last-error.prev.txt   the last error report, once the launcher has shown it
 ```
+
+The player writes an error report to `ux0:/data/mkxp-z/last-error.txt`; the
+next launcher start shows it and moves it to `logs/last-error.prev.txt`, so
+that is where to look after you have seen the error on screen.
 
 Every boot rotates the log before opening it, keeping three generations, so a
 crash and the relaunch that follows it do not cost the earlier evidence. A
@@ -247,8 +267,20 @@ Installing a newer `mkxp-z.vpk` over the installed app keeps
 `ux0:/data/mkxp-z/`: your games, saves, `config.json`, logs and stored bindings
 all live there, outside the app. Deleting the bubble does not remove that folder
 either; delete it by hand to remove everything. A stored binding file under
-`ux0:/data/mkxp-z/mkxp-z/` overrides the defaults of a newer release too (see
-the controls above); delete it to adopt them.
+`ux0:/data/mkxp-z/mkxp-z/` overrides the defaults of a newer release too; reset
+it as described under the controls above to adopt them.
+
+**Saves in `ux0:/data/mkxp-z/mkxp-z/` (upgrading from 1.0.1 or earlier).** Up
+to 1.0.1, `System.data_directory` returned that one shared folder for every
+game, so games that save through it (Pokémon Essentials and other
+mkxp-z-aware games) wrote their saves there, and two such games overwrote each
+other. From 1.0.2 it returns the game's own folder, and those games
+look for their saves there. The player does not move old files, because it
+cannot tell which game owns them; the log says
+`vita-config: legacy shared data in '…' (first: '…')` while any are left. With
+VitaShell, move each save file (for Essentials, `Game.rxdata`) from
+`ux0:/data/mkxp-z/mkxp-z/` into `ux0:/data/mkxp-z/games/<Name>/` of the game
+that wrote it. Leave `keybindings.mkxp*` and `mkxp.json` where they are.
 
 ---
 
@@ -258,7 +290,11 @@ Use a macOS or Unix host with VitaSDK and its port libraries installed
 (`vita/scripts/vita-env.sh` finds `$HOME/vitasdk` or `/usr/local/vitasdk`;
 otherwise set `VITASDK`). Host tools: a native C/C++ compiler, Git, Make, GNU
 Bison 3+, Autoconf, CMake, Meson, Ninja, Python 3, pkg-config, curl, patch,
-shasum, tar, unzip and xxd. Install these VitaSDK packages first with `vdpm install`:
+shasum, tar, unzip and xxd, plus a bootstrap Ruby (`/usr/bin/ruby`, a `ruby` on
+`PATH`, or `BOOTSTRAP_RUBY`) for the host-Ruby step. That step replaces `PATH`
+with `/opt/homebrew/opt/bison/bin`, `/opt/homebrew/bin` and the system
+directories, so Bison 3 and Autoconf must be found there (or pass `BASERUBY`, see
+below). Install these VitaSDK packages first with `vdpm install`:
 `sdl2` (the stock package; the build links its own vitaGL-backed SDL2 instead),
 `sdl2_image`, `sdl2_ttf`, `freetype`, `libpng`, `zlib`, `physfs`, `libogg` and
 `libvorbis`. `sdl2_image` and `sdl2_ttf` pull in libjpeg-turbo, libwebp,

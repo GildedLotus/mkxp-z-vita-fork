@@ -520,15 +520,19 @@ struct ShaderSet
 	FlashMapShader flashMap;
 	TransShader trans;
 	SimpleTransShader simpleTrans;
+	SimpleMatrixShader simpleMatrix;
+	TilemapVXShader tilemapVX;
+	MovieYuvShader movieYuv;
+#ifndef MKXPZ_SOFTWARE_BITMAPS
+	/* GPU-bitmap paths only: software bitmaps never draw these, so they are
+	 * not linked, warmed or shipped as GXP. */
 	HueShader hue;
 	BltShader blt;
-	SimpleMatrixShader simpleMatrix;
 	BlurShader blur;
-	TilemapVXShader tilemapVX;
 	KglInvertShader kglInvert;
 	KglCompressAlphaShader kglCompressAlpha;
 	KglSubtractShader kglSubtract;
-	MovieYuvShader movieYuv;
+#endif
 #ifndef MKXPZ_NO_OPTIONAL_SHADERS
 	KglShadowShaderH kglShadowH;
 	KglShadowShaderV kglShadowV;

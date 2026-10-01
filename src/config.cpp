@@ -31,6 +31,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#include <dirent.h>
+#endif
 
 #include "vita_glue.h"
 /* controllerDeadzone resolves into the analog gate both the Input runtime and
@@ -400,6 +403,38 @@ static void vitaFilterGameLayer(json::value &layer)
 
     for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++)
         obj.erase(denied[i]);
+}
+
+/* The shared customDataPath once held saves of mkxp-z-aware games.
+ * Nobody can tell which game owns such a file, so only say it is there:
+ * never move, copy or delete it. Types come from the listing; an
+ * untyped entry is skipped, not stat()ed, and the walk stops at 64 entries. */
+static void vitaLegacySharedDataNotice(const std::string &dir)
+{
+    DIR *d = opendir(dir.c_str());
+    if (!d)
+        return;
+    for (int seen = 0; seen < 64; seen++) {
+        struct dirent *e = readdir(d);
+        if (!e)
+            break;
+#if defined(__vita__)
+        const bool regular = SCE_S_ISREG(e->d_stat.st_mode);
+#else
+        const bool regular = e->d_type == DT_REG;
+#endif
+        const char *n = e->d_name;
+        if (!regular || n[0] == '.' ||
+            !strncmp(n, "keybindings.mkxp", 16) || !strncmp(n, "mkxp.json", 9))
+            continue;
+        char tb[640];
+        snprintf(tb, sizeof(tb), "vita-config: legacy shared data in '%s' "
+                 "(first: '%s'); move a game's files into its own folder",
+                 dir.c_str(), n);
+        vita_glue_trace(tb);
+        break;
+    }
+    closedir(d);
 }
 
 static bool vitaDirExists(const char *path)
@@ -892,8 +927,29 @@ try { exp } catch (...) {}
     if (!gameFolder.empty() && !mkxp_fs::setCurrentDirectory(gameFolder.c_str())) {
         throw Exception(Exception::MKXPError, "Unable to switch into gameFolder %s", gameFolder.c_str());
     }
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    /* Saves go in the game's own folder. The CWD, not the
+     * configured value: a relative gameFolder must resolve exactly once. */
+    gameDataPath.clear();
+    if (!gameFolder.empty()) {
+        try {
+            gameDataPath = mkxp_fs::getCurrentDirectory();
+        } catch (const Exception &) {
+            gameDataPath.clear();
+        }
+    }
+#endif
     
     readGameINI();
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+    if (!gameDataPath.empty()) {
+        char tb[600];
+        snprintf(tb, sizeof(tb), "vita-config: data directory='%s'",
+                 gameDataPath.c_str());
+        vita_glue_trace(tb);
+        vitaLegacySharedDataNotice(customDataPath);
+    }
+#endif
     
     // Now check for an extra mkxp.conf in the user's save directory and merge anything else from that
     userConfPath = mkxp_fs::normalizePath(std::string(customDataPath + "/" CONF_FILE).c_str(), 0, 1);
@@ -1027,6 +1083,16 @@ try { exp } catch (...) {}
      * the player never set. */
     vitaTouchMouse = true;
     SET_OPT(vitaTouchMouse, boolean);
+
+    /* The software Bitmap backend throws at every Bitmap construction under
+     * enableHires. The game layers cannot set it, but the device defaults
+     * and the root mkxp.json can, and that would fail at the first Bitmap;
+     * refuse it here with one line instead. */
+    if (enableHires) {
+        vita_glue_trace("vita-config: enableHires is not supported on this "
+                        "platform; ignored");
+        enableHires = false;
+    }
 
     /* The analog gate. Read after the merge like every
      * other preference, clamped to a band that can neither leave an axis

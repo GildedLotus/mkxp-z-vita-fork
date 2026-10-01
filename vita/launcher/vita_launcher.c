@@ -62,6 +62,16 @@ static void trace_fmt(LauncherTraceFn trace, const char *fmt, ...)
     trace(line);
 }
 
+#ifdef __vita__
+static void set_pool_hint(const char *hint, unsigned mib)
+{
+    char bytes[16];
+
+    snprintf(bytes, sizeof(bytes), "%u", mib * 1024u * 1024u);
+    SDL_SetHint(hint, bytes);
+}
+#endif
+
 /* ---- options ----------------------------------------------------------- */
 
 void vita_launcher_options_default(VitaLauncherOptions *opt)
@@ -128,18 +138,29 @@ int vita_launcher_session_open(VitaLauncherSession *s,
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
+#ifdef __vita__
+    /* SDL_CreateWindow runs vglInit; without hints the backend falls back
+     * to SDL's 96/64/16 MiB. An SDL_VITA_VGL_* environment variable wins. */
+    set_pool_hint(VITA_GLUE_VGL_HINT_RAM, VITA_GLUE_VGL_LAUNCHER_RAM_MIB);
+    set_pool_hint(VITA_GLUE_VGL_HINT_CDRAM, VITA_GLUE_VGL_LAUNCHER_CDRAM_MIB);
+    set_pool_hint(VITA_GLUE_VGL_HINT_PHYCONT, VITA_GLUE_VGL_LAUNCHER_PHYCONT_MIB);
+    vita_glue_vgl_init_timing("launcher", 0);
+#endif
     s->window = SDL_CreateWindow("mkxp-z launcher", SDL_WINDOWPOS_UNDEFINED,
                                  SDL_WINDOWPOS_UNDEFINED, LAUNCHER_VIEW_W,
                                  LAUNCHER_VIEW_H,
                                  SDL_WINDOW_OPENGL |
                                      SDL_WINDOW_FULLSCREEN_DESKTOP);
+#ifdef __vita__
+    vita_glue_vgl_init_timing("launcher", 1);
+#endif
     if (!s->window) {
         trace_fmt(s->trace, "launcher: SDL_CreateWindow FAILED: %s",
                   SDL_GetError());
         vita_launcher_session_close(s);
         return 0;
     }
-    s->trace("launcher: SDL_CreateWindow ok (EGL display path)");
+    s->trace("launcher: SDL_CreateWindow ok");
 
     /* Main thread, like src/main.cpp: the context is made current on the
      * thread that created it and nothing else ever binds it. */
@@ -175,7 +196,7 @@ int vita_launcher_session_open(VitaLauncherSession *s,
               s->joystick ? 1 : 0);
 
     /* The whole set exists now. This is the cold sample of the
-     * headroom measurement: whatever the firmware sync pool has left with exactly one
+     * headroom measurement: what the process has left with exactly one
      * texture, one VBO, one program and the flip buffers taken. */
     if (o.post_session_open)
         o.post_session_open(o.pre_loadexec_ctx);

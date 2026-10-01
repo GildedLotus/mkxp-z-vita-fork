@@ -654,6 +654,32 @@ SWR_INLINE bool binCertified(double t)
     return std::fabs(t - (double)(int)t - 0.5) < 0.5 - 1.0 / 1048576.0;
 }
 
+/* One byte of blendOverDExact for d[3] == 0, sop > 0: alpha when `alpha`,
+ * else the channel of sample v. Both are >= 0, so (int) is the floor. */
+__attribute__((noinline))
+uint8_t blendClearExact(double sop, double v, bool alpha)
+{
+    const double co1 = sop / 65025.0;
+    return (uint8_t)(int)(alpha ? co1 * 255.0 + 0.5 : co1 * v / co1 + 0.5);
+}
+
+/* blendOverD for d[3] == 0, sop > 0. co2 is then a signed
+ * zero, so the exact blend is outa = co1, alpha floor(co1*255 + 0.5) and
+ * channel floor(co1*s/co1 + 0.5), each within 2^-44 of sop/255 or s plus
+ * 0.5. The Q16 sampler only sends near-tie pixels here, which blendOverD's
+ * general certification always rejects, so round each byte alone and divide
+ * only for a tie. Out of line to keep the translucent path's code small. */
+__attribute__((noinline))
+void blendOverDClear(uint8_t *d, const double *s, double sop)
+{
+    const double ta = sop * (1.0 / 255.0) + 0.5;
+    d[3] = binCertified(ta) ? (uint8_t)(int)ta : blendClearExact(sop, 0.0, true);
+    for (int ch = 0; ch < 3; ++ch) {
+        const double t = s[ch] + 0.5;
+        d[ch] = binCertified(t) ? (uint8_t)(int)t : blendClearExact(sop, s[ch], false);
+    }
+}
+
 /* blendOverDExact without its per-pixel divides and floor() calls:
  * the two constant divisors become multiplies by their reciprocals and the
  * three channel quotients share one reciprocal of outa. Every quantity is
@@ -668,8 +694,11 @@ SWR_INLINE bool binCertified(double t)
 void blendOverD(uint8_t *d, const double *s, uint32_t op)
 {
     const double sop = s[3] * (double)op;
-    if (sop == 0.0 && d[3] == 0) {
-        blendOverDExact(d, s, op);
+    if (d[3] == 0) {
+        if (sop == 0.0)
+            blendOverDExact(d, s, op);
+        else
+            blendOverDClear(d, s, sop);
         return;
     }
     const double co1 = sop * (1.0 / 65025.0);
@@ -1337,6 +1366,65 @@ const uint32_t kDiv60Magic = 34953u;
 
 SWR_INLINE uint32_t div60(uint32_t x) { return (x * kDiv60Magic) >> 21; }
 
+#if SWR_NEON
+/* One channel of the integer kernel below for 4 pixels in 32-bit lanes.
+ * Bit-identical to the scalar loop: U < 1079*d < 3*period, so two
+ * conditional subtractions finish the mod; vabd is |U - half| and vqsub
+ * clamps X - flat at 0. */
+SWR_INLINE uint32x4_t hueChannel4(uint32x4_t base, uint16x4_t d, uint16_t off,
+                                  uint32x4_t period, uint32x4_t half,
+                                  uint32x4_t flat)
+{
+    uint32x4_t U = vmlal_n_u16(base, d, off);
+    U = vsubq_u32(U, vandq_u32(vcgeq_u32(U, period), period));
+    U = vsubq_u32(U, vandq_u32(vcgeq_u32(U, period), period));
+    uint32x4_t X = vminq_u32(vqsubq_u32(vabdq_u32(U, half), flat), flat);
+    X = vmulq_n_u32(vaddq_u32(X, vdupq_n_u32(30)), kDiv60Magic);
+    return vshrq_n_u32(X, 21);
+}
+
+/* 8 pixels: the four sextant cases as lane selects, then 3 channels. */
+SWR_INLINE void hue8(uint8_t *p, const uint16_t off[3])
+{
+    uint8x8x4_t px = vld4_u8(p);
+    const uint8x8_t mx8 = vmax_u8(vmax_u8(px.val[0], px.val[1]), px.val[2]);
+    const uint8x8_t mn8 = vmin_u8(vmin_u8(px.val[0], px.val[1]), px.val[2]);
+    const uint16x8_t d = vsubl_u8(mx8, mn8);
+    const uint64x2_t any = vreinterpretq_u64_u16(d);
+    if ((vgetq_lane_u64(any, 0) | vgetq_lane_u64(any, 1)) == 0)
+        return; /* all achromatic: the scalar skip, 8 at a time */
+
+    const int16x8_t r = vreinterpretq_s16_u16(vmovl_u8(px.val[0]));
+    const int16x8_t g = vreinterpretq_s16_u16(vmovl_u8(px.val[1]));
+    const int16x8_t b = vreinterpretq_s16_u16(vmovl_u8(px.val[2]));
+    const int16x8_t ds = vreinterpretq_s16_u16(d);
+    /* T = g-b | 2d-(r-b) | 6d-(b-g) | 4d+(r-g), chosen like the scalar ifs. */
+    const int16x8_t t1 = vsubq_s16(g, b);
+    const int16x8_t t2 = vsubq_s16(vshlq_n_s16(ds, 1), vsubq_s16(r, b));
+    const int16x8_t t3 = vsubq_s16(vmulq_n_s16(ds, 6), vsubq_s16(b, g));
+    const int16x8_t t4 = vaddq_s16(vshlq_n_s16(ds, 2), vsubq_s16(r, g));
+    const int16x8_t tGb = vbslq_s16(vcgeq_s16(r, g), t1, t2);
+    const int16x8_t tLt = vbslq_s16(vcgeq_s16(r, b), t3, t4);
+    const uint16x8_t T =
+        vreinterpretq_u16_s16(vbslq_s16(vcgeq_s16(g, b), tGb, tLt));
+
+    const uint16x4_t dLo = vget_low_u16(d), dHi = vget_high_u16(d);
+    const uint32x4_t baseLo = vmull_n_u16(vget_low_u16(T), 60);
+    const uint32x4_t baseHi = vmull_n_u16(vget_high_u16(T), 60);
+    const uint32x4_t perLo = vmull_n_u16(dLo, 360), perHi = vmull_n_u16(dHi, 360);
+    const uint32x4_t halfLo = vmull_n_u16(dLo, 180), halfHi = vmull_n_u16(dHi, 180);
+    const uint32x4_t flatLo = vmull_n_u16(dLo, 60), flatHi = vmull_n_u16(dHi, 60);
+    const uint16x8_t mn = vmovl_u8(mn8);
+    for (int ch = 0; ch < 3; ++ch) {
+        const uint16x8_t ramp = vcombine_u16(
+            vmovn_u32(hueChannel4(baseLo, dLo, off[ch], perLo, halfLo, flatLo)),
+            vmovn_u32(hueChannel4(baseHi, dHi, off[ch], perHi, halfHi, flatHi)));
+        px.val[ch] = vmovn_u16(vaddq_u16(mn, ramp));
+    }
+    vst4_u8(p, px);
+}
+#endif /* SWR_NEON */
+
 } // namespace
 
 /* shader/hue.frag, evaluated exactly, in integers.
@@ -1404,11 +1492,20 @@ void hue_change(const Surface &dst, Rect rect, int degrees)
                                             (uint64_t)(unsigned)rect.h);
 
     const int32_t kOff[3] = { wrapped + 360, wrapped + 240, wrapped + 120 };
+#if SWR_NEON
+    const uint16_t kOff16[3] = { (uint16_t)kOff[0], (uint16_t)kOff[1],
+                                 (uint16_t)kOff[2] };
+#endif
 
     for (int y = 0; y < rect.h; ++y) {
         uint8_t *row = dst.px + (size_t)(rect.y + y) * (size_t)dst.stride +
                        (size_t)rect.x * 4;
-        for (int x = 0; x < rect.w; ++x) {
+        int x = 0;
+#if SWR_NEON
+        for (; x + 8 <= rect.w; x += 8)
+            hue8(row + (size_t)x * 4, kOff16);
+#endif
+        for (; x < rect.w; ++x) {
             uint8_t *p = row + (size_t)x * 4;
             /* An achromatic pixel is a fixed point of a hue rotation, so
              * skip the whole sextant evaluation for it.
@@ -1541,22 +1638,26 @@ void blur(const Surface &dst)
 
     const int w = dst.w, h = dst.h;
     const size_t rowBytes = (size_t)w * 4;
+    /* Three horizontal-pass rows, not a w*h copy: output row
+     * y needs rows y-1..y+1, and row y+1 is computed before row y is
+     * overwritten, so every horizontal pass still reads original pixels. */
     std::vector<uint8_t> tmp;
     try {
-        tmp.resize(rowBytes * (size_t)h);
+        tmp.resize(rowBytes * 3);
     } catch (...) {
         return; /* failure contract: no scratch, no pass, pixels untouched */
     }
 
-    /* Horizontal pass: dst -> tmp. The two clamp-to-edge pixels are peeled
-     * (pixel 0 is (2*p0 + p1 + 1)/3, pixel w-1 is its mirror) so the
-     * interior is one branch-free run; w == 1 is (3p+1)/3 == p, a copy. */
-    for (int y = 0; y < h; ++y) {
+    /* Horizontal pass of row y into its ring slot. The two clamp-to-edge
+     * pixels are peeled (pixel 0 is (2*p0 + p1 + 1)/3, pixel w-1 is its
+     * mirror) so the interior is one branch-free run; w == 1 is
+     * (3p+1)/3 == p, a copy. */
+    auto hpass = [&](int y) {
         const uint8_t *srow = dst.px + (size_t)y * (size_t)dst.stride;
-        uint8_t *trow = tmp.data() + (size_t)y * rowBytes;
+        uint8_t *trow = tmp.data() + (size_t)(y % 3) * rowBytes;
         if (w == 1) {
             std::memcpy(trow, srow, 4);
-            continue;
+            return;
         }
         for (int ch = 0; ch < 4; ++ch) {
             trow[ch] = (uint8_t)(((uint32_t)srow[ch] * 2 + srow[4 + ch] + 1) / 3);
@@ -1565,17 +1666,20 @@ void blur(const Surface &dst)
         }
         if (w > 2)
             box3Bytes(trow + 4, srow, srow + 4, srow + 8, rowBytes - 8);
-    }
+    };
 
-    /* Vertical pass: tmp -> dst. Clamp-to-edge is a repeated row pointer,
-     * so there is no edge case left to peel. */
+    /* Vertical pass into dst. Clamp-to-edge is a repeated row pointer, so
+     * there is no edge case left to peel. */
+    hpass(0);
     for (int y = 0; y < h; ++y) {
         const int ym = y > 0 ? y - 1 : 0;
         const int yp = y + 1 < h ? y + 1 : h - 1;
+        if (yp != y)
+            hpass(yp);
         box3Bytes(dst.px + (size_t)y * (size_t)dst.stride,
-                  tmp.data() + (size_t)ym * rowBytes,
-                  tmp.data() + (size_t)y * rowBytes,
-                  tmp.data() + (size_t)yp * rowBytes, rowBytes);
+                  tmp.data() + (size_t)(ym % 3) * rowBytes,
+                  tmp.data() + (size_t)(y % 3) * rowBytes,
+                  tmp.data() + (size_t)(yp % 3) * rowBytes, rowBytes);
     }
 }
 

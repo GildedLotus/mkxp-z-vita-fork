@@ -88,10 +88,10 @@ static inline void vitaGlCheckFBO(const char *tag)
  * VBOs keep working -- pixel-correct, uploads included -- but a new render
  * surface, a new shader program and a new VAO can fail HARD.
  *
- * So boot order is the whole game. The engine's render surfaces are a fixed,
- * known set, and they are reserved and verified before anything else asks the
- * driver for an object; after boot nothing may create a surface, a program or
- * a VAO at all. This namespace is the accounting and the boot sequence. */
+ * vitaGL has no such pool, but the rule stands: the engine's render surfaces are a fixed, known set, reserved and
+ * verified before anything else asks the driver for an object; after boot
+ * nothing may create a surface, a program or a VAO at all. This namespace is
+ * the accounting and the boot sequence. */
 namespace GPUBudget
 {
 	/* Live GL object counts, maintained by the TEX / GenericBO / FBO gen+del
@@ -175,12 +175,10 @@ namespace GPUBudget
 	void frameAdvance();
 	uint64_t frameCounter();
 
-	/* The swap-completion watchdog. The flip chain is strictly
-	 * one-in-flight and the driver blocks handing over a new flip until the
-	 * previous one is displayed, so the wall-clock time inside
-	 * SDL_GL_SwapWindow measures whether the PREVIOUS frame's render
-	 * completed -- the only GPU-stall canary reachable from userland
-	 * Bracket the swap with these. */
+	/* The slow-swap watchdog. vglSwapBuffers blocks while the display
+	 * queue is full (sceGxmDisplayQueueAddEntry) and while it ends the scene
+	 * and runs the garbage collector, so a long swap reports back-pressure
+	 * without naming its cause. Bracket the swap with these. */
 	void swapBegin();
 	void swapEnd();
 
@@ -213,7 +211,7 @@ namespace GPUBudget
 	 * defers the deletion of a texture an incomplete render still needs. It is
 	 * the transfer side that has no fallback.
 	 *
-	 * Holding the release for two completed flips closes all three. */
+	 * Holding the release for two completed flips closed all three. */
 	enum DeferKind
 	{
 		DeferTexture = 0,
@@ -227,13 +225,12 @@ namespace GPUBudget
 	 *
 	 *   deferSwaps[kind]          how many REAL swaps a release is held for
 	 *                             (0 restores stock immediate deletion).
-	 *                             Two is the PROVEN value, not a guess: the
-	 *                             window has two flip buffers and at most
-	 *                             one flip in flight, so after swap k
-	 *                             returns only swap k-1's render is known
-	 *                             complete.
+	 *                             0 on vitaGL, because the driver defers
+	 *                             every free past the frames that used the
+	 *                             storage (gl-meta.cpp).
 	 *   syncBeforeRespecify[kind] whether a size-changing re-specification
 	 *                             of a LIVE object drains the GPU first
+	 *                             (false on vitaGL)
 	 */
 	extern unsigned deferSwaps[DeferKindCount];
 	extern bool syncBeforeRespecify[DeferKindCount];
@@ -243,8 +240,10 @@ namespace GPUBudget
 	/* Release everything the queue holds. `waitForGPU` drains before
 	 * releasing anything, which is what makes a drain safe at a point where
 	 * no further swaps are coming (freeze, shutdown, or a loading screen
-	 * that has filled the queue). The drain is glFinish, a real sceGxmFinish
-	 * fence on vitaGL. */
+	 * that has filled the queue). The drain is glFinish, which waits only
+	 * on a scene flushed mid-frame, not on every draw issued since; vitaGL's
+	 * own 4-frame free deferral is what keeps storage alive. An empty queue
+	 * skips the wait, except at "shutdown". */
 	void deferDrain(const char *why, bool waitForGPU);
 
 	unsigned deferPending();
@@ -267,7 +266,10 @@ namespace GPUBudget
 	 * that already waits for the GPU. No freeze drain: while swaps are
 	 * stopped nothing in the pool awaits retirement, and the names the
 	 * previous scene left are exactly the ones the next scene re-samples
-	 * (the sceneprof gate this pool exists for). */
+	 * (the sceneprof gate this pool exists for).
+	 *
+	 * Off on vitaGL: take() returns 0 and offer() retires at once, since
+	 * every glTexImage2D there allocates fresh storage (no in-place path). */
 	GLuint texRecycleTake(int width, int height);
 	void texRecycleOffer(GLuint id, int width, int height);
 	void texRecycleDrain(const char *why);
@@ -496,6 +498,34 @@ namespace TEX
 	{
 		gl.TexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, format, GL_UNSIGNED_BYTE, data);
 	}
+
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+	/* Checked like uploadImageChecked, but writes into the existing level:
+	 * no new storage, so no respecify(). On vitaGL a level sampled in the
+	 * last 4 frames is copied whole first (textures.c), so callers use this
+	 * only for cold levels. */
+	static inline bool uploadSubImageChecked(GLint x, GLint y, GLsizei width, GLsizei height, const void *data)
+	{
+		bool success = true;
+		for (GLenum err; (err = gl.GetError()) != GL_NO_ERROR;)
+		{
+			success = false;
+			noteUploadError("upload-setup", err);
+		}
+		if (!success)
+			return false;
+		const uint64_t bytes = (uint64_t)width * (uint64_t)height * 4u;
+		GPUBudget::uploadBegin(bytes);
+		gl.TexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, data);
+		for (GLenum err; (err = gl.GetError()) != GL_NO_ERROR;)
+		{
+			success = false;
+			noteUploadError("upload-sub", err);
+		}
+		GPUBudget::uploadEnd(width, height, bytes);
+		return success;
+	}
+#endif
 
 	static inline void allocEmpty(GLsizei width, GLsizei height)
 	{
@@ -796,6 +826,8 @@ struct TEXFBO
 };
 
 #ifdef MKXPZ_SOFTWARE_BITMAPS
+#include "baseatlas.h"
+
 struct Config;
 
 namespace GPUBudget
@@ -879,12 +911,33 @@ namespace GPUBudget
 	 * run must not look like a seal violation, must not disturb the live
 	 * counters, must restore the binding it found, and disposes of a refused
 	 * probe through the same failed-FBO discipline as a real surface.
-	 * `where` labels the line: "boot", "scene", "freeze". */
+	 * `where` labels the line: "boot", "scene", "freeze". A no-op on vitaGL. */
 	void headroomCanary(const char *where = "boot");
 
 	/* Close boot. After this, creationSite() reports a new program, VAO
 	 * or texture and continues, and a new render surface is refused. */
 	void seal();
+
+	/* Window bases composed on the GPU: one atlas
+	 * surface reserved with the others, shelf-packed. place() keeps a slot
+	 * that already fits and returns false when there is no atlas or no room,
+	 * and the window then composes on the CPU as before. */
+	bool placeWindowBase(BaseSlot &slot, int w, int h);
+	void releaseWindowBase(BaseSlot &slot);
+	const TEXFBO &windowBaseAtlas();
+
+	/* The reserved VX/Ace tile atlas. claim() hands the
+	 * surface to one tilemap when it exists, is free and has exactly w x h;
+	 * otherwise false, and the tilemap builds its atlas on the CPU. release()
+	 * returns it and zeroes `held`; any other TEXFBO is ignored. */
+	bool claimTileAtlas(int w, int h, TEXFBO &out);
+	void releaseTileAtlas(TEXFBO &held);
+
+	/* Clears the slot, then runs draw(ctx, origin) into the base and again
+	 * into the top and bottom gutter rows, so linear sampling at the base's
+	 * edge clamps as it does on a private texture. */
+	void composeWindowBase(const BaseSlot &slot,
+	                       void (*draw)(void *ctx, const Vec2i &origin), void *ctx);
 }
 #endif
 

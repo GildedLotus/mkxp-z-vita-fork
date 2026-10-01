@@ -149,8 +149,9 @@ RB_METHOD_GUARD(bitmapInitialize) {
          * Exception::SDLError), but
          * new BitmapPrivate and every std::vector inside the constructor fail
          * with std::bad_alloc, which is not an Exception. Under
-         * MKXPZ_SOFTWARE_BITMAPS a Bitmap is a CPU pixel buffer on a 16 MiB
-         * libc heap, so that is a realistic failure, not a theoretical one. */
+         * MKXPZ_SOFTWARE_BITMAPS a Bitmap is a CPU pixel buffer on the
+         * bounded newlib heap, so that is a realistic failure, not a
+         * theoretical one. */
         b = newBitmapCollecting([&] { return new Bitmap(filename); });
     } else {
         int width, height;
@@ -899,7 +900,7 @@ RB_METHOD_GUARD(bitmapSnapToBitmap) {
      * bitmapInitProps -- and for the reason that method documents: a Ruby
      * raise is a longjmp, so nothing native may be alive across one that this
      * frame alone owns. new Bitmap(*b, pos) is a full CPU pixel buffer (905
-     * KiB for a 544x416 screen) out of a 16 MiB heap; it used to be built
+     * KiB for a 544x416 screen) out of the bounded heap; it used to be built
      * first, and rb_obj_alloc and the four raising calls inside
      * bitmapInitProps each dropped it on the floor. */
     VALUE ret = rb_obj_alloc(rb_class_of(self));

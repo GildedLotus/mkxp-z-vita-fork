@@ -165,6 +165,8 @@ struct SharedFontStatePrivate
 	std::vector<void*> fontBuffers;
 	// Non-owning exact-path index; bytes remain owned by fontBuffers.
 	std::vector<std::pair<std::string, std::pair<void *, int>>> fontBytesByPath;
+	// Sum of fontBuffers, held under MKXPZ_VITA_FONT_SLURP_TOTAL.
+	size_t fontBufferBytes = 0;
 #endif
     
     /* Internal default font family that is used anytime an
@@ -795,6 +797,12 @@ static int calc_ppem_for_height(Font_Container *font, int height)
 #ifndef MKXPZ_VITA_FONT_SLURP_MAX
 #define MKXPZ_VITA_FONT_SLURP_MAX (8 * 1024 * 1024)
 #endif
+/* Every pooled block lives until shutdown, and past the 64-path reuse index
+ * each new size of a font slurps its own copy; past this many pooled bytes a
+ * font streams instead. Three fonts at the per-file cap. */
+#ifndef MKXPZ_VITA_FONT_SLURP_TOTAL
+#define MKXPZ_VITA_FONT_SLURP_TOTAL (24 * 1024 * 1024)
+#endif
 #include "fontres-telemetry.h"
 #ifndef MKXPZ_VITA_FONT_REUSE
 #define MKXPZ_VITA_FONT_REUSE 1
@@ -816,7 +824,8 @@ static int calc_ppem_for_height(Font_Container *font, int height)
  * On any refusal -- no length, over the cap, out of memory, a short read, no
  * RWops -- *bufOut stays 0 and `ops` comes back open and rewound, so the
  * caller streams exactly as it did before. */
-static SDL_RWops *vitaSlurpFont(SDL_RWops *ops, const char *name, void **bufOut)
+static SDL_RWops *vitaSlurpFont(SDL_RWops *ops, const char *name, void **bufOut,
+                                size_t pooledBytes)
 {
 	static_assert(MKXPZ_VITA_FONT_SLURP_MAX > 0 &&
 	              MKXPZ_VITA_FONT_SLURP_MAX <= 0x7fffffff,
@@ -827,7 +836,9 @@ static SDL_RWops *vitaSlurpFont(SDL_RWops *ops, const char *name, void **bufOut)
 	const Sint64 size = SDL_RWsize(ops);
 	size_t got = 0;
 
-	if (size > 0 && size <= MKXPZ_VITA_FONT_SLURP_MAX)
+	if (size > 0 && size <= MKXPZ_VITA_FONT_SLURP_MAX &&
+	    pooledBytes <= MKXPZ_VITA_FONT_SLURP_TOTAL &&
+	    (size_t)size <= MKXPZ_VITA_FONT_SLURP_TOTAL - pooledBytes)
 	{
 		void *buf = SDL_malloc((size_t)size);
 
@@ -1002,7 +1013,7 @@ _TTF_Font *SharedFontState::getFont(std::string family,
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
 			/* The bundled font above is already memory-backed; this is the only
 			 * branch that hands FreeType a device stream. */
-			ops = vitaSlurpFont(ops, path, &slurped);
+			ops = vitaSlurpFont(ops, path, &slurped, p->fontBufferBytes);
 			if (slurped) slurpedSize = (int)SDL_RWsize(ops);
 			if (g_fontRes.active) {
 				g_fontRes.cur.copy_bytes = slurped ? g_fontRes.cur.slurp_bytes : 0;
@@ -1115,6 +1126,7 @@ _TTF_Font *SharedFontState::getFont(std::string family,
 	 * together or neither is.) */
 	if (slurped) {
 		p->fontBuffers.push_back(slurped);
+		p->fontBufferBytes += (size_t)slurpedSize;
 		const std::string &path = *p->sets[family].operator->();
 		if (MKXPZ_VITA_FONT_REUSE && p->fontBytesByPath.size() < 64 && path.size() < 512) {
 			try { p->fontBytesByPath.push_back({path, {slurped, slurpedSize}}); }

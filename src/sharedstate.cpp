@@ -363,6 +363,12 @@ struct SharedStatePrivate
 			fileSystem.initFontSets(fontState);
 		}
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* globalTex and gpTexFBO serve only the stock GPU blit paths
+		 * (Bitmap::stretchBlt's two GPU routes, the stock tilemap atlas),
+		 * which this backend compiles out, so neither is
+		 * allocated. SharedState::gpTexFBO() aborts loudly if anything asks. */
+#else
 		globalTexW = 128;
 		globalTexH = 64;
 
@@ -373,14 +379,6 @@ struct SharedStatePrivate
 		TEX::allocEmpty(globalTexW, globalTexH);
 		globalTexDirty = false;
 
-#ifdef MKXPZ_SOFTWARE_BITMAPS
-		/* gpTexFBO is a render surface whose only callers were
-		 * Bitmap::stretchBlt's two GPU routes, and the software raster ops replaced both
-		 * of them -- it now has zero users under this
-		 * backend. Allocating it anyway would burn one of
-		 * about 8 render surfaces, plus its sync objects, for nothing.
-		 * SharedState::gpTexFBO() aborts loudly if anything asks. */
-#else
 		TEXFBO::init(gpTexFBO);
 		/* Reuse starting values */
 		TEXFBO::allocEmpty(gpTexFBO, globalTexW, globalTexH);
@@ -398,8 +396,8 @@ struct SharedStatePrivate
 
 	~SharedStatePrivate()
 	{
-		TEX::del(globalTex);
 #ifndef MKXPZ_SOFTWARE_BITMAPS
+		TEX::del(globalTex);
 		TEXFBO::fini(gpTexFBO);
 #endif
 #ifdef MKXPZ_SOFTWARE_BITMAPS
@@ -635,12 +633,13 @@ void SharedState::requestAtlasTex(int w, int h, TEXFBO &out)
 		/* Texture only, never a render target. Tile
 		 * atlases are assembled on the CPU and uploaded whole, and render surfaces are a
 		 * small fixed budget -- all of them spoken for by the time the first
-		 * map loads. */
+		 * map loads. No storage here: softAtlasUpload's whole-level upload
+		 * specifies it, and the tilemaps draw nothing until that succeeds.
+		 * A zeroed level first cost a memset and a doubled peak. */
 		tex.tex = TEX::gen();
 		TEX::bind(tex.tex);
 		TEX::setRepeat(false);
 		TEX::setSmooth(false);
-		TEX::allocEmpty(w, h);
 		tex.width = w;
 		tex.height = h;
 #else

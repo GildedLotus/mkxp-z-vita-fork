@@ -182,20 +182,18 @@ static const struct SwRasterProfileGate {
 #define OVERLAY_PAD_Y 3
 #define OVERLAY_LINE_H 10            /* 8 px face + 2 px leading */
 
-/* The upload staging buffer. vita/overlay keeps its pixels as ARGB8888
- * (0xAARRGGBB) and this engine uploads every texture as GL_RGBA, so the two
- * bytes have to be swapped somewhere. The alternative was a BGRA upload --
- * the device does advertise GL_EXT_texture_format_BGRA8888 -- and it was
- * rejected: GLES2 wants internalformat == format, so it could not go through
- * TEX::uploadImage (which fixes internalformat at GL_RGBA), and changing this
- * texture's format after boot is exactly the re-specification that makes the
- * driver free and re-take its storage. overlay_copy_rgba8888() keeps the
- * overlay on the same upload path as every other texture in the engine.
- *
- * File-static, not a member: it is scratch, it is 256 KiB, and this way "no
- * dynamic allocation after boot" is true by construction rather than by
- * inspection of when GraphicsPrivate is built. */
+#if defined(__vita__) && defined(MKXPZ_VITAGL_BACKEND)
+/* vita/overlay keeps ARGB8888 words, which in memory are B,G,R,A bytes:
+ * vitaGL stores a GL_BGRA level with a plain copy, so the device needs no
+ * staging buffer or swizzle. Every glTexImage2D on vitaGL takes fresh
+ * storage, and this texture is created BGRA and never changes format. */
+#define OVERLAY_GL_FORMAT GL_BGRA
+#else
+/* Host GL fixes the internal format at GL_RGBA, so swap the bytes into a
+ * file-static scratch buffer (256 KiB). */
+#define OVERLAY_GL_FORMAT GL_RGBA
 static uint8_t overlayStaging[OVERLAY_PIXELS * 4];
+#endif
 #endif
 
 typedef struct AudioQueue
@@ -1743,9 +1741,17 @@ struct TransitionSwapCapture {
         }
         if (!pixels) return false;
         std::fill(pixels.get(), pixels.get() + stride * height, 0);
+        // A native-blit present binds only the draw target; the read target
+        // is still the blit source, so read the drawable explicitly.
+        GLint read = 0;
+        if (gl.BlitFramebuffer) {
+            gl.GetIntegerv(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &read);
+            gl.BindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        }
         gl.PixelStorei(GL_PACK_ALIGNMENT, 1);
         gl.ReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.get());
         gl.PixelStorei(GL_PACK_ALIGNMENT, pack);
+        if (gl.BlitFramebuffer) gl.BindFramebuffer(GL_READ_FRAMEBUFFER, read);
         if (gl.GetError() != GL_NO_ERROR) return false;
         char name[40];
         std::snprintf(name, sizeof(name), auxiliary ? "transition_probe_%02u" : "transition_mask_%02u",
@@ -1941,12 +1947,13 @@ struct GraphicsPrivate {
 
 #ifdef MKXPZ_SOFTWARE_BITMAPS
     /* ---- The on-screen overlay ---------------------
-     * The one texture GPUBudget::ScreenOverlayTexture stands for, taken in
-     * the constructor and held for the life of the process, plus the text
-     * the consumers own. No pointers, no vectors: one slot per line, so
-     * nothing here can allocate or be reallocated after boot, and rewriting
-     * one line cannot disturb another's bytes. */
+     * The one texture GPUBudget::ScreenOverlayTexture stands for, taken on
+     * the first visible draw and held for the life of the process, plus the
+     * text the consumers own. One slot per line, so rewriting one line
+     * cannot disturb another's bytes. overlayStored: the texture has a
+     * level holding an uploaded image. */
     TEX::ID overlayTex;
+    bool overlayStored = false;
     bool overlaySettings = false;
     bool overlayVisible;
     int overlayLineCount;
@@ -1975,6 +1982,12 @@ struct GraphicsPrivate {
     SDL_mutex *avgFPSLock;
     
     SDL_mutex *glResourceLock;
+    /* The thread setLock() last made the context current on (0: none).
+     * SDL_GL_MakeCurrent's already-current test costs two generic-TLS
+     * lookups per guarded call on Vita, and the vitaGL
+     * backend's MakeCurrent is a no-op, so only SDL's per-thread record
+     * needs keeping. Written under glResourceLock; checkSyncLock clears it. */
+    std::atomic<SDL_threadID> glCurrentThread{0};
     bool multithreadedMode;
     
     /* Global list of all live Disposables
@@ -2032,8 +2045,7 @@ struct GraphicsPrivate {
         /* Already reserved at scRes; this is normally a no-op. */
         TEXFBO::reallocChecked(frozenScene, scRes.x, scRes.y, "frozenScene");
 
-        /* The other boot reservation: one texture for the on-screen overlay,
-         * taken here because here is still inside boot. */
+        /* The overlay's CPU state; its texture waits for the first show. */
         reserveOverlayTexture();
 #else
         TEXFBO::init(frozenScene);
@@ -2049,12 +2061,11 @@ struct GraphicsPrivate {
     
     ~GraphicsPrivate() {
         /* The overlay texture is deliberately NOT deleted, for the same
-         * reason the reserved surfaces are not: it was taken at boot and the
-         * process owns it until it exits. Deleting it here would queue a
-         * deferred release after GPUBudget::deferDrain("shutdown") has
-         * already run (Graphics::shutdown), so nothing would ever retire it
-         * -- and a Graphics rebuilt afterwards would have to take a texture
-         * out of a sealed, possibly empty pool.
+         * reason the reserved surfaces are not: once taken, the process owns
+         * it until it exits. Deleting it here would queue a deferred release
+         * after GPUBudget::deferDrain("shutdown") has already run
+         * (Graphics::shutdown), so nothing would ever retire it. A run that
+         * never showed the overlay has no texture to keep.
          *
          * Both of the following are guarded inside TEXFBO::fini() under
          * the bounded-GPU backend -- a reserved surface belongs to the
@@ -2234,13 +2245,8 @@ struct GraphicsPrivate {
         }
 
 #ifdef MKXPZ_SOFTWARE_BITMAPS
-        /* The swap-completion watchdog, and it is the only GPU-stall
-         * canary reachable from userland: the flip chain is strictly
-         * one-in-flight, and the swap blocks until the previous flip is
-         * handed over before the next one, so
-         * the wall-clock time of SDL_GL_SwapWindow IS a measurement of
-         * whether the PREVIOUS frame's render completed. No driver call, no
-         * privilege, no cost. */
+        /* The slow-swap watchdog: wall-clock time blocked inside
+         * SDL_GL_SwapWindow (display-queue back-pressure; see gl-util.h). */
         GPUBudget::swapBegin();
 #endif
 
@@ -2334,52 +2340,62 @@ struct GraphicsPrivate {
      * compose when a consumer changes the text, draw once per frame.
      * ================================================================== */
 
-    /* EXACTLY one texture, and it is taken HERE -- inside
-     * SharedStatePrivate's construction, which sharedstate.cpp runs after
-     * GPUBudget::reserveFixedSurfaces() and before GPUBudget::warmUpPrograms()
-     * and GPUBudget::seal(). That ordering is the whole reservation: after the
-     * seal the firmware sync pool may be empty, a texture created out of an
-     * empty pool gets a NULL sync object, and GPUBudget::creationSite() would
-     * (rightly) report it as a seal violation.
-     *
-     * So this is UNCONDITIONAL. It runs whether or not anything ever asks for
-     * the overlay to be shown, because the alternative -- reserving lazily on
-     * the first overlaySetVisible(true) -- is a post-seal texture, which is
-     * the one thing the budget forbids. The cost of never using it is 256 KiB
-     * of GPU-visible memory and one sync object. */
+    /* Boot: the CPU side only. The texture (256 KiB) is taken by the first
+     * visible drawOverlay(), so a run that never shows the overlay never
+     * pays for it. vitaGL has no sealed texture pool, so nothing needs to be
+     * reserved before the seal. */
     void reserveOverlayTexture() {
-        /* A second boot-reserved texture is another 256 KiB and another sync
-         * object out of a pool of about 32: a budget decision, not a
-         * detail. Keep this at one. */
         static_assert(GPUBudget::ReservedTextureCount == 1,
-                      "the boot texture budget is exactly one texture");
+                      "the overlay texture budget is exactly one texture");
 
         memset(overlayLines, 0, sizeof(overlayLines));
         overlay_init();
+    }
 
+    /* First visible draw: one texture, nearest and clamped (an 8x8 face
+     * filtered bilinearly is mud). Its storage comes from the first upload. */
+    bool takeOverlayTexture() {
         overlayTex = TEX::gen();
+        if (!overlayTex.gl)
+            return false;
         TEX::bind(overlayTex);
-        /* Whole-level storage NOW, at the final size and format, so every
-         * later upload is a same-size same-format whole-level refresh: then
-         * TEX::uploadImage's GPUBudget::respecify() is the documented no-op
-         * and the driver never has to free and re-take this texture's storage
-         * underneath a frame that may still be sampling it. */
-        TEX::allocEmpty(OVERLAY_W, OVERLAY_H);
-        /* Nearest and clamped: the overlay is drawn 1:1, and an 8x8 face
-         * filtered bilinearly is mud. setSmooth(false) does not touch
-         * shState (it reads the config only when smoothing is ON), which
-         * matters because shState is still null this early in boot -- the
-         * same reason TEXFBO::init can call it from reserveFixedSurfaces. */
         TEX::setRepeat(false);
         TEX::setSmooth(false);
-        TEX::unbind();
 
         char line[96];
         snprintf(line, sizeof(line),
-                 "vita-gpu: overlay texture reserved tex=%u %dx%d (%u KiB, "
-                 "pre-seal)", (unsigned)overlayTex.gl, OVERLAY_W, OVERLAY_H,
+                 "vita-gpu: overlay texture taken tex=%u %dx%d (%u KiB)",
+                 (unsigned)overlayTex.gl, OVERLAY_W, OVERLAY_H,
                  (unsigned)(OVERLAY_PIXELS * 4 / 1024));
         Debug() << line;
+        return true;
+    }
+
+    /* Whole level, checked. A failure keeps the image dirty for the next
+     * frame; vitaGL keeps any previous level intact. */
+    bool uploadOverlay() {
+        TEX::drainStaleErrors("overlay-prepare");
+#if defined(__vita__) && defined(MKXPZ_VITAGL_BACKEND)
+        const void *pixels = overlay_pixels();
+#else
+        overlay_copy_rgba8888(overlayStaging, OVERLAY_W * 4);
+        const void *pixels = overlayStaging;
+#endif
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+        FrameProfile::Scope profileUpload(FrameProfile::Upload, 0, false, false);
+#endif
+        const uint64_t bytes = (uint64_t)OVERLAY_PIXELS * 4u;
+        GPUBudget::respecify(GPUBudget::SlotTexture, GPUBudget::DeferTexture, bytes);
+        GPUBudget::uploadBegin(bytes);
+        ::gl.TexImage2D(GL_TEXTURE_2D, 0, OVERLAY_GL_FORMAT, OVERLAY_W, OVERLAY_H, 0,
+                        OVERLAY_GL_FORMAT, GL_UNSIGNED_BYTE, pixels);
+        bool ok = true;
+        for (GLenum err; (err = ::gl.GetError()) != GL_NO_ERROR;) {
+            ok = false;
+            GPUBudget::noteGLError("overlay-upload", err);
+        }
+        GPUBudget::uploadEnd(OVERLAY_W, OVERLAY_H, bytes);
+        return ok;
     }
 
     /* The whole single-writer rule, in one place. A call from a thread that
@@ -2520,25 +2536,26 @@ struct GraphicsPrivate {
      * engine's scratch quad, which under this backend draws straight out of
      * client memory and so owns no buffer either. */
     void drawOverlay() {
-        if (!overlayVisible || overlayTex == TEX::ID(0))
+        if (!overlayVisible)
+            return;
+        if (overlayTex == TEX::ID(0) && !takeOverlayTexture())
             return;
 
         TEX::bind(overlayTex);
 
         /* Upload ONLY when the composed pixels differ from what the texture
          * already holds. overlay_dirty() tracks content, not writes, so N
-         * frames of unchanged text cost exactly one upload -- the first one
-         * -- and a whole-level 256 KiB refresh never happens twice for the
-         * same image. Whole level, never a sub-rect: a sub-rect upload on
-         * this driver is the one transfer path with no sync object behind it
-         */
-        if (overlay_dirty()) {
-            overlay_copy_rgba8888(overlayStaging, OVERLAY_W * 4);
-#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
-            FrameProfile::Scope profileUpload(FrameProfile::Upload, 0, false, false);
-#endif
-            TEX::uploadImage(OVERLAY_W, OVERLAY_H, overlayStaging, GL_RGBA);
-            overlay_mark_uploaded();
+         * frames of unchanged text cost exactly one upload. Whole level: the
+         * texture is sampled every visible frame, so vitaGL would copy the
+         * old level before any sub-rect update. */
+        if (overlay_dirty() || !overlayStored) {
+            if (!uploadOverlay()) {
+                if (!overlayStored)
+                    return;
+            } else {
+                overlayStored = true;
+                overlay_mark_uploaded();
+            }
         }
 
         /* blitEnd() popped the window-sized viewport that blitBeginScreen()
@@ -2600,7 +2617,9 @@ struct GraphicsPrivate {
 
 #ifdef MKXPZ_SOFTWARE_BITMAPS
     /* The freeze contract for the per-frame composite: a refused upload
-     * retires the deferred queue and retries once; a second one skips the
+     * retires the deferred queue and retries once (on vitaGL without a
+     * glFinish: its allocator fenced and purged before it refused, and the
+     * queue is empty); a second one skips the
      * frame (the CPU pixels are intact and the next update draws the scene
      * again) instead of raising into the script, like freeze and transition.
      * A skipped frame presents nothing but still counts and paces. A refusal
@@ -2785,6 +2804,7 @@ struct GraphicsPrivate {
         SDL_GL_MakeCurrent(threadData->window, 0);
         threadData->syncPoint.waitMainSync();
         SDL_GL_MakeCurrent(threadData->window, glCtx);
+        glCurrentThread = 0;
         
         fpsLimiter.resetFrameAdjust();
     }
@@ -2804,7 +2824,10 @@ struct GraphicsPrivate {
         if (!(force || multithreadedMode)) return;
         
         SDL_LockMutex(glResourceLock);
-        SDL_GL_MakeCurrent(threadData->window, threadData->glContext);
+        const SDL_threadID self = SDL_ThreadID();
+        if (glCurrentThread.load(std::memory_order_relaxed) != self &&
+            SDL_GL_MakeCurrent(threadData->window, threadData->glContext) == 0)
+            glCurrentThread.store(self, std::memory_order_relaxed);
     }
     
     void releaseLock(bool force = false) {
@@ -3002,7 +3025,9 @@ void Graphics::freeze() {
      * The drain is also the single highest-value instrument here: it calls
      * into WaitForRender, which retries up to 10000 x 100 ms, so a render
      * that never completes turns a silent process stop into a log that ends
-     * at "BEGIN freeze-drain". */
+     * at "BEGIN freeze-drain". The queue is always empty on vitaGL, so the
+     * drain does not wait and the canary is a no-op (gl-meta.cpp deferDrain,
+     * headroomCanary). */
     GPUBudget::breadcrumb("BEGIN", "freeze-drain");
     GPUBudget::deferDrain("freeze", true);
     GPUBudget::breadcrumb("END", "freeze-drain");
@@ -3664,6 +3689,18 @@ bool Graphics::getIntegerScaling() const
 
 void Graphics::setIntegerScaling(bool value)
 {
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+    /* The 4th render surface exists only if the config asked at boot, and
+     * no surface may be created after the seal: refuse, stay off. Even
+     * `false` must not reach rebuildIntegerScaleBuffer() without it. */
+    if (!GPUBudget::haveIntegerScaleSurface()) {
+        static bool logged = false;
+        if (value && !logged)
+            Debug() << "vita-gpu: integer scaling needs integerScaling in config at boot";
+        logged = logged || value;
+        return;
+    }
+#endif
     p->integerScaleActive = value;
     p->findHighestIntegerScale();
     p->rebuildIntegerScaleBuffer();

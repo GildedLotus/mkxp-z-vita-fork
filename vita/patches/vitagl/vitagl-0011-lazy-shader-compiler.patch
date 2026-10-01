@@ -1,0 +1,53 @@
+# vitagl-0011: start SceShaccCg on the first shader cache miss, not in vglInit.
+# - gxm.c: init_gxm no longer loads libshacccg at every boot; every engine program and the
+#   launcher's ship as GXP, so a normal boot never needs it. start_shader_compiler installs the
+#   shark log callback itself, so a later start keeps the diagnostics.
+# - custom_shaders.c: glLinkProgram's postponed compile starts the compiler when a stage missed the
+#   cache (glCompileShader and the FFP paths already did). With no compiler the link still fails
+#   as in 0002.
+# - Shader output is unchanged: shipped GXPs stay valid (MANIFEST re-attested for the new patch hash only).
+diff --git a/source/gxm.c b/source/gxm.c
+index 97fe297..788037b 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -326,6 +326,12 @@ GLboolean start_shader_compiler(void) {
+ 			vgl_log("%s:%d Fatal error: SceShaccCg not found.\n", __FILE__, __LINE__);
+ #endif
+ 	}
++#if defined(HAVE_SHARK_LOG) || defined(LOG_ERRORS)
++	if (is_shark_online) {
++		shark_install_log_cb(shark_log_cb);
++		shark_set_warnings_level(SHARK_WARN_HIGH);
++	}
++#endif
+ 
+ 	return is_shark_online;
+ }
+@@ -351,13 +357,7 @@ void init_gxm(void) {
+ 	sceRazorGpuCaptureEnableSalvage("ux0:data/vitagl_gpucrash.sgx");
+ #endif
+ 
+-	// Initializing runtime shader compiler
+-	if (start_shader_compiler()) {
+-#if defined(HAVE_SHARK_LOG) || defined(LOG_ERRORS)
+-		shark_install_log_cb(shark_log_cb);
+-		shark_set_warnings_level(SHARK_WARN_HIGH);
+-#endif
+-	}
++	// The runtime shader compiler starts on the first shader cache miss (start_shader_compiler)
+ 
+ #ifndef HAVE_SINGLE_THREADED_GC
+ 	// Initializing garbage collector
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index b81507a..2e249b3 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -2590,6 +2590,8 @@ void glLinkProgram(GLuint progr) {
+ 		}
+ #endif
+ 		if (!p->vshader->prog || !p->fshader->prog) {
++			if (!is_shark_online)
++				start_shader_compiler();
+ 			if (p->vshader->is_glsl || p->fshader->is_glsl) {
+ 				glsl_translator_set_process(p->vshader, p->fshader);
+ 			}

@@ -127,7 +127,7 @@ void composite_text(const Surface &dst, Rect dstRect, const Surface &src,
  *   out.a   = (c1*255 + inv*dst.a + 32512) / 65025   when !keepDestAlpha
  * Both are the round-half-up of the shader's src*sa + dst*(1-sa) resp.
  * sa + da*(1-sa); byte inputs reach no rounding tie, so this is exactly
- * what the engine's double formulation writes. keepDestAlpha
+ * what the engine's fixed-point compose writes. keepDestAlpha
  * is the BlendKeepDestAlpha mode: GL_ZERO,GL_ONE writes no alpha. A source
  * alpha of 0 leaves the destination unchanged and 255 replaces it, so no
  * caller-side special cases exist.

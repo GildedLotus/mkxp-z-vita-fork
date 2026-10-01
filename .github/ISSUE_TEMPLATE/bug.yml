@@ -6,7 +6,7 @@ body:
     id: player-version
     attributes:
       label: mkxp-z for PS Vita version
-      placeholder: "1.0.0"
+      placeholder: "1.0.2"
     validations:
       required: true
   - type: textarea

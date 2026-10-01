@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Capture the precompiled GXP boot shaders after a device boot WITH libshacccg.
-#   capture-vitagl-shaders.sh --ftp HOST[:PORT] --title MKXPZ00xx   pull ux0:/data/shader_cache/<title>
+#   capture-vitagl-shaders.sh --ftp HOST[:PORT] --title MKXPZ00xx   pull ux0:/data/shader_cache/<title>-<set>
+#     (<set>: the first 16 hex of sha256 of the current set's MANIFEST, which the capturing build stamped)
 #   capture-vitagl-shaders.sh --from-dir <pulled cache root holding v2/>
 # Output: $VITAGL_SHADERS_DIR (default vita/vitagl-shaders, the tracked set the release ships). Extra arguments go to
 # vita/scripts/vitagl-shaders.py capture; the shader sources come from this tree. Capture refuses

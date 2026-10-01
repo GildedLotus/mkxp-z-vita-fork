@@ -68,39 +68,35 @@ namespace SoftBase
 namespace
 {
 
-/* v / 255.0 for every byte value. The Cortex-A9's
- * vdiv.f64 is about 25 cycles and does not pipeline, and `x / 255.0` cannot
- * become a multiply without -ffast-math because 1/255 is not representable,
- * so the compiler emits one divide per channel per layer. Every entry is
- * built from the same expression it replaces, so the table is bit-identical
- * to the division and the composed pixels do not move. The one exception is
- * the interpolated operand in drawQuad, which cannot index a table; it pays
- * kInv255 instead and accepts the rounding change recorded there. */
-struct ByteToUnit
+/* Fixed point, not double: a fragment channel is a byte
+ * with 8 fraction bits, so 1.0 is kOne = 255 << 8 and every step below is the
+ * double formulation's expression scaled by an integer. Byte inputs enter
+ * exactly (b << 8), so unfiltered unshaded quads write what the doubles did;
+ * only the Q12 bilinear weights and the quantised shade can move a byte, by
+ * at most 1. */
+const int kOne = 255 << 8;
+
+inline int clampUnit(int v)
 {
-	double v[256];
-
-	ByteToUnit()
-	{
-		for (int i = 0; i < 256; ++i)
-			v[i] = (double) i / 255.0;
-	}
-};
-
-const ByteToUnit unit;
-
-/* 1/255 correctly rounded once at compile time; the bilinear combine's
- * multiply by this is the reference formulation. */
-const double kInv255 = 1.0 / 255.0;
-
-inline double clamp01(double v)
-{
-	return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+	return v < 0 ? 0 : (v > kOne ? kOne : v);
 }
 
-inline uint8_t toByte(double v)
+/* round(v * scale), clamped, once per quad or per tap: never in the loop. */
+inline int quantise(double v, double scale, int lo, int hi)
 {
-	return (uint8_t)(clamp01(v) * 255.0 + 0.5);
+	const int q = (int)std::floor(v * scale + 0.5);
+	return q < lo ? lo : (q > hi ? hi : q);
+}
+
+/* round((x*a + d*(1-a)) * 255) for x, a in kOne units and a destination
+ * byte d. The convex sum is at most kOne^2 + kHalf < 2^32, and the divisor
+ * is a constant, so the compiler multiplies instead of dividing. */
+const uint32_t kBlendDiv = (uint32_t)kOne * 256;
+
+inline uint8_t blendByte(uint32_t x, uint32_t a, uint32_t d)
+{
+	return (uint8_t)((x * a + (d << 8) * ((uint32_t)kOne - a) + kBlendDiv / 2)
+	                 / kBlendDiv);
 }
 
 inline int clampInt(int v, int lo, int hi)
@@ -114,7 +110,7 @@ inline int clampInt(int v, int lo, int hi)
 struct Tap
 {
 	int i0, i1;
-	double w;
+	uint32_t w; /* weight of i1 in 1/4096ths */
 };
 
 void buildTaps(std::vector<Tap> &taps, int dstFrom, int dstCount,
@@ -137,53 +133,62 @@ void buildTaps(std::vector<Tap> &taps, int dstFrom, int dstCount,
 		{
 			/* GL_NEAREST: floor(u), clamped to the texture. */
 			tap.i0 = tap.i1 = clampInt((int)std::floor(u), 0, limit);
-			tap.w = 0.0;
+			tap.w = 0;
 			continue;
 		}
 
 		/* GL_LINEAR: the two texels straddling u - 0.5, CLAMP_TO_EDGE. */
 		const double f = u - 0.5;
 		const int base = (int)std::floor(f);
-		tap.w = f - (double)base;
+		tap.w = (uint32_t)quantise(f - (double)base, 4096.0, 0, 4096);
 		tap.i0 = clampInt(base, 0, limit);
 		tap.i1 = clampInt(base + 1, 0, limit);
 	}
 }
 
-/* Shade converted once per quad instead of once per pixel: float -> double is
- * exact, so this only moves the conversions out of the pixel loop. 'identity'
- * is the shade that provably does nothing -- adding 0.0 to a non-negative
- * fragment and multiplying it by 1.0 are both exact -- which is every frame
- * quad of both window types and every background quad at back opacity 255. */
-struct ShadeD
+/* Shade quantised once per quad: tone in kOne units, gray in 1/4096ths,
+ * opacity in 1/65536ths. 'identity' is the shade that provably does nothing,
+ * which is every frame quad of both window types and every background quad
+ * at back opacity 255. */
+struct ShadeQ
 {
-	double r, g, b, gray, opacity;
+	int r, g, b;
+	uint32_t gray, opacity;
 	bool identity;
 
-	explicit ShadeD(const Shade &s)
-	    : r(s.r), g(s.g), b(s.b), gray(s.gray), opacity(s.opacity),
+	explicit ShadeQ(const Shade &s)
+	    : r(quantise(s.r, kOne, -kOne, kOne)),
+	      g(quantise(s.g, kOne, -kOne, kOne)),
+	      b(quantise(s.b, kOne, -kOne, kOne)),
+	      gray((uint32_t)quantise(s.gray, 4096.0, 0, 4096)),
+	      opacity((uint32_t)quantise(s.opacity, 65536.0, 0, 65536)),
 	      identity(s.r == 0 && s.g == 0 && s.b == 0 &&
 	               s.gray == 0 && s.opacity == 1)
 	{}
 };
 
-/* shader/plane.frag, color.a == 0 and flash.a == 0. */
-inline void shadeFragment(double *frag, const ShadeD &shade)
+/* shader/plane.frag, color.a == 0 and flash.a == 0, on 0..kOne channels.
+ * BT.601 luma weights in 1/65536ths (19595 + 38470 + 7471 = 65536); every
+ * product stays below 2^32. */
+inline void shadeFragment(int *frag, const ShadeQ &shade)
 {
-	const double gray = shade.gray;
+	const uint32_t gray = shade.gray;
 
-	if (gray != 0.0)
+	if (gray != 0)
 	{
-		const double luma = frag[0] * 0.299 + frag[1] * 0.587 + frag[2] * 0.114;
+		const uint32_t luma = ((uint32_t)frag[0] * 19595u +
+		                       (uint32_t)frag[1] * 38470u +
+		                       (uint32_t)frag[2] * 7471u + 32768u) >> 16;
 
 		for (int ch = 0; ch < 3; ++ch)
-			frag[ch] = frag[ch] * (1.0 - gray) + luma * gray;
+			frag[ch] = (int)(((uint32_t)frag[ch] * (4096u - gray) +
+			                  luma * gray + 2048u) >> 12);
 	}
 
 	frag[0] += shade.r;
 	frag[1] += shade.g;
 	frag[2] += shade.b;
-	frag[3] *= shade.opacity;
+	frag[3] = (int)(((uint32_t)frag[3] * shade.opacity + 32768u) >> 16);
 }
 
 } // namespace
@@ -230,7 +235,7 @@ void drawQuad(const Surface &dst, const IntRect &pos,
 	if (x1 <= x0 || y1 <= y0)
 		return;
 
-	const ShadeD sh(shade);
+	const ShadeQ sh(shade);
 
 	/* A shade-free 1:1 quad in one of the
 	 * alpha-accumulating blends is exactly swraster's simple_blit -- the
@@ -239,7 +244,7 @@ void drawQuad(const Surface &dst, const IntRect &pos,
 	 * byte-identical to the generic loop below: with an identity shade the
 	 * fragment is the raw source byte, and byte operands reach no rounding
 	 * tie, so its constant-65025 round-half-up writes what this loop's
-	 * doubles write. The containment test keeps every quads' taps inside
+	 * fixed point writes. The containment test keeps every quads' taps inside
 	 * the skin, so the loop's CLAMP_TO_EDGE behaviour stays out of scope;
 	 * anything filtered, shaded or clipped against the source edge falls
 	 * through to the generic path unchanged. */
@@ -294,14 +299,14 @@ void drawQuad(const Surface &dst, const IntRect &pos,
 		for (int x = x0; x < x1; ++x)
 		{
 			const Tap &col = colTap[x - x0];
-			double frag[4];
+			int frag[4];
 
 			if (!smooth)
 			{
 				const uint8_t *s = srow0 + (size_t)col.i0 * 4;
 
 				for (int ch = 0; ch < 4; ++ch)
-					frag[ch] = unit.v[s[ch]];
+					frag[ch] = s[ch] << 8;
 			}
 			else
 			{
@@ -309,23 +314,16 @@ void drawQuad(const Surface &dst, const IntRect &pos,
 				const uint8_t *p01 = srow0 + (size_t)col.i1 * 4;
 				const uint8_t *p10 = srow1 + (size_t)col.i0 * 4;
 				const uint8_t *p11 = srow1 + (size_t)col.i1 * 4;
+				const uint32_t wx = col.w, wy = row.w;
 
-				/* The last division in the loop, paid as a multiply: the
-				 * operand is an interpolated double, so no table can stand
-				 * in for it, and 1/255 is not representable, so kInv255
-				 * rounds differently from / 255.0 -- by +-1 on 66 of
-				 * 8,595,840 sampled outputs.
-				 * Every byte-valued path stays bit-exact through the table
-				 * above; only this stretched-background quad, one per
-				 * window, moves. */
+				/* Q12 x Q12 weights: at most 255 << 24 plus the rounding
+				 * half, below 2^32, reduced to a byte with 8 fraction bits. */
 				for (int ch = 0; ch < 4; ++ch)
 				{
-					const double top = (double)p00[ch] * (1.0 - col.w)
-					                 + (double)p01[ch] * col.w;
-					const double bot = (double)p10[ch] * (1.0 - col.w)
-					                 + (double)p11[ch] * col.w;
+					const uint32_t top = p00[ch] * (4096u - wx) + p01[ch] * wx;
+					const uint32_t bot = p10[ch] * (4096u - wx) + p11[ch] * wx;
 
-					frag[ch] = (top * (1.0 - row.w) + bot * row.w) * kInv255;
+					frag[ch] = (int)((top * (4096u - wy) + bot * wy + 32768u) >> 16);
 				}
 			}
 
@@ -336,37 +334,29 @@ void drawQuad(const Surface &dst, const IntRect &pos,
 
 			if (blend == Replace)
 			{
-				/* toByte clamps, so the separate GL clamp step below would
-				 * be redundant on this path. */
+				/* round(clamp01(f) * 255), f = frag / kOne. */
 				for (int ch = 0; ch < 4; ++ch)
-					d[ch] = toByte(frag[ch]);
+					d[ch] = (uint8_t)((clampUnit(frag[ch]) + 128) >> 8);
 
 				continue;
 			}
 
 			/* GL clamps a fragment to 0..1 before blending it into a
 			 * fixed-point colour buffer. */
-			for (int ch = 0; ch < 4; ++ch)
-				frag[ch] = clamp01(frag[ch]);
+			const uint32_t sa = (uint32_t)clampUnit(frag[3]);
 
-			const double sa = frag[3];
-
-			/* A fully transparent fragment leaves the destination exactly
-			 * as it was: src * 0 is zero (or -0, which adds as zero) and
-			 * dst/255 * 1 round-trips to dst for all 256 byte values --
-			 * checked exhaustively. Windowskin
-			 * frames are mostly transparent, so this skips real work. */
-			if (sa == 0.0)
+			/* A fully transparent fragment leaves the destination exactly as
+			 * it was (blendByte returns d when a == 0). Windowskin frames are
+			 * mostly transparent, so this skips real work. */
+			if (sa == 0)
 				continue;
 
-			const double da = unit.v[d[3]];
-
 			for (int ch = 0; ch < 3; ++ch)
-				d[ch] = toByte(frag[ch] * sa + unit.v[d[ch]] * (1.0 - sa));
+				d[ch] = blendByte((uint32_t)clampUnit(frag[ch]), sa, d[ch]);
 
 			/* BlendKeepDestAlpha writes GL_ZERO, GL_ONE for alpha. */
 			if (blend == Normal)
-				d[3] = toByte(sa + da * (1.0 - sa));
+				d[3] = blendByte((uint32_t)kOne, sa, d[3]);
 		}
 	}
 }
@@ -605,6 +595,10 @@ struct WindowPrivate
 	 * drag a CPU compose plus a whole-level upload into every frame of a
 	 * window fade. */
 	int bakedBackOpacity;
+
+	/* Where the base is when it was composed on the GPU;
+	 * invalid while it lives in basePixels/baseTex instead. */
+	BaseSlot gpuSlot;
 #endif
 
 	QuadChunk backgroundVert;
@@ -704,6 +698,7 @@ struct WindowPrivate
 		 * if it was ever composed. Nothing to give back to a pool. */
 		if (baseTex.tex != TEX::ID(0))
 			TEX::del(baseTex.tex);
+		GPUBudget::releaseWindowBase(gpuSlot);
 #else
 		shState->texPool().release(baseTex);
 #endif
@@ -1018,12 +1013,67 @@ struct WindowPrivate
 		if (!TEX::uploadImageChecked(baseTex.width, baseTex.height, basePixels.data(), GL_RGBA))
 			throw TEX::UploadError();
 	}
+
+	/* The stock pass below, drawn into this window's atlas slot instead of
+	 * a pooled render target. False when there is no
+	 * slot to be had; the CPU twin then composes as before. */
+	bool composeBaseGpu()
+	{
+		if (nullOrDisposed(windowskin) || size.x < 16 || size.y < 16 ||
+		    !GPUBudget::placeWindowBase(gpuSlot, size.x, size.y))
+		{
+			GPUBudget::releaseWindowBase(gpuSlot);
+			baseTexQuad.setTexRect(FloatRect(0, 0, size.x, size.y));
+			return false;
+		}
+
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+		FrameProfile::Scope profileCompose(FrameProfile::Compose);
+#endif
+		GPUBudget::composeWindowBase(gpuSlot, drawBaseLayers, this);
+		baseTexQuad.setTexRect(FloatRect(gpuSlot.innerX(), gpuSlot.innerY(),
+		                                 size.x, size.y));
+		bakedBackOpacity = backOpacity;
+
+		if (baseTex.tex != TEX::ID(0))
+			TEX::del(baseTex.tex);
+		baseTex.tex = TEX::ID(0);
+		std::vector<uint8_t>().swap(basePixels);
+
+		return true;
+	}
+
+	static void drawBaseLayers(void *ctx, const Vec2i &origin)
+	{
+		WindowPrivate *p = static_cast<WindowPrivate*>(ctx);
+
+		SimpleAlphaShader &shader = shState->shaders().simpleAlpha;
+		shader.bind();
+		shader.applyViewportProj();
+		shader.setTranslation(origin);
+
+		p->windowskin->bindTex(shader);
+		TEX::setSmooth(true);
+
+		glState.blend.pushSet(false);
+		p->baseQuadArray.draw(0, p->backgroundVert.count);
+
+		glState.blend.set(true);
+		glState.blendMode.pushSet(BlendNormal);
+		p->baseQuadArray.draw(p->backgroundVert.count,
+		                      p->baseQuadArray.count() - p->backgroundVert.count);
+
+		glState.blendMode.pop();
+		glState.blend.pop();
+		TEX::setSmooth(false);
+	}
 #endif
 
 	void redrawBaseTex()
 	{
 #ifdef MKXPZ_SOFTWARE_BITMAPS
-		composeBaseTex();
+		if (!composeBaseGpu())
+			composeBaseTex();
 		return;
 #else
 		/* Discard old buffer */
@@ -1153,6 +1203,16 @@ struct WindowPrivate
 		 * and then draw this texture instead of the quad array */
 		useBaseTex = opacity < 255;
 
+#ifdef MKXPZ_SOFTWARE_BITMAPS
+		/* An opaque window draws its quads directly; give the slot back and
+		 * recompose if it fades again. */
+		if (!useBaseTex && gpuSlot.valid())
+		{
+			GPUBudget::releaseWindowBase(gpuSlot);
+			baseTexDirty = true;
+		}
+#endif
+
 		if (useBaseTex)
 		{
 			ensureBaseTexReady();
@@ -1207,8 +1267,19 @@ struct WindowPrivate
 			 * an untextured quad, and at opacity 0 do not draw a fully
 			 * transparent one either. The controls are a separate element
 			 * and still draw. */
-			if (baseTexDirty || baseTex.tex == TEX::ID(0) || opacity == 0)
+			if (baseTexDirty || opacity == 0 ||
+			    (!gpuSlot.valid() && baseTex.tex == TEX::ID(0)))
 				return;
+
+			if (gpuSlot.valid())
+			{
+				const TEXFBO &atlas = GPUBudget::windowBaseAtlas();
+				shader.setTexSize(Vec2i(atlas.width, atlas.height));
+				TEX::bind(atlas.tex);
+				TEX::setSmooth(false);
+				baseTexQuad.draw();
+				return;
+			}
 #endif
 			shader.setTexSize(Vec2i(baseTex.width, baseTex.height));
 

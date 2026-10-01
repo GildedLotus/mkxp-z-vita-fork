@@ -123,7 +123,7 @@ static GLuint compile_shader(GLenum type, const char *src, const char *tag,
 
 /* The program is one code-heap allocation and must exist before the texture:
  * a shader that cannot allocate its code heap fails the draw silently, and we
- * would rather find that out with the sync pool still full. */
+ * would rather find that out before the texture holds any memory. */
 static int build_program(LauncherGL *gl, LauncherTraceFn trace)
 {
     GLuint vs, fs;
@@ -253,9 +253,7 @@ int launcher_gl_init(LauncherGL *gl, int width, int height,
     /* Tightly packed rows; SDL's 32-bit surfaces are 4-byte aligned anyway,
      * but the default of 4 is a promise this module does not want to make. */
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    /* Allocate the level once, whole. Every later upload re-fills this same
-     * level; glTexImage2D is never called again, because re-specification is
-     * what releases a texture's driver-side storage. */
+    /* Allocate the level now, so a pool too small for it fails at init. */
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)width, (GLsizei)height, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     if (!checked(trace, "texture storage")) {
@@ -294,12 +292,13 @@ static int upload_pending(LauncherGL *gl)
 {
     (void)take_errors();
     glBindTexture(GL_TEXTURE_2D, (GLuint)gl->texture);
-    /* Whole level, always. The offsets are literal zeroes and the extent is
-     * the whole texture: there is no code path here that can emit a
-     * sub-rectangle, which is the 16 ms stall the earlier driver showed. */
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)gl->width,
-                    (GLsizei)gl->height, GL_RGBA, GL_UNSIGNED_BYTE,
-                    gl->pending_pixels);
+    /* Re-specify the whole level. The texture is sampled every frame, so
+     * vitaGL would copy the old level before a glTexSubImage2D; a new level
+     * is one copy, and the old one is freed once the GPU is done with it
+     * A failure leaves the previous level intact. */
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)gl->width,
+                 (GLsizei)gl->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 gl->pending_pixels);
     if (!checked(NULL, "texture upload"))
         return 0;
     gl->uploads++;

@@ -284,9 +284,8 @@ getPrivateDataCheck(VALUE self, const char *type)
     }
     void *obj = DATA_PTR(self);
 #else
-    const char *ownname = rb_obj_classname(self);
     if (!rb_typeddata_is_kind_of(self, &type))
-        rb_raise(rb_eTypeError, "Can't convert %s into %s", ownname,
+        rb_raise(rb_eTypeError, "Can't convert %s into %s", rb_obj_classname(self),
                  type.wrap_struct_name);
     
     void *obj = RTYPEDDATA_DATA(self);

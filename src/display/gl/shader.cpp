@@ -32,7 +32,10 @@
 #include <SDL_video.h>
 #endif
 
-#ifdef __vita__
+/* The engine program-binary cache is compiled out on vitaGL, which reads its
+ * own shipped GXP cache and has no program-binary extension. */
+#if defined(__vita__) && !defined(MKXPZ_VITAGL_BACKEND)
+#define MKXPZ_PROGRAM_BINARY_CACHE
 #include "shader-cache.h"
 #endif
 
@@ -185,7 +188,7 @@ std::string &Shader::commonHeader() {
 
 static void setupShaderSource(GLuint shader, GLenum type,
                               const unsigned char *body, int bodySize, bool finalPresentation
-#ifdef __vita__
+#ifdef MKXPZ_PROGRAM_BINARY_CACHE
                               , ShaderCache::Key *key = nullptr
 #endif
                               )
@@ -229,7 +232,7 @@ static void setupShaderSource(GLuint shader, GLenum type,
 	shaderSrcSize[i] = bodySize;
 	++i;
 
-#ifdef __vita__
+#ifdef MKXPZ_PROGRAM_BINARY_CACHE
 	if (key) {
 		key->number(type); key->number(i);
 		for (size_t j = 0; j < i; ++j) key->bytes(shaderSrc[j], shaderSrcSize[j]);
@@ -275,7 +278,7 @@ void Shader::init(const unsigned char *vert, int vertSize,
 	const struct { GLuint index; const char *name; } attributes[] = {
 		{Position, "position"}, {TexCoord, "texCoord"}, {Color, "color"}
 	};
-#ifdef __vita__
+#ifdef MKXPZ_PROGRAM_BINARY_CACHE
 	ShaderCache::Session &cache = ShaderCache::session();
 	ShaderCache::Key key = cache.identity();
 	for (const auto &attribute : attributes) { key.number(attribute.index); key.text(attribute.name); }
@@ -356,7 +359,7 @@ void Shader::init(const unsigned char *vert, int vertSize,
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
 	linkMS = (vita_glue_frame_profile_now_us() - linkStart) / 1000.0;
 #endif
-#ifdef __vita__
+#ifdef MKXPZ_PROGRAM_BINARY_CACHE
 	cache.save(program, key);
 #endif
 	}
@@ -377,7 +380,7 @@ void shaderBootComplete()
 #ifdef MKXPZ_VITAGL_BACKEND
 	vita_glue_vgl_pool_ledger("shaders");
 #endif
-#ifdef __vita__
+#ifdef MKXPZ_PROGRAM_BINARY_CACHE
 	ShaderCache::session().summary();
 #endif
 }
@@ -1280,9 +1283,8 @@ void XbrzShader::setTargetScale(const Vec2 &value)
 #endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
 
 #ifdef MKXPZ_SOFTWARE_BITMAPS
-/* Mirrors ShaderSet's member list exactly, including its #ifdefs. BlurShader
- * is not a ShaderBase -- it is a pair of them -- so it contributes two
- * entries, which is also how many programs it compiles. */
+/* Mirrors ShaderSet's member list exactly, including its #ifdefs; the
+ * GPU-bitmap-only members (BlurShader among them) are not built here. */
 void shaderSetEnumerate(ShaderSet &set, std::vector<ShaderBase*> &out)
 {
 	out.clear();
@@ -1300,15 +1302,8 @@ void shaderSetEnumerate(ShaderSet &set, std::vector<ShaderBase*> &out)
 	out.push_back(&set.flashMap);
 	out.push_back(&set.trans);
 	out.push_back(&set.simpleTrans);
-	out.push_back(&set.hue);
-	out.push_back(&set.blt);
 	out.push_back(&set.simpleMatrix);
-	out.push_back(&set.blur.pass1);
-	out.push_back(&set.blur.pass2);
 	out.push_back(&set.tilemapVX);
-	out.push_back(&set.kglInvert);
-	out.push_back(&set.kglCompressAlpha);
-	out.push_back(&set.kglSubtract);
 	out.push_back(&set.movieYuv);
 #ifndef MKXPZ_NO_OPTIONAL_SHADERS
 	out.push_back(&set.kglShadowH);

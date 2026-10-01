@@ -400,6 +400,12 @@ CPP_ARGS=("${VITA_CPU[@]}" "${VITA_DEBUG[@]}" "${VITA_SECTIONS[@]}" ${FILE_PREFI
 # compiler sees -DMKXPZ_VITA_VERSION="1.0.0" (a C string literal).
 C_ARGS+=("-DMKXPZ_VITA_VERSION=\"$MKXPZ_VITA_VERSION\"")
 CPP_ARGS+=("-DMKXPZ_VITA_VERSION=\"$MKXPZ_VITA_VERSION\"")
+# The glue's writable vitaGL shader-cache root is per shipped GXP set: the
+# MANIFEST records the set digest and every vitaGL input.
+SHADER_MANIFEST="$ROOT/vita/vitagl-shaders/MANIFEST"
+VITA_SHADER_SET_ID=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest()[:16])' "$SHADER_MANIFEST") ||
+  die "cannot read $SHADER_MANIFEST"
+C_ARGS+=("-DVITA_SHADER_SET_ID=\"$VITA_SHADER_SET_ID\"")
 if [[ "$HAVE_TSF" -eq 1 ]]; then
   CPP_ARGS+=("-DMKXPZ_TSF" "-I$TSF_PREFIX")
 fi

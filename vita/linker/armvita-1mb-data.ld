@@ -14,8 +14,8 @@
    ~10 MiB. Aligning RW to 1 MiB makes linked == loaded for both cases:
      - ASLR off (-na): loader honors preferred, which is already 1MiB-aligned
      - ASLR on / forced 1MiB placement: ALIGN_1MB(RX_end) equals preferred
-   as long as RX_end stays in the same 1 MiB window (SCE metadata appended
-   by vita-elf-create is only a few KiB).
+   as long as RX_end plus the SCE data vita-elf-create appends stays in the
+   same 1 MiB window, which the SCE-data reserve below guarantees.
 
    The __sce_headroom defsym is obsolete: the loader ignored
    it. Do not reintroduce DATA_SEGMENT_ALIGN(0x10000, 0x10000). */
@@ -140,10 +140,22 @@ SECTIONS
   .note.dlopen :        { *(.note.dlopen) }
   .note.netbsd.ident :  { *(.note.netbsd.ident) }
   .note.openbsd.ident : { *(.note.openbsd.ident) }
+  /* vita-elf-create appends S bytes of SCE module data at
+     ALIGN4(RX_end) and fails if RW starts inside them, and the loader puts RW
+     at ALIGN_1MB(RX_end + S). Reserve __mkxpz_sce_reserve bytes for S; when
+     that reserve would cross a 1 MiB boundary, pad RX up to the boundary so
+     RX + S and RW move to the next window together.
+     vita/scripts/check-sce-headroom.py checks S against the reserve. */
+  __mkxpz_sce_reserve = 0x8000;
+  .sce_reserve_pad (READONLY) :
+  {
+    LONG(0)  /* data keeps the pad PROGBITS, so it stays in the RX segment */
+    . += (ALIGN(0x100000) - . < __mkxpz_sce_reserve) ? ALIGN(0x100000) - . : 0;
+  }
   /* Start of the Read Write Data region.  */
   /* 1 MiB align so linked RW == loader ALIGN_1MB(RX_end).
      Replaces DATA_SEGMENT_ALIGN(0x10000,0x10000) + __sce_headroom. */
-  . = ALIGN(0x100000);
+  . = ALIGN(. + __mkxpz_sce_reserve, 0x100000);
   /* Exception handling.  */
   .eh_frame       : ONLY_IF_RW { KEEP (*(.eh_frame)) *(.eh_frame.*) }
   .sframe         : ONLY_IF_RW { KEEP (*(.sframe)) *(.sframe.*) }
