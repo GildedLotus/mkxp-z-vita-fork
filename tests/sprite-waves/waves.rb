@@ -1,4 +1,11 @@
-b = Bitmap.new("Graphics/Pictures/OST_009")
+# A generated grid keeps the wave/source-rectangle probe self-contained.
+b = Bitmap.new(400, 400)
+8.times do |y|
+	8.times do |x|
+		b.fill_rect(x * 50, y * 50, 50, 50,
+		            Color.new(x * 32, y * 32, (x + y).even? ? 255 : 0))
+	end
+end
 s = Sprite.new
 s.bitmap = b
 

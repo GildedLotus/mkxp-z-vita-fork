@@ -80,8 +80,8 @@ fi
 actual="$(git -C "$SRC" rev-parse HEAD)"
 [[ "$actual" == "$RUBY_REF" ]] || die "source HEAD $actual != pin $RUBY_REF"
 
-# mkxp-z macos/Dependencies/common.make strips this assignment before
-# autoreconf. autoconf 2.72 accepted it here, but keep the same guard so a
+# Strip the macOS preload assignment before autoreconf. autoconf 2.72
+# accepted it here, but keep the same guard so a
 # future autoconf does not treat the default as a preprocessor macro.
 if [[ "$(uname -s)" == Darwin ]]; then
   sed -i.bak '/: ${PRELOADENV=DYLD_INSERT_LIBRARIES}/d' "$SRC/configure.ac"

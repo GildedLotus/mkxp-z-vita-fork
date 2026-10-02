@@ -25,28 +25,8 @@ embedded_shaders = [
     'blurH.vert',
     'blurV.vert',
     'simpleMatrix.vert',
-    'kglInvert.frag',
-    'kglCompressAlpha.frag',
-    'kglSubtract.frag',
     'movieYuv.frag',
 ]
-
-# Optional shaders: kglShadow H/V (KGL2 soft shadow), bicubic/lanczos3 scalers.
-# Omitted entirely when optional_shaders is disabled so ShaderSet never
-# constructs programs the driver may reject at boot.
-if get_option('optional_shaders') == true
-    embedded_shaders += [
-        'kglShadowH.frag',
-        'kglShadowV.frag',
-        'bicubic.frag',
-        'lanczos3.frag',
-    ]
-endif
-
-# xBRZ shader is GPLv3.
-if get_option('enable-https') == true
-    embedded_shaders += 'xbrz.frag'
-endif
 
 embedded_shaders_f = files(embedded_shaders)
 
@@ -57,8 +37,7 @@ foreach file : embedded_shaders_f
         output: '@0@.xxd'.format(embedded_shaders[count]),
         command: [
             # Rewrite xxd's path-derived symbols to the stable
-            # ___shader_<basename> form shader.cpp expects (linux/Makefile
-            # uses `xxd -i ../shader/<file>`). See assets/meson.build.
+            # ___shader_<basename> form shader.cpp expects. See assets/meson.build.
             'python3', '-c',
             '''
 import os, re, subprocess, sys

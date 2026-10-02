@@ -30,8 +30,6 @@
 #include <vector>
 #endif
 
-class ShaderNoConstructTag {};
-
 class Shader
 {
 public:
@@ -44,8 +42,6 @@ public:
 		TexCoord = 1,
 		Color = 2
 	};
-    
-    static std::string &commonHeader();
 
 protected:
 	Shader();
@@ -66,11 +62,6 @@ protected:
 	GLuint program;
 	bool initialized;
 	bool finalPresentationVariant;
-    
-private:
-#ifdef MKXPZ_BUILD_XCODE
-    static std::string shaderCommon;
-#endif
 };
 
 class ShaderBase : public Shader
@@ -119,7 +110,6 @@ class SimpleShader : public ShaderBase
 {
 public:
 	SimpleShader();
-	SimpleShader(const ShaderNoConstructTag &);
 
 	void setTexOffsetX(int value);
 	bool hasFinalPresentation() const { return finalPresentationVariant; }
@@ -172,7 +162,6 @@ class SimpleSpriteShader : public ShaderBase
 {
 public:
 	SimpleSpriteShader();
-	SimpleSpriteShader(const ShaderNoConstructTag &);
 
 	void setSpriteMat(const float value[16]);
 
@@ -359,7 +348,6 @@ class BltShader : public ShaderBase
 {
 public:
 	BltShader();
-	BltShader(const ShaderNoConstructTag &);
 
 	void init();
 
@@ -372,122 +360,6 @@ public:
 private:
 	GLint u_source, u_destination, u_subRect, u_opacity;
 };
-
-class KglInvertShader : public ShaderBase
-{
-public:
-	KglInvertShader();
-};
-
-class KglCompressAlphaShader : public ShaderBase
-{
-public:
-	KglCompressAlphaShader();
-};
-
-class KglSubtractShader : public BltShader
-{
-public:
-	KglSubtractShader();
-};
-
-#ifndef MKXPZ_NO_OPTIONAL_SHADERS
-class KglShadowShaderH : public ShaderBase
-{
-public:
-	KglShadowShaderH();
-
-	void setParams(int x1, int x2, int y, bool soft, int w, int h, int x_center, int y_center, double slope1, double slope2);
-
-private:
-	GLint u_x1, u_x2, u_y, u_soft, u_w, u_h, u_x_center, u_y_center, u_slope1, u_slope2;
-};
-
-class KglShadowShaderV : public ShaderBase
-{
-public:
-	KglShadowShaderV();
-
-	void setParams(int y1, int y2, int x, bool wall, bool soft, int w, int h, int x_center, int y_center, double slope1, double slope2);
-
-private:
-	GLint u_y1, u_y2, u_x, u_wall, u_soft, u_w, u_h, u_x_center, u_y_center, u_slope1, u_slope2;
-};
-
-class Lanczos3Shader : public SimpleShader
-{
-public:
-	Lanczos3Shader();
-	Lanczos3Shader(const ShaderNoConstructTag &);
-
-	void setTexSize(const Vec2i &value);
-
-protected:
-	GLint u_sourceSize;
-};
-
-class BicubicShader : public Lanczos3Shader
-{
-public:
-	BicubicShader();
-
-	void setSharpness(int sharpness);
-
-protected:
-	GLint u_bc;
-};
-#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
-
-#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
-class XbrzShader : public Lanczos3Shader
-{
-public:
-	XbrzShader();
-
-	void setTargetScale(const Vec2 &value);
-
-protected:
-	GLint u_targetScale;
-};
-#endif
-
-#ifndef MKXPZ_NO_OPTIONAL_SHADERS
-class Lanczos3SpriteShader : public SimpleSpriteShader
-{
-public:
-	Lanczos3SpriteShader();
-	Lanczos3SpriteShader(const ShaderNoConstructTag &);
-
-	void setTexSize(const Vec2i &value);
-
-protected:
-	GLint u_sourceSize;
-};
-
-class BicubicSpriteShader : public Lanczos3SpriteShader
-{
-public:
-	BicubicSpriteShader();
-
-	void setSharpness(int sharpness);
-
-protected:
-	GLint u_bc;
-};
-#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
-
-#ifndef MKXPZ_NO_OPTIONAL_SHADERS
-class XbrzSpriteShader : public Lanczos3SpriteShader
-{
-public:
-	XbrzSpriteShader();
-
-	void setTargetScale(const Vec2 &value);
-
-protected:
-	GLint u_targetScale;
-};
-#endif
 
 /* Graphics.play_movie frames: packed Y/Cb/Cr planes converted on the GPU
  * (THEORAPLAY_VIDFMT_YUVTEX). Built with the set at boot like every program. */
@@ -529,25 +401,6 @@ struct ShaderSet
 	HueShader hue;
 	BltShader blt;
 	BlurShader blur;
-	KglInvertShader kglInvert;
-	KglCompressAlphaShader kglCompressAlpha;
-	KglSubtractShader kglSubtract;
-#endif
-#ifndef MKXPZ_NO_OPTIONAL_SHADERS
-	KglShadowShaderH kglShadowH;
-	KglShadowShaderV kglShadowV;
-	BicubicShader bicubic;
-	Lanczos3Shader lanczos3;
-#endif
-#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
-	XbrzShader xbrz;
-#endif
-#ifndef MKXPZ_NO_OPTIONAL_SHADERS
-	Lanczos3SpriteShader lanczos3Sprite;
-	BicubicSpriteShader bicubicSprite;
-#ifdef MKXPZ_SSL
-	XbrzSpriteShader xbrzSprite;
-#endif
 #endif
 };
 

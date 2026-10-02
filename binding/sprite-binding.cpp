@@ -28,11 +28,7 @@
 #include "sprite.h"
 #include "viewportelement-binding.h"
 
-#if RAPI_FULL > 187
 DEF_TYPE(Sprite);
-#else
-DEF_ALLOCFUNC(Sprite);
-#endif
 
 RB_METHOD_GUARD(spriteInitialize) {
     VALUE viewportObj = Qnil;
@@ -115,11 +111,7 @@ RB_METHOD_GUARD_END
 
 void spriteBindingInit() {
     VALUE klass = rb_define_class("Sprite", rb_cObject);
-#if RAPI_FULL > 187
     rb_define_alloc_func(klass, classAllocate<&SpriteType>);
-#else
-    rb_define_alloc_func(klass, SpriteAllocate);
-#endif
     
     disposableBindingInit<Sprite>(klass);
     flashableBindingInit<Sprite>(klass);

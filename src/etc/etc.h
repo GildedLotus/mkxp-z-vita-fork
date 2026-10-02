@@ -204,11 +204,6 @@ enum InterpolationMethod
 {
 	NearestNeighbor = 0,
 	Bilinear = 1,
-	Bicubic = 2,
-	Lanczos3 = 3,
-#ifdef MKXPZ_SSL
-	xBRZ = 4,
-#endif
 };
 
 enum SpecialScale

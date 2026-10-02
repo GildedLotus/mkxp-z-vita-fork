@@ -42,10 +42,6 @@
 #include <array>
 #include <unordered_map>
 
-#ifdef MKXPZ_BUILD_XCODE
-#include "filesystem/filesystem.h"
-#endif
-
 #include <SDL_ttf.h>
 
 #include <ft2build.h>
@@ -54,19 +50,9 @@
 #include FT_TRUETYPE_TABLES_H
 #include FT_TRUETYPE_IDS_H
 
-#ifndef MKXPZ_BUILD_XCODE
-#ifndef MKXPZ_CJK_FONT
 #include "liberation.ttf.xxd"
-#else
-#include "wqymicrohei.ttf.xxd"
-#endif
 
-
-#ifndef MKXPZ_CJK_FONT
 #define BUNDLED_FONT liberation
-#else
-#define BUNDLED_FONT wqymicrohei
-#endif
 
 #define BUNDLED_FONT_DECL(FONT) \
 	extern unsigned char ___assets_##FONT##_ttf[]; \
@@ -81,19 +67,13 @@ BUNDLED_FONT_DECL(liberation)
 #define BNDL_F_D(f) BUNDLED_FONT_D(f)
 #define BNDL_F_L(f) BUNDLED_FONT_L(f)
 
-#endif
-
 /* Dirty hack to get the FT_Face.
  * SDL_ttf will probably never move it from the beginning of the struct. */
 #define TTF_FONT_TO_FT_FACE(font) (*reinterpret_cast<FT_Face *>(font))
 
 static SDL_RWops *openBundledFont()
 {
-#ifndef MKXPZ_BUILD_XCODE
     return SDL_RWFromConstMem(BNDL_F_D(BUNDLED_FONT), BNDL_F_L(BUNDLED_FONT));
-#else
-    return SDL_RWFromFile(mkxp_fs::getPathForAsset("Fonts/liberation", "ttf").c_str(), "rb");
-#endif
 }
 
 
@@ -919,9 +899,8 @@ _TTF_Font *SharedFontState::getFont(std::string family,
 	 * -> default_font_family step, i.e. the key resolution ran on.
 	 *
 	 * The subscript is safe: a non-empty answer from resolveFamily is
-	 * always a family already in `sets`. The built-in face is named
-	 * outright because this port pins -Dcjk_fallback_font=false, so
-	 * BUNDLED_FONT is liberation and nothing else. */
+	 * always a family already in `sets`. The built-in face is always
+	 * Liberation Sans. */
 	if (!p->loggedFamilies.contains(requested))
 	{
 		p->loggedFamilies.insert(requested);

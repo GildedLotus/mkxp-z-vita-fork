@@ -1014,12 +1014,9 @@ void Sprite::draw()
         scalingMethod = shState->config().bitmapSmoothScaling;
     }
 
-#ifdef MKXPZ_NO_OPTIONAL_SHADERS
-    /* Bicubic / Lanczos3 sprite shaders are not built; clamp so the switch
-     * below never selects those cases. */
-    if (scalingMethod >= Bicubic)
+    /* This Vita-only fork supports nearest-neighbor and bilinear scaling. */
+    if (scalingMethod > Bilinear)
         scalingMethod = Bilinear;
-#endif
 
     if (renderEffect)
     {
@@ -1103,48 +1100,6 @@ void Sprite::draw()
     }
     else
     {
-        switch (scalingMethod)
-        {
-#ifndef MKXPZ_NO_OPTIONAL_SHADERS
-        case Bicubic:
-        {
-            BicubicSpriteShader &shader = shState->shaders().bicubicSprite;
-            shader.bind();
-
-            shader.setTexSize(Vec2i(sourceWidthHires, sourceHeightHires));
-            shader.setSharpness(shState->config().bicubicSharpness);
-            shader.setSpriteMat(p->trans.getMatrix());
-            shader.applyViewportProj();
-            base = &shader;
-        }
-            break;
-        case Lanczos3:
-        {
-            Lanczos3SpriteShader &shader = shState->shaders().lanczos3Sprite;
-            shader.bind();
-            
-            shader.setTexSize(Vec2i(sourceWidthHires, sourceHeightHires));
-            shader.setSpriteMat(p->trans.getMatrix());
-            shader.applyViewportProj();
-            base = &shader;
-        }
-            break;
-#ifdef MKXPZ_SSL
-        case xBRZ:
-        {
-            XbrzSpriteShader &shader = shState->shaders().xbrzSprite;
-            shader.bind();
-
-            shader.setTexSize(Vec2i(sourceWidthHires, sourceHeightHires));
-            shader.setTargetScale(Vec2((float)(shState->config().xbrzScalingFactor), (float)(shState->config().xbrzScalingFactor)));
-            shader.setSpriteMat(p->trans.getMatrix());
-            shader.applyViewportProj();
-            base = &shader;
-        }
-            break;
-#endif
-#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
-        default:
         {
             SimpleSpriteShader &shader = shState->shaders().simpleSprite;
             shader.bind();
@@ -1153,7 +1108,6 @@ void Sprite::draw()
             shader.applyViewportProj();
             base = &shader;
         }
-        }        
     }
     
     GLProperty<BlendType>::Guard blendMode(glState.blendMode);
@@ -1170,13 +1124,6 @@ void Sprite::draw()
 #endif
     }
 
-#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
-    if (scalingMethod == xBRZ)
-    {
-        XbrzShader &shader = shState->shaders().xbrz;
-        shader.setTargetScale(Vec2((float)(shState->config().xbrzScalingFactor), (float)(shState->config().xbrzScalingFactor)));
-    }
-#endif
     
     TEX::setSmooth(scalingMethod == Bilinear);
 

@@ -25,11 +25,7 @@
 #include "plane.h"
 #include "viewportelement-binding.h"
 
-#if RAPI_FULL > 187
 DEF_TYPE(Plane);
-#else
-DEF_ALLOCFUNC(Plane);
-#endif
 
 RB_METHOD_GUARD(planeInitialize) {
   VALUE viewportObj = Qnil;
@@ -66,11 +62,7 @@ DEF_GFX_PROP_F(Plane, ZoomY)
 
 void planeBindingInit() {
   VALUE klass = rb_define_class("Plane", rb_cObject);
-#if RAPI_FULL > 187
   rb_define_alloc_func(klass, classAllocate<&PlaneType>);
-#else
-  rb_define_alloc_func(klass, PlaneAllocate);
-#endif
 
   disposableBindingInit<Plane>(klass);
   viewportElementBindingInit<Plane>(klass);

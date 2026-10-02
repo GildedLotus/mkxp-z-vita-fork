@@ -35,8 +35,6 @@ struct Config {
     int rgssVersion;
     
     bool debugMode;
-    bool winConsole;
-    bool preferMetalRenderer;
     bool displayFPS;
     bool printFPS;
     
@@ -48,10 +46,6 @@ struct Config {
     int bitmapSmoothScaling;
     int bitmapSmoothScalingDown;
     bool smoothScalingMipmaps;
-    int bicubicSharpness;
-#ifdef MKXPZ_SSL
-    double xbrzScalingFactor;
-#endif
     bool enableHires;
     double textureScalingFactor;
     double framebufferScalingFactor;
@@ -78,7 +72,6 @@ struct Config {
     } integerScaling;
     
     std::string gameFolder;
-    bool manualFolderSelect;
     
     bool anyAltToggleFS;
     bool enableReset;
@@ -107,9 +100,7 @@ struct Config {
     std::string dataPathOrg;
     std::string dataPathApp;
     
-    std::string iconPath;
     std::string execName;
-    std::string titleLanguage;
     
     struct {
         std::string soundFont;

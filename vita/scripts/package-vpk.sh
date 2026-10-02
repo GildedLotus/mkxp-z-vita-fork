@@ -8,9 +8,8 @@
 #
 # eboot source priority:
 #   1. $MKXPZ_ELF                          (explicit override)
-#   2. $BUILD_DIR/mkxp-z                   (meson output)
-#   3. $BUILD_DIR/src/mkxp-z               (alternate meson layout)
-#   4. fail
+#   2. $BUILD_DIR/mkxp-z.cortex-a9         (Vita Meson output)
+#   3. fail
 #
 # VPK contents:
 #   eboot.bin
@@ -138,15 +137,9 @@ ELF_IN=""
 if [[ -n ${MKXPZ_ELF:-} ]]; then
 	[[ -f $MKXPZ_ELF ]] || die "MKXPZ_ELF=$MKXPZ_ELF does not exist"
 	ELF_IN="$MKXPZ_ELF"
-elif [[ -x "$BUILD_DIR/mkxp-z" ]]; then
-	ELF_IN="$BUILD_DIR/mkxp-z"
 elif [[ -x "$BUILD_DIR/mkxp-z.cortex-a9" ]]; then
-	# meson names the exe '<project>.<cpu>' when host_system=linux and
-	# appimage=false (vita/meson/vita-cross.ini). Without this branch the
-	# packager silently fell back to the stub.
+	# The Vita Meson target is named '<project>.<cpu>'.
 	ELF_IN="$BUILD_DIR/mkxp-z.cortex-a9"
-elif [[ -x "$BUILD_DIR/src/mkxp-z" ]]; then
-	ELF_IN="$BUILD_DIR/src/mkxp-z"
 else
 	die "real player ELF missing; build mkxp-z first or set MKXPZ_ELF"
 fi
@@ -261,7 +254,6 @@ if blob[:6] == b"\x7fELF\x01\x01":
         if label == b".mkxpz.build_receipt":
             receipt = json.loads(blob[offset:offset + length])
 if receipt is None:
-    # Shader delivery is decided by what the ELF was built with (optionalShaders).
     sys.exit("%s carries no build receipt: configure it with vita/scripts/configure-vita.sh and relink" % elf)
 # The GL driver is baked in at compile time. Not governed by
 # ALLOW_STALE_ELF — this is a different build, not a stale one.
@@ -269,12 +261,6 @@ if receipt.get("backend") != backend:
     sys.exit("ELF was built for the %s backend, not %s: reconfigure with "
              "VITA_GL_BACKEND=%s and relink" % (receipt.get("backend"), backend, backend))
 sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-# The shipped GXP set covers the boot programs only. An ELF built with the optional shaders links
-# Bicubic/Lanczos3/... at boot, which have no cache file and no compiler on a player's device: the
-# receipt, not the packaging shell, says what this ELF was built with.
-if receipt.get("optionalShaders") is not False:
-    sys.exit("ELF was built with optional shaders (receipt optionalShaders=%r): the shipped GXP set does not cover "
-             "them; reconfigure with MKXPZ_OPTIONAL_SHADERS=0 and relink" % receipt.get("optionalShaders"))
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(root / "vita/scripts"))
 import treedigest

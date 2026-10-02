@@ -4,27 +4,18 @@
 #include <SDL.h>
 #include <cstdint>
 #include <new>
-#include <string>
 
-#include "filesystem/filesystem.h"
 #include "miniffi.h"
 #include "binding-util.h"
 
-#if RAPI_MAJOR >= 2
 #include <ruby/thread.h>
-#endif
 
 #if defined(__linux__) || defined(__APPLE__)
 #define MVAL2RB(v) ULONG2NUM(v)
 #define RB2MVAL(v) (mffi_value)NUM2ULONG(v)
 #else
-#ifdef __MINGW64__
-#define MVAL2RB(v) ULL2NUM(v)
-#define RB2MVAL(v) (mffi_value)NUM2ULL(v)
-#else
 #define MVAL2RB(v) UINT2NUM(v)
 #define RB2MVAL(v) (mffi_value)NUM2UINT(v)
-#endif
 #endif
 
 #define _T_VOID 0
@@ -65,13 +56,7 @@ static void MiniFFIFree(void *p) {
     delete data;
 }
 
-#if RAPI_FULL > 187
 DEF_TYPE_CUSTOMFREE(MiniFFI, MiniFFIFree);
-#else
-static VALUE MiniFFIAllocate(VALUE klass) {
-    return Data_Wrap_Struct(klass, MiniFFIMark, MiniFFIFree, 0);
-}
-#endif
 
 static void *MiniFFI_GetFunctionHandle(void *libhandle, const char *func) {
     if (!libhandle)
@@ -211,19 +196,8 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
     if (!data)
         throw std::bad_alloc();
     try {
-#ifdef __APPLE__
-        data->lib = SDL_LoadObject(mkxp_fs::normalizePath(RSTRING_PTR(libname), 1, 1).c_str());
-#else
         data->lib = SDL_LoadObject(RSTRING_PTR(libname));
-#endif
         data->func = MiniFFI_GetFunctionHandle(data->lib, RSTRING_PTR(func));
-#ifdef __WIN32__
-        if (data->lib && !data->func) {
-            std::string func_a(RSTRING_PTR(func));
-            func_a += 'A';
-            data->func = SDL_LoadFunction(data->lib, func_a.c_str());
-        }
-#endif
         if (!data->func)
             throw Exception(Exception::RuntimeError, "%s", SDL_GetError());
     } catch (...) {
@@ -248,7 +222,6 @@ RB_METHOD_GUARD(MiniFFI_initialize) {
 }
 RB_METHOD_GUARD_END
 
-#if RAPI_MAJOR >= 2
 typedef struct {
     MINIFFI_FUNC function;
     MiniFFIFuncArgs *args;
@@ -259,7 +232,6 @@ void* miniffi_call_cb(void *args) {
     MFFICallCBArgs *a = (MFFICallCBArgs*)args;
     return (void*)miniffi_call_intern(a->function, a->args, a->nparams);
     }
-#endif
 
 /* The call proper, with the object's record pinned by `active` (see
  * MiniFFI_call), so the library and everything the record holds stay valid
@@ -309,12 +281,8 @@ RB_METHOD_GUARD(MiniFFI_callPinned) {
         }
         params[i] = lParam;
     }
-#if RAPI_MAJOR >= 2
     MFFICallCBArgs cb_args {ApiFunction, &param, nimport};
     mffi_value ret = (mffi_value)rb_thread_call_without_gvl(miniffi_call_cb, &cb_args, 0, 0);
-#else
-    mffi_value ret = miniffi_call_intern(ApiFunction, &param, nimport);
-#endif
     
     switch (funcData->exports) {
         case _T_NUMBER:
@@ -372,12 +340,8 @@ RB_METHOD_GUARD_END
 
 void MiniFFIBindingInit() {
     VALUE cMiniFFI = rb_define_class("MiniFFI", rb_cObject);
-#if RAPI_FULL > 187
     MiniFFIType.function.dmark = MiniFFIMark;
     rb_define_alloc_func(cMiniFFI, classAllocate<&MiniFFIType>);
-#else
-    rb_define_alloc_func(cMiniFFI, MiniFFIAllocate);
-#endif
     _rb_define_method(cMiniFFI, "initialize", MiniFFI_initialize);
     _rb_define_method(cMiniFFI, "call", MiniFFI_call);
     rb_define_alias(cMiniFFI, "Call", "call");

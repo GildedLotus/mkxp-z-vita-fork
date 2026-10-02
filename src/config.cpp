@@ -393,7 +393,7 @@ static void vitaFilterGameLayer(json::value &layer)
         "framebufferScalingFactor", "atlasScalingFactor",
         "smoothScalingMipmaps", "JITEnable", "JITVerboseLevel",
         "JITMaxCache", "JITMinCalls", "YJITEnable", "dataPathOrg",
-        "dataPathApp", "iconPath", "preferMetalRenderer", "dumpAtlas"
+        "dataPathApp", "dumpAtlas"
     };
 
     if (!layer.is_object())
@@ -754,10 +754,6 @@ void Config::read(int argc, char *argv[]) {
         {"bitmapSmoothScaling", 0},
         {"bitmapSmoothScalingDown", 0},
         {"smoothScalingMipmaps", false},
-        {"bicubicSharpness", 100},
-#ifdef MKXPZ_SSL
-        {"xbrzScalingFactor", 1.},
-#endif
         {"enableHires", false},
         {"textureScalingFactor", 1.},
         {"framebufferScalingFactor", 1.},
@@ -767,28 +763,15 @@ void Config::read(int argc, char *argv[]) {
         {"defScreenH", 0},
         {"windowTitle", ""},
         {"fixedFramerate", 0},
-#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
         /* Off, as in stock. Rendering is on the GPU, so an overrun is script
          * work, which skipping the draw does not shorten; RGSS itself never
          * skips. "frameSkip": true in any layer opts into the bounded skip
          * (FPSLimiter::maxConsecutiveSkips). See vita/docs/config.md. */
         {"frameSkip", false},
-#else
-        {"frameSkip", false},
-#endif
         {"syncToRefreshrate", false},
         {"solidFonts", json::array({})},
-#if defined(__APPLE__) && defined(__aarch64__)
-        {"preferMetalRenderer", true},
-#else
-        {"preferMetalRenderer", false},
-#endif
         {"subImageFix", false},
-#ifdef __WIN32__
-        {"enableBlitting", false},
-#else
         {"enableBlitting", true},
-#endif
         {"integerScalingActive", false},
         {"integerScalingLastMile", true},
         {"maxTextureSize", 0},
@@ -799,7 +782,6 @@ void Config::read(int argc, char *argv[]) {
         {"allowSymlinks", true},
         {"dataPathOrg", ""},
         {"dataPathApp", ""},
-        {"iconPath", ""},
         {"execName", "Game"},
         {"midiSoundFont", ""},
         {"midiChorus", false},
@@ -910,7 +892,6 @@ try { exp } catch (...) {}
     SET_STRINGOPT(gameFolder, gameFolder);
     SET_STRINGOPT(dataPathOrg, dataPathOrg);
     SET_STRINGOPT(dataPathApp, dataPathApp);
-    SET_STRINGOPT(iconPath, iconPath);
     SET_STRINGOPT(execName, execName);
     SET_OPT(allowSymlinks, boolean);
     SET_OPT(pathCache, boolean);
@@ -985,10 +966,6 @@ try { exp } catch (...) {}
     SET_OPT(bitmapSmoothScaling, integer);
     SET_OPT(bitmapSmoothScalingDown, integer);
     SET_OPT(smoothScalingMipmaps, boolean);
-    SET_OPT(bicubicSharpness, integer);
-#ifdef MKXPZ_SSL
-    SET_OPT(xbrzScalingFactor, integer);
-#endif
     SET_OPT(enableHires, boolean);
     SET_OPT(textureScalingFactor, number);
     SET_OPT(framebufferScalingFactor, number);
@@ -1003,9 +980,6 @@ try { exp } catch (...) {}
     for (std::string & solidFont : solidFonts)
         std::transform(solidFont.begin(), solidFont.end(), solidFont.begin(),
             [](unsigned char c) { return std::tolower(c); });
-#ifdef __APPLE__
-    SET_OPT(preferMetalRenderer, boolean);
-#endif
     SET_OPT(subImageFix, boolean);
     SET_OPT(enableBlitting, boolean);
     SET_OPT_CUSTOMKEY(integerScaling.active, integerScalingActive, boolean);
@@ -1056,21 +1030,6 @@ try { exp } catch (...) {}
     rgssVersion = clamp(rgssVersion, 0, 3);
     SE.sourceCount = clamp(SE.sourceCount, 1, 64);
     BGM.trackCount = clamp(BGM.trackCount, 1, 16);
-    
-    // Determine whether to open a console window on... Windows
-    winConsole = getEnvironmentBool("MKXPZ_WINDOWS_CONSOLE", editor.debug);
-    
-#ifdef __APPLE__
-    // Determine whether to use the Metal renderer on macOS
-    // Environment variable takes priority over the json setting
-    preferMetalRenderer = isMetalSupported() && getEnvironmentBool("MKXPZ_MACOS_METAL", preferMetalRenderer);
-#endif
-    
-    // Determine whether to allow manual selection of a game folder on startup
-    // Only works on macOS atm, mainly used to test games located outside of the bundle.
-    // The config is re-read after the window is already created, so some entries
-    // may not take effect
-    manualFolderSelect = getEnvironmentBool("MKXPZ_FOLDER_SELECT", false);
 
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     vitaglRamPoolMiB = vitaglCdramPoolMiB = vitaglPhycontPoolMiB = 0;

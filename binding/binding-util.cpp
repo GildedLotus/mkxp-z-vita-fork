@@ -109,11 +109,7 @@ void raiseRbExc(Exception *exc) { raiseRbExcOwned(exc, true); }
 void raiseRbExcStatic(Exception *exc) { raiseRbExcOwned(exc, false); }
 
 void raiseDisposedAccess(VALUE self) {
-#if RAPI_FULL > 187
   const char *klassName = RTYPEDDATA_TYPE(self)->wrap_struct_name;
-#else
-  const char *klassName = rb_obj_classname(self);
-#endif
   char buf[32];
 
   strncpy(buf, klassName, sizeof(buf));
@@ -345,7 +341,6 @@ int rb_get_args(int argc, VALUE *argv, const char *format, ...) {
   return 0;
 }
 
-#if RAPI_MAJOR >= 2
 #include <ruby/thread.h>
 
 typedef struct gvl_guard_args {
@@ -397,5 +392,3 @@ void *drop_gvl_guard(void *(*func)(void *), void *args,
 	}
 	return ret;
 }
-
-#endif

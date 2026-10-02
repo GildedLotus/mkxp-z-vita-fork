@@ -22,8 +22,8 @@
  * class that still works.
  *
  * It must be called from the RGSS thread and from nowhere else. That thread
- * owns the GL context (main.cpp creates it inside rgssThreadFun under
- * -DMKXPZ_INIT_GL_LATER), and it is the thread the bindings raise on.
+ * owns the GL context (main.cpp creates it inside rgssThreadFun), and it is
+ * the thread the bindings raise on.
  *
  * It never throws -- not a Ruby exception, not a C++ one -- and it never
  * fails twice: anything that does not work is one `error-overlay: skipped

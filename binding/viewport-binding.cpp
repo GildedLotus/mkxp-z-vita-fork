@@ -27,11 +27,7 @@
 #include "sharedstate.h"
 #include "viewport.h"
 
-#if RAPI_FULL > 187
 DEF_TYPE(Viewport);
-#else
-DEF_ALLOCFUNC(Viewport);
-#endif
 
 RB_METHOD_GUARD(viewportInitialize) {
     Viewport *v = 0;
@@ -81,11 +77,7 @@ DEF_GFX_PROP_I(Viewport, OY)
 
 void viewportBindingInit() {
     VALUE klass = rb_define_class("Viewport", rb_cObject);
-#if RAPI_FULL > 187
     rb_define_alloc_func(klass, classAllocate<&ViewportType>);
-#else
-    rb_define_alloc_func(klass, ViewportAllocate);
-#endif
     
     disposableBindingInit<Viewport>(klass);
     flashableBindingInit<Viewport>(klass);

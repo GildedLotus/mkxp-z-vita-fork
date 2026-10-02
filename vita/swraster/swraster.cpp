@@ -2087,7 +2087,7 @@ void composite_text(const Surface &dst, Rect dstRect, const Surface &src,
 }
 
 /* ------------------------------------------------------------------ */
-/* subtract_blit (shader/kglSubtract.frag)                             */
+/* subtract_blit (upstream shader/kglSubtract.frag)                             */
 /*                                                                     */
 /*   out.rgb = clamp(dst.rgb - factor*src.rgb, 0, 1);   out.a = 1      */
 /*                                                                     */

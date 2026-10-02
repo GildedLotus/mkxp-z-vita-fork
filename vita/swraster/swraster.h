@@ -142,7 +142,7 @@ void composite_text(const Surface &dst, Rect dstRect, const Surface &src,
 void simple_blit(const Surface &dst, Rect dstRect, const Surface &src,
                  Rect srcRect, bool keepDestAlpha);
 
-/* shader/kglSubtract.frag, mkxp's non-RGSS KGL_SUBTRACT blit mode
+/* upstream shader/kglSubtract.frag, mkxp's non-RGSS KGL_SUBTRACT blit mode
  * (Bitmap#kgl_subtract_rect):
  *   out.rgb = clamp(dst.rgb - factor*src.rgb, 0, 1);  out.a = 1
  * The source alpha is never read, and every destination pixel the blit

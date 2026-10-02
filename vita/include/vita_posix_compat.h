@@ -2,7 +2,7 @@
 /* vita_posix_compat.h — force-included for mkxp-z on arm-vita-eabi.
  *
  * Vita newlib lacks a handful of POSIX entry points that ghc/filesystem.hpp
- * and cpp-httplib reference unconditionally on the non-Windows path:
+ * references unconditionally on the non-Windows path:
  *   symlink, readlink
  * plus the AT_* constants used with utimensat (which newlib DOES declare
  * in sys/stat.h) and a visible strerror_r (feature-test gated) and usleep
@@ -68,16 +68,9 @@ static inline ssize_t vita_compat_readlink(const char *path, char *buf, size_t b
 int usleep(unsigned int usec);
 #endif
 
-/* cpp-httplib calls strcasecmp without including <strings.h>. */
+/* Case-insensitive engine comparisons need this declaration in newlib. */
 #ifndef strcasecmp
 int strcasecmp(const char *s1, const char *s2);
-#endif
-
-/* Vita's <netinet/in.h> lacks the IN6_IS_ADDR_* predicate macros. */
-#ifndef IN6_IS_ADDR_LINKLOCAL
-#define IN6_IS_ADDR_LINKLOCAL(a) \
-	(((const unsigned char *)(a))[0] == 0xfe && \
-	 (((const unsigned char *)(a))[1] & 0xc0) == 0x80)
 #endif
 
 #ifdef __cplusplus

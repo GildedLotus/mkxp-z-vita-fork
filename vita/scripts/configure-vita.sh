@@ -10,10 +10,9 @@
 # and vita/, on top of mkxp-z commit 826929ee (see MKXPZ_PIN). Nothing is
 # cloned or patched here.
 #
-# Feature policy: every optional feature off except MiniFFI (Win32API shim).
-# -Dgfx_backend=gles, -Denable-https=false, -Dmri_version=3.1. Steam is off by
-# leaving steamworks_path empty. Dynamic FluidSynth is off; a verified
-# TSF_PREFIX (TinySoundFont headers) enables the static MIDI path.
+# Feature policy: vitaGL/GLES2, static MRI 3.1, and MiniFFI
+# (Win32API shim). A verified TSF_PREFIX (TinySoundFont headers) enables the
+# static MIDI path; without it MIDI remains silent.
 #
 # Side-prefix deps: theora / uchardet / SDL2_sound / pixman / OpenAL are built
 # by vita/scripts/build-vita-deps.sh into build/vita-deps/prefix (gitignored).
@@ -54,7 +53,6 @@ MKXPZ_SRC="$ROOT"
 # An explicit BUILD_DIR wins.
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/mkxp-z-vitagl}"
 CROSS_FILE="$ROOT/vita/meson/vita-cross.ini"
-STUB_DIR="$BUILD_DIR/stub-libs"
 
 # Release version: the single VERSION file at the repo root is
 # the one source for the boot log line and the launcher header. It reaches the
@@ -63,18 +61,6 @@ STUB_DIR="$BUILD_DIR/stub-libs"
 # release script (vita/scripts/build-release.sh) is the strict gate.
 MKXPZ_VITA_VERSION=$(tr -d ' \t\r\n' < "$ROOT/vita/VERSION" 2>/dev/null || true)
 [[ $MKXPZ_VITA_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || MKXPZ_VITA_VERSION="dev"
-
-# Keep optional shaders off: they hung Shader::init on hardware (BicubicShader),
-# and shader-code allocation failures under GPU pool exhaustion are hard errors,
-# while the boot shader warm-up already spends that budget. The shipped GXP set
-# covers the boot programs only. Enabling them needs a hardware warm-up and
-# headroom re-test, not just a link.
-MKXPZ_OPTIONAL_SHADERS="${MKXPZ_OPTIONAL_SHADERS:-0}"
-case "$MKXPZ_OPTIONAL_SHADERS" in
-  0) OPTIONAL_SHADERS=false ;;
-  1) OPTIONAL_SHADERS=true ;;
-  *) echo "error: MKXPZ_OPTIONAL_SHADERS must be 0 or 1" >&2; exit 1 ;;
-esac
 
 # Side-prefix deps from vita/scripts/build-vita-deps.sh.
 DEPS_PREFIX="${DEPS_PREFIX:-$ROOT/build/vita-deps/prefix}"
@@ -140,7 +126,6 @@ if [[ "$MODE" == "status" ]]; then
   echo "MKXPZ_PIN=$MKXPZ_PIN"
   echo "CROSS_FILE=$CROSS_FILE"
   echo "BUILD_DIR=$BUILD_DIR"
-  echo "optional_shaders=$OPTIONAL_SHADERS"
   echo "section_gc=on (MKXPZ_LTO=${MKXPZ_LTO:-0}: b_lto + converter roots when 1)"
   echo "MRI: includes=$MRI_INCLUDES libpath=$MRI_LIBPATH library=lib$MRI_LIBRARY.a"
   echo "MRI pc: $RUBY_PREFIX/lib/pkgconfig/ruby-3.1.pc $( [[ -f $RUBY_PREFIX/lib/pkgconfig/ruby-3.1.pc ]] && echo present || echo absent)"
@@ -169,19 +154,7 @@ fi
 [[ "$RUBY_MEMBERS" == *vita_static_extensions.o* && "$RUBY_MEMBERS" == *encinit.o* ]] || die "complete Ruby registrars missing"
 [[ -f "$RUBY_PREFIX/lib/ruby/3.1.0/date.rb" ]] || die "Ruby runtime wrappers missing from prefix"
 
-# --- 1. Stub libs for find_library('iconv') / find_library('charset') --------
-# newlib's libc.a already exports iconv/iconv_open/iconv_close (verified with
-# arm-vita-eabi-nm on this VitaSDK). Upstream src/meson.build does
-#   compilers['cpp'].find_library('iconv')
-#   compilers['cpp'].find_library('charset')
-# on the non-Windows path. We ship a one-symbol dummy archive so -liconv
-# resolves; real iconv_* resolve from libc at link time (verified: a program
-# that calls iconv_open links). libcharset is linked by upstream meson but
-# has no call sites in the sources we grepped.
-#
-# VitaSDK's gcc overrides LIBRARY_PATH, so meson find_library does NOT see
-# env LIBRARY_PATH. Pass -L via a generated second cross file instead.
-#
+# --- 1. Generated build options ---------------------------------------------
 # Side-prefix deps (theora/uchardet/SDL2_sound, vita/scripts/build-vita-deps.sh):
 # meson later-cross-file array options REPLACE earlier ones (machinefile.py
 # reads all files into one ConfigParser — last key wins), so this generated
@@ -191,22 +164,7 @@ if [[ "$MODE" == "reconfigure" && -d "$BUILD_DIR" ]]; then
   echo "==> wiping $BUILD_DIR"
   rm -rf "$BUILD_DIR"
 fi
-mkdir -p "$STUB_DIR" "$BUILD_DIR"
-STUB_C="$STUB_DIR/mkxp_z_vita_stub.c"
-if [[ ! -f "$STUB_DIR/libiconv.a" || ! -f "$STUB_DIR/libcharset.a" ]]; then
-  echo "==> building iconv/charset stub archives in $STUB_DIR"
-  cat > "$STUB_C" << 'EOF'
-/* Dummy symbol so -liconv / -lcharset resolve. Real iconv_* live in newlib. */
-void mkxp_z_vita_iconv_stub(void) {}
-EOF
-  STUB_O="$STUB_DIR/mkxp_z_vita_stub.o"
-  arm-vita-eabi-gcc -c -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard \
-    -o "$STUB_O" "$STUB_C"
-  # D: deterministic member headers, so two configures of the same inputs are
-  # byte-identical (the guard-sharing proof compares them).
-  arm-vita-eabi-ar rcsD "$STUB_DIR/libiconv.a" "$STUB_O"
-  arm-vita-eabi-ar rcsD "$STUB_DIR/libcharset.a" "$STUB_O"
-fi
+mkdir -p "$BUILD_DIR"
 
 # Vita CPU flags must be repeated here: a later cross file's c_args/cpp_args/
 # c_link_args/cpp_link_args replace vita-cross.ini's (see header comment).
@@ -384,7 +342,7 @@ echo "    PKG_CONFIG_LIBDIR:  $SDL2_VITAGL_PREFIX/lib/pkgconfig : $RUBY_PREFIX/l
 [[ "$HAVE_SDL2_VITAGL" -eq 1 ]] ||
   echo "    note: vitaGL SDL2 not found at $SDL2_VITAGL_PREFIX (run vita/scripts/build-sdl2-vitagl.sh)"
 
-STUB_CROSS="$BUILD_DIR/vita-stub-libs.ini"
+GENERATED_CROSS="$BUILD_DIR/vita-build.ini"
 # Helper: join shell words as meson single-quoted array entries.
 meson_array() {
   local first=1 w
@@ -409,8 +367,8 @@ C_ARGS+=("-DVITA_SHADER_SET_ID=\"$VITA_SHADER_SET_ID\"")
 if [[ "$HAVE_TSF" -eq 1 ]]; then
   CPP_ARGS+=("-DMKXPZ_TSF" "-I$TSF_PREFIX")
 fi
-C_LINK=("${VITA_CPU[@]}" "-L$STUB_DIR" ${GC_SECTIONS[@]+"${GC_SECTIONS[@]}"} ${GC_ROOTS[@]+"${GC_ROOTS[@]}"})
-CPP_LINK=("${VITA_CPU[@]}" "-L$STUB_DIR" ${GC_SECTIONS[@]+"${GC_SECTIONS[@]}"} ${GC_ROOTS[@]+"${GC_ROOTS[@]}"})
+C_LINK=("${VITA_CPU[@]}" ${GC_SECTIONS[@]+"${GC_SECTIONS[@]}"} ${GC_ROOTS[@]+"${GC_ROOTS[@]}"})
+CPP_LINK=("${VITA_CPU[@]}" ${GC_SECTIONS[@]+"${GC_SECTIONS[@]}"} ${GC_ROOTS[@]+"${GC_ROOTS[@]}"})
 # The one pthread token in the whole link. emit_pkgconfig_wrapper
 # above removes every -pthread/-lpthread the .pc files contribute; this puts
 # exactly one back. -pthread (not -lpthread) on purpose: the driver expands it
@@ -465,8 +423,8 @@ C_LINK+=("-L$SDL2_VITAGL_PREFIX/lib" "-L$VITAGL_PREFIX/lib")
 CPP_LINK+=("-L$SDL2_VITAGL_PREFIX/lib" "-L$VITAGL_PREFIX/lib")
 echo "==> vitaGL backend: SDL2 $SDL2_VITAGL_PREFIX + GL $VITAGL_PREFIX (-DMKXPZ_VITAGL_BACKEND)"
 # Vita POSIX compat + ghc/filesystem OS.
-# -I$ROOT/vita/include provides ifaddrs.h stub (cpp-httplib) and
-# vita_posix_compat.h (symlink/readlink/utimensat/truncate stubs).
+# -I$ROOT/vita/include provides vita_posix_compat.h
+# (symlink/readlink/utimensat filesystem compatibility).
 # -include force-injects the compat header into every TU.
 # -DGHC_OS_DETECTED -DGHC_OS_LINUX make ghc/filesystem.hpp take its
 # non-Windows path (Vita defines neither __linux__ nor __APPLE__).
@@ -474,7 +432,7 @@ VITA_INC="$ROOT/vita/include"
 if [[ -d "$VITA_INC" ]]; then
   C_ARGS+=("-I$VITA_INC" "-include" "$VITA_INC/vita_posix_compat.h" "-DGHC_OS_DETECTED" "-DGHC_OS_LINUX")
   CPP_ARGS+=("-I$VITA_INC" "-include" "$VITA_INC/vita_posix_compat.h" "-DGHC_OS_DETECTED" "-DGHC_OS_LINUX")
-  echo "==> Vita include: $VITA_INC (ifaddrs stub + posix compat + ghc OS defines)"
+  echo "==> Vita include: $VITA_INC (POSIX filesystem compatibility + ghc OS defines)"
 fi
 # vita_glue.c is compiled into the executable by src/meson.build. It is NOT put
 # on C_LINK/CPP_LINK: meson uses those args for every find_library() test, and
@@ -503,7 +461,7 @@ RECEIPT_OBJ="$BUILD_DIR/mkxpz-build-receipt.o"
 # vitaGL stack; "backend" lets the packager refuse an ELF built for another
 # GL driver.
 RECEIPT_DEPS=("sdl2Vitagl=$SDL2_VITAGL_PREFIX/lib" "vitagl=$VITAGL_PREFIX/lib" "vitaDeps=$DEPS_PREFIX/lib")
-python3 - "$ROOT" "$BUILD_DIR" "$MKXPZ_PIN" "$MRI_LIBPATH/lib${MRI_LIBRARY}.a" "$OPTIONAL_SHADERS" \
+python3 - "$ROOT" "$BUILD_DIR" "$MKXPZ_PIN" "$MRI_LIBPATH/lib${MRI_LIBRARY}.a" \
   "$(arm-vita-eabi-gcc -dumpversion)" "$(meson --version)" "$HAVE_TSF:$TSF_PREFIX" \
   "$VITA_GL_BACKEND" "$MKXPZ_LTO" "${RECEIPT_DEPS[@]}" <<'PYRECEIPT'
 import hashlib, json, subprocess, sys
@@ -512,7 +470,7 @@ root, build = Path(sys.argv[1]), Path(sys.argv[2])
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(root / "vita/scripts"))
 import treedigest
-pin, archive, shaders, gcc, meson, tsf, backend, lto = sys.argv[3:11]
+pin, archive, gcc, meson, tsf, backend, lto = sys.argv[3:10]
 sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 tree_digest = treedigest.lib_digest
 sources = [root / "vita/linker/armvita-1mb-data.ld", root / "vita/meson/vita-cross.ini"]
@@ -529,16 +487,15 @@ receipt = {
     "engineSourcesSha256": treedigest.digest(root, treedigest.ENGINE),
     "sources": {str(p.relative_to(root)): sha(p) for p in sorted(sources)},
     "rubyArchiveSha256": sha(Path(archive)),
-    "dependencies": {name: tree_digest(Path(lib).glob("*.a")) for name, lib in (a.split("=", 1) for a in sys.argv[11:])},
+    "dependencies": {name: tree_digest(Path(lib).glob("*.a")) for name, lib in (a.split("=", 1) for a in sys.argv[10:])},
     "tinysoundfont": tree_digest([Path(tsf_prefix, n) for n in ("tsf.h", "tml.h")]) if have_tsf == "1" else None,
-    "toolchain": {"gcc": gcc, "meson": meson}, "optionalShaders": shaders == "true",
+    "toolchain": {"gcc": gcc, "meson": meson},
     "mesonBuildtype": "release", "lto": lto == "1",
 }
 blob = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
 target = build / "mkxpz-build-receipt.json"
 if target.is_file() and target.read_bytes() != blob:
-    for name in ("mkxp-z", "mkxp-z.cortex-a9"):
-        (build / name).unlink(missing_ok=True)
+    (build / "mkxp-z.cortex-a9").unlink(missing_ok=True)
 target.write_bytes(blob)
 rows = [",".join(str(b) for b in blob[i:i + 32]) for i in range(0, len(blob), 32)]
 # The .globl symbol is the GC root: -Wl,--undefined=mkxpz_build_receipt keeps
@@ -556,7 +513,6 @@ echo "==> build receipt: $RECEIPT_OBJ (section .mkxpz.build_receipt, not loaded)
   cat << EOF
 # Generated by vita/scripts/configure-vita.sh — do not edit.
 # Injects:
-#   -L for iconv/charset stub archives
 #   -I/-L for build/vita-deps/prefix (theora, uchardet, SDL2_sound) when built
 #   -L for build/ruby-vita-prefix when libruby-static.a is installed
 #   -I/-L for the vitaGL stack and its VIDEO_VITA_VGL SDL2
@@ -574,8 +530,8 @@ EOF
   printf 'cpp_args = [%s]\n'     "$(meson_array "${CPP_ARGS[@]}")"
   printf 'c_link_args = [%s]\n'  "$(meson_array "${C_LINK[@]}")"
   printf 'cpp_link_args = [%s]\n' "$(meson_array "${CPP_LINK[@]}")"
-} > "$STUB_CROSS"
-echo "==> stub cross file: $STUB_CROSS"
+} > "$GENERATED_CROSS"
+echo "==> generated cross file: $GENERATED_CROSS"
 
 # --- 4. Preflight: report every hard dep, not just the first meson stop ------
 # Hard deps from src/meson.build + binding/meson.build at this pin.
@@ -592,14 +548,11 @@ preflight_pkg() {
 preflight_lib() {
   local name=$1 note=$2
   local search=()
-  search+=(-L"$STUB_DIR")
   [[ "$HAVE_DEPS" -eq 1 ]] && search+=(-L"$DEPS_PREFIX/lib")
   if arm-vita-eabi-g++ "${search[@]}" \
      -print-file-name="lib${name}.a" 2>/dev/null \
      | grep -q '^/'; then
     echo "  ok      lib${name}.a  ($note)"
-  elif [[ -f "$STUB_DIR/lib${name}.a" ]]; then
-    echo "  stub    lib${name}.a  ($note)"
   elif [[ -f "$DEPS_PREFIX/lib/lib${name}.a" ]]; then
     echo "  deps    lib${name}.a  ($note; $DEPS_PREFIX/lib)"
   else
@@ -624,8 +577,6 @@ preflight_pkg zlib
 preflight_pkg uchardet
 preflight_pkg SDL2_image
 preflight_lib bz2 "vdpm via sdl2_image"
-preflight_lib iconv "newlib libc provides iconv_*; stub satisfies find_library"
-preflight_lib charset "linked by upstream meson; no call sites found"
 if [[ -f "$MRI_LIBPATH/lib${MRI_LIBRARY}.a" ]]; then
   echo "  ok      lib${MRI_LIBRARY}.a  (MRI $MRI_INCLUDES)"
 else
@@ -654,7 +605,7 @@ elif [[ -f "$MRI_INCLUDES/arm-eabi/ruby/config.h" ]]; then
 else
   echo "  MISSING config.h under $MRI_INCLUDES  (run vita/scripts/build-ruby-vita.sh install-prefix)"
 fi
-echo "  note    fluidsynth skipped (-Dshared_fluid=false); Discord is not a meson option at this pin"
+echo "  note    MIDI uses TinySoundFont when its pinned headers are present"
 if [[ "$HAVE_DEPS" -eq 1 ]]; then
   echo "  note    theora/uchardet/SDL2_sound from $DEPS_PREFIX (vita/scripts/build-vita-deps.sh)"
 else
@@ -663,18 +614,9 @@ fi
 
 # --- 5. Meson setup ----------------------------------------------------------
 # Exact option set for
-#   gfx_backend=gles  ; -DGLES2_HEADER, no gl.pc needed
-#   enable-https=false   non-goal; drops OpenSSL
-#   mri_version=3.1
+#   vitaGL/GLES2 and static linking are fixed in meson.build.
 #   use_miniffi=true     default; the one optional feature we keep
-#   shared_fluid=false   no dynamic fluidsynth; TSF_PREFIX enables the static shim
-#   cjk_fallback_font=false
-#   cxx11_experimental=false  use bundled ghc/filesystem
 #   workdir_current=false
-#   static_executable=true    -static-libgcc/-static-libstdc++, AL_LIBTYPE_STATIC
-#   appimage=false
-#   steamworks_path='' / steam_appid=''  Steam compiled out
-#   force32=false
 #   mri_includes/libpath/library  manual MRI; bypasses dependency('ruby-3.1').
 #       install-prefix also drops ruby-3.1.pc so the dependency() path works
 #       when mri_includes is left empty.
@@ -691,36 +633,22 @@ fi
 #       game) is unaffected and still exits to LiveArea.
 MESON_OPTS=(
   --cross-file "$CROSS_FILE"
-  --cross-file "$STUB_CROSS"
+  --cross-file "$GENERATED_CROSS"
   --buildtype release
   ${MESON_LTO[@]+"${MESON_LTO[@]}"}
-  -Dgfx_backend=gles
-  -Denable-https=false
-  -Doptional_shaders="$OPTIONAL_SHADERS"
   -Dsoftware_bitmaps=true
   -Dvita_launcher=true
-  -Dmri_version=3.1
   -Dmri_includes="$MRI_INCLUDES"
   -Dmri_libpath="$MRI_LIBPATH"
   -Dmri_library="$MRI_LIBRARY"
   -Duse_miniffi=true
-  -Dshared_fluid=false
-  -Dcjk_fallback_font=false
-  -Dcxx11_experimental=false
   -Dworkdir_current=false
-  -Dstatic_executable=true
-  -Dappimage=false
-  -Dappimagekit_path=
-  -Dsteamworks_path=
-  -Dsteam_appid=
-  -Dsteamshim_debug=false
-  -Dforce32=false
 )
 
 echo "==> meson setup"
 echo "    src=$MKXPZ_SRC"
 echo "    build=$BUILD_DIR"
-echo "    cross=$CROSS_FILE + $STUB_CROSS"
+echo "    cross=$CROSS_FILE + $GENERATED_CROSS"
 echo "    VITASDK=$VITASDK"
 echo "    meson options:"
 for o in "${MESON_OPTS[@]}"; do

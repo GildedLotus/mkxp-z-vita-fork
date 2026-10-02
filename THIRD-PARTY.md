@@ -35,10 +35,14 @@ text the entry says so under "Known gaps".
   (the section allows a later GPL version).
 - **Ruby 3.1.3**: Ruby licence *or* BSD-2-Clause. We elect **BSD-2-Clause** (`licenses/Ruby-BSD-2-Clause.txt`;
   `licenses/Ruby-LEGAL.txt` lists the notices of the parts bundled inside Ruby).
-- **mkxp-z**: GPL-2.0-or-later per the upstream README (text in `COPYING`), used under GPL-3.0. Its `assets/LICENSE.mkxp-z-with-https.txt`
-  is a GPL-3 notice for the HTTPS build; this build links no OpenSSL.
+- **mkxp-z**: GPL-2.0-or-later per the upstream README (text in `COPYING`), used under GPL-3.0.
 - **stb_image, stb_vorbis, stb_dxt** (MIT or public domain), **dr_flac, dr_mp3** (public domain or MIT-0), **miniz**
   (public domain): used under their most permissive alternative; both texts ship.
+
+mkxp-z is Copyright (C) 2013 - 2023 the mkxp-z contributors, including
+Amaryllis Kulla <ancurio@mapleshrine.eu>, Struma, Splendide Imaginarius,
+and others. The full list of contributors can be found by cloning the
+mkxp-z Git repository (<https://github.com/mkxp-z/mkxp-z>).
 
 ## Engine and graphics stack
 
@@ -86,11 +90,10 @@ part of their bytes). `libshacccg.suprx` is Sony's and is neither shipped nor li
 |---|---|---|---|---|---|
 | Ruby (MRI, mkxp-z fork; patched by `vita/patches/ruby/`) | 3.1.3 @ 4d85560cf659 | BSD-2-Clause arm elected | https://github.com/mkxp-z/ruby | linked (`libruby-static.a`) | `licenses/Ruby-BSD-2-Clause.txt`, `licenses/Ruby-LEGAL.txt` |
 | ghc::filesystem | as vendored in mkxp-z | MIT | https://github.com/gulrak/filesystem | compiled into the engine | `licenses/mkxp-z-vendored-notices.txt` |
-| libnsgif, LUrlParser, cpp-httplib | as vendored in mkxp-z | MIT | https://www.netsurf-browser.org/projects/libnsgif/, https://github.com/corporateshark/LUrlParser, https://github.com/yhirose/cpp-httplib | compiled into the engine | `licenses/mkxp-z-vendored-notices.txt`, `licenses/permissive-notices.txt#Vendored mkxp-z sources` |
+| libnsgif | as vendored in mkxp-z | MIT | https://www.netsurf-browser.org/projects/libnsgif/ | compiled into the engine | `licenses/mkxp-z-vendored-notices.txt`, `licenses/permissive-notices.txt#Vendored mkxp-z sources` |
 | rapidcsv | as vendored in mkxp-z | BSD-3-Clause | https://github.com/d99kris/rapidcsv | compiled into the engine (header) | `licenses/permissive-notices.txt#rapidcsv` |
 | sigslot | as vendored in mkxp-z | MIT | https://github.com/palacaze/sigslot | compiled into the engine (header) | `licenses/permissive-notices.txt#sigslot` |
 | json5pp | as vendored in mkxp-z | MIT | https://github.com/kimushu/json5pp | compiled into the engine (header) | `licenses/permissive-notices.txt#json5pp` |
-| Game controller DB | `assets/gamecontrollerdb.txt` | zlib | https://github.com/gabomdq/SDL_GameControllerDB | bundled in the engine | `licenses/permissive-notices.txt#SDL2` (same wording, same copyright line) |
 | VitaSDK newlib (libc, libm) | 4.1.0 @ 64aa7aa33d4f | BSD-style and other permissive notices per file | https://github.com/vitasdk/newlib | linked | `licenses/newlib-COPYING.NEWLIB.txt` |
 | pthread-embedded (libpthread) | 11d2e5722d98 | LGPL-2.1-or-later (parts MIT), elected GPL-3 | https://github.com/vitasdk/pthread-embedded | linked (static) | `licenses/pthread-embedded.txt` |
 | libstdc++, libgcc (GCC 15.2.0) | VitaSDK toolchain | GPL-3.0 with the GCC Runtime Library Exception | https://github.com/vitasdk | linked | `licenses/GCC-Runtime-Library-Exception.txt`, `LICENSE` |

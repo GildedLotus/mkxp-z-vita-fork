@@ -57,8 +57,7 @@ struct SharedMidiState
 
 	~SharedMidiState()
 	{
-		/* We might have initialized, but if the consecutive libfluidsynth
-		 * load failed, no resources will have been allocated */
+		/* Synthesis initialization may have failed before allocating resources. */
 		if (!flSettings)
 			return;
 

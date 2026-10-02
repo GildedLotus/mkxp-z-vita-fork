@@ -58,7 +58,6 @@ COVERAGE = {
     "rapidcsv": ("branch",),
     "sigslot": ("branch",),
     "json5pp": ("branch",),
-    "Game controller DB": ("branch",),
 }
 # The vitasdk/packages recipes are the source of the vdpm binaries' build; any of these rows needs them.
 VDPM_ROWS = {"libpng", "zlib", "bzip2", "libwebp", "FreeType", "PhysFS", "libogg, libvorbis", "SDL2_image, SDL2_ttf"}
@@ -177,7 +176,7 @@ if build_dir is not None:
     if "-o" not in tokens:
         die("the last ninja command for the executable is not a link line")
     linked = set()
-    # Archives the engine build generates itself (the iconv and charset stubs) are part of this tree, not a component.
+    # Build-local archives are part of this tree, not an external component.
     own = [Path(token[2:]) for token in tokens if token.startswith("-L") and build_dir.resolve() in Path(token[2:]).resolve().parents]
     for token in tokens:
         if token.startswith("-l"):

@@ -74,19 +74,13 @@
 extern "C" {
 #include <ruby.h>
 
-#if RAPI_FULL >= 190
 #include <ruby/encoding.h>
-#endif
 
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
 /* rb_tracepoint_new / RUBY_INTERNAL_EVENT_GC_END_SWEEP. */
 #include <ruby/debug.h>
 #endif
 }
-
-#ifdef __WIN32__
-#include "binding-mri-win32.h"
-#endif
 
 #include <assert.h>
 #include <string>
@@ -142,10 +136,6 @@ void fileIntBindingInit();
 
 #ifdef MKXPZ_MINIFFI
 void MiniFFIBindingInit();
-#endif
-
-#ifdef MKXPZ_STEAM
-void CUSLBindingInit();
 #endif
 
 void httpBindingInit();
@@ -232,10 +222,6 @@ static void mriBindingInit() {
     
 #ifdef MKXPZ_MINIFFI
     MiniFFIBindingInit();
-#endif
-    
-#ifdef MKXPZ_STEAM
-    CUSLBindingInit();
 #endif
     
     httpBindingInit();
@@ -337,38 +323,21 @@ static void mriBindingInit() {
     
     rb_gv_set("BTEST", rb_bool_new(shState->config().editor.battleTest));
     
-#ifdef MKXPZ_BUILD_XCODE
-    std::string version = std::string(MKXPZ_VERSION "/") + getPlistValue("GIT_COMMIT_HASH");
-    VALUE vers = rb_utf8_str_new_cstr(version.c_str());
-#else
     VALUE vers = rb_utf8_str_new_cstr(MKXPZ_VERSION "/" MKXPZ_GIT_HASH);
-#endif
     rb_str_freeze(vers);
     rb_define_const(mod, "VERSION", vers);
     
     // Automatically load zlib if it's present -- the correct way this time
     int state;
-#if RAPI_FULL > 187
     VALUE previousError = rb_errinfo();
-#endif
     rb_eval_string_protect("require('zlib') if !Kernel.const_defined?(:Zlib)", &state);
     if (state) {
         Debug() << "Could not load Zlib. If this is important, make sure Ruby was built with static extensions, or that"
-        << ((MKXPZ_PLATFORM == MKXPZ_PLATFORM_MACOS) ? "zlib.bundle" : "zlib.so")
-        << "is present and reachable by Ruby's loadpath.";
-#if RAPI_FULL > 187
+        << " zlib.so is present and reachable by Ruby's loadpath.";
         /* This optional dependency error was handled. Do not leave it in
          * $! and make runRMXPScripts abort before evaluating game scripts. */
         rb_set_errinfo(previousError);
-#endif
     }
-    
-    // Set $stdout and its ilk accordingly on Windows
-    // I regret teaching you that word
-#ifdef __WIN32__
-    if (shState->config().winConsole)
-        configureWindowsStreams();
-#endif
 }
 
 static void showMsg(const std::string &msg) {
@@ -520,76 +489,52 @@ RB_METHOD(mkxpPuts) {
 
 RB_METHOD(mkxpPlatform) {
     RB_UNUSED_PARAM;
-    
-#if MKXPZ_PLATFORM == MKXPZ_PLATFORM_MACOS
-    std::string platform("macOS");
-    
-    if (mkxp_sys::isRosetta())
-        platform += " (Rosetta)";
-    
-#elif MKXPZ_PLATFORM == MKXPZ_PLATFORM_WINDOWS
-    std::string platform("Windows");
-    
-    if (mkxp_sys::isWine()) {
-        platform += " (Wine - ";
-        switch (mkxp_sys::getRealHostType()) {
-            case mkxp_sys::WineHostType::Mac:
-                platform += "macOS)";
-                break;
-            default:
-                platform += "Linux)";
-                break;
-        }
-    }
-#else
-    std::string platform("Linux");
-#endif
-    
-    return rb_utf8_str_new_cstr(platform.c_str());
+
+    return rb_utf8_str_new_cstr("Linux");
 }
 
 RB_METHOD(mkxpIsMacHost) {
     RB_UNUSED_PARAM;
     
-    return rb_bool_new(MKXPZ_PLATFORM == MKXPZ_PLATFORM_MACOS);
+    return RUBY_Qfalse;
 }
 
 RB_METHOD(mkxpIsUsingRosetta) {
     RB_UNUSED_PARAM;
     
-    return rb_bool_new(mkxp_sys::isRosetta());
+    return RUBY_Qfalse;
 }
 
 RB_METHOD(mkxpIsLinuxHost) {
     RB_UNUSED_PARAM;
     
-    return rb_bool_new(MKXPZ_PLATFORM == MKXPZ_PLATFORM_LINUX);
+    return RUBY_Qtrue;
 }
 
 RB_METHOD(mkxpIsWindowsHost) {
     RB_UNUSED_PARAM;
     
-    return rb_bool_new(MKXPZ_PLATFORM == MKXPZ_PLATFORM_WINDOWS);
+    return RUBY_Qfalse;
 }
 
 RB_METHOD(mkxpIsUsingWine) {
     RB_UNUSED_PARAM;
-    return rb_bool_new(mkxp_sys::isWine());
+    return RUBY_Qfalse;
 }
 
 RB_METHOD(mkxpIsReallyMacHost) {
     RB_UNUSED_PARAM;
-    return rb_bool_new(mkxp_sys::getRealHostType() == mkxp_sys::WineHostType::Mac);
+    return RUBY_Qfalse;
 }
 
 RB_METHOD(mkxpIsReallyLinuxHost) {
     RB_UNUSED_PARAM;
-    return rb_bool_new(mkxp_sys::getRealHostType() == mkxp_sys::WineHostType::Linux);
+    return RUBY_Qtrue;
 }
 
 RB_METHOD(mkxpIsReallyWindowsHost) {
     RB_UNUSED_PARAM;
-    return rb_bool_new(mkxp_sys::getRealHostType() == mkxp_sys::WineHostType::Windows);
+    return RUBY_Qfalse;
 }
 
 RB_METHOD(mkxpUserLanguage) {
@@ -600,15 +545,8 @@ RB_METHOD(mkxpUserLanguage) {
 
 RB_METHOD(mkxpUserName) {
     RB_UNUSED_PARAM;
-    
-    // Using the Windows API isn't working with usernames that involve Unicode
-    // characters for some dumb reason
-#ifdef __WIN32__
-    VALUE env = rb_const_get(rb_mKernel, rb_intern("ENV"));
-    return rb_funcall(env, rb_intern("[]"), 1, rb_str_new_cstr("USERNAME"));
-#else
+
     return rb_utf8_str_new_cstr(mkxp_sys::getUserName().c_str());
-#endif
 }
 
 RB_METHOD(mkxpGameTitle) {
@@ -836,7 +774,6 @@ RB_METHOD_GUARD(mkxpSetDefaultFontFamily) {
 }
 RB_METHOD_GUARD_END
 
-#if RAPI_FULL >= 190
 static VALUE mkxpUTF8String(VALUE str) {
     // Untagged legacy byte strings still use detection; explicit Ruby tags win.
     if (rb_enc_get_index(str) == rb_ascii8bit_encindex() &&
@@ -858,19 +795,12 @@ static VALUE mkxpUTF8String(VALUE str) {
     }
     return rb_str_encode(str, rb_enc_from_encoding(rb_utf8_encoding()), 0, Qnil);
 }
-#endif
 
 RB_METHOD_GUARD(mkxpStringToUTF8) {
     RB_UNUSED_PARAM;
 
     rb_check_argc(argc, 0);
-#if RAPI_FULL >= 190
     return mkxpUTF8String(self);
-#else
-    std::string ret(RSTRING_PTR(self), RSTRING_LEN(self));
-    ret = Encoding::convertString(ret);
-    return rb_utf8_str_new(ret.c_str(), ret.length());
-#endif
 }
 RB_METHOD_GUARD_END
 
@@ -878,29 +808,10 @@ RB_METHOD_GUARD(mkxpStringToUTF8Bang) {
     RB_UNUSED_PARAM;
 
     rb_check_argc(argc, 0);
-#if RAPI_FULL >= 190
     rb_check_frozen(self);
     return rb_str_replace(self, mkxpUTF8String(self));
-#else
-    std::string ret(RSTRING_PTR(self), RSTRING_LEN(self));
-    ret = Encoding::convertString(ret);
-    rb_str_resize(self, ret.length());
-    memcpy(RSTRING_PTR(self), ret.c_str(), RSTRING_LEN(self));
-    return self;
-#endif
 }
 RB_METHOD_GUARD_END
-
-#ifdef __APPLE__
-#define OPENCMD "open "
-#define OPENARGS "--args"
-#elif defined(__linux__)
-#define OPENCMD "xdg-open "
-#define OPENARGS ""
-#else
-#define OPENCMD "start /b \"launch\" "
-#define OPENARGS ""
-#endif
 
 RB_METHOD_GUARD(mkxpLaunch) {
     RB_UNUSED_PARAM;
@@ -910,33 +821,8 @@ RB_METHOD_GUARD(mkxpLaunch) {
     rb_scan_args(argc, argv, "11", &cmdname, &args);
     SafeStringValue(cmdname);
     
-    std::string command(OPENCMD);
-    command += "\""; command += RSTRING_PTR(cmdname); command += "\"";
-    
-    if (args != RUBY_Qnil) {
-#ifndef __linux__
-        command += " ";
-        command += OPENARGS;
-        Check_Type(args, T_ARRAY);
-        
-        for (int i = 0; i < RARRAY_LEN(args); i++) {
-            VALUE arg = rb_ary_entry(args, i);
-            SafeStringValue(arg);
-            
-            if (RSTRING_LEN(arg) <= 0)
-                continue;
-            
-            command += " ";
-            command += RSTRING_PTR(arg);
-        }
-#else
-        Debug() << command << ":" << "Arguments are not supported with xdg-open. Ignoring.";
-#endif
-    }
-    
-    if (std::system(command.c_str()) != 0) {
-        throw Exception(Exception::MKXPError, "Failed to launch \"%s\"", RSTRING_PTR(cmdname));
-    }
+    /* The Vita has no shell: 1.0.2's system() call always failed here. */
+    throw Exception(Exception::MKXPError, "Failed to launch \"%s\"", RSTRING_PTR(cmdname));
     
     return RUBY_Qnil;
 }
@@ -1093,13 +979,9 @@ static bool processReset(bool rubyExc) {
 	return 0;
 }
 
-#if RAPI_FULL > 187
 static VALUE newStringUTF8(const char *string, long length) {
     return rb_enc_str_new(string, length, rb_utf8_encoding());
 }
-#else
-#define newStringUTF8 rb_str_new
-#endif
 
 struct evalArg {
     VALUE string;
@@ -1143,14 +1025,8 @@ RB_METHOD_GUARD(mriRgssMain) {
 
     while (true) {
         VALUE exc = Qnil;
-#if RAPI_FULL < 270
-        rb_rescue2((VALUE(*)(ANYARGS))rgssMainCb, rb_block_proc(),
-                   (VALUE(*)(ANYARGS))rgssMainRescue, (VALUE)&exc, rb_eException,
-                   (VALUE)0);
-#else
         rb_rescue2(rgssMainCb, rb_block_proc(), rgssMainRescue, (VALUE)&exc,
                    rb_eException, (VALUE)0);
-#endif
         
         if (NIL_P(exc))
             break;
@@ -1517,20 +1393,11 @@ static void showExc(VALUE exc, const BacktraceData &btData) {
     VALUE name = rb_class_path(rb_obj_class(exc));
     
     VALUE ds = rb_sprintf("%" PRIsVALUE ": %" PRIsVALUE " (%" PRIsVALUE ")",
-#if RAPI_MAJOR >= 2
                           bt0, exc, name);
-#else
-    // Ruby 1.9's version of this function needs char*
-    RSTRING_PTR(bt0), RSTRING_PTR(exc), RSTRING_PTR(name));
-#endif
     /* omit "useless" last entry (from ruby:1:in `eval') */
     for (long i = 1, btend = btlen - 1; i < btend; ++i)
         rb_str_catf(ds, "\n\tfrom %" PRIsVALUE,
-#if RAPI_MAJOR >= 2
                     rb_ary_entry(bt, i));
-#else
-    RSTRING_PTR(rb_ary_entry(bt, i)));
-#endif
     Debug() << StringValueCStr(ds);
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     /* The device path ends here, before the location parsing below touches a
@@ -1619,7 +1486,6 @@ static void mriBindingExecute() {
     BootProfile::Scope bootRuby(BootProfile::Ruby);
     Config &conf = shState->rtData().config;
     
-#if RAPI_MAJOR >= 2
     /* Normally only a ruby executable would do a sysinit,
      * but not doing it will lead to crashes due to closed
      * stdio streams on some platforms (eg. Windows) */
@@ -1640,18 +1506,11 @@ static void mriBindingExecute() {
     rubyArgsC.push_back("-e ");
     void *node;
     if (conf.jit.enabled) {
-#if RAPI_FULL >= 310
         // Ruby v3.1.0 renamed the --jit options to --mjit.
         std::string verboseLevel("--mjit-verbose=");
         std::string maxCache("--mjit-max-cache=");
         std::string minCalls("--mjit-min-calls=");
         rubyArgsC.push_back("--mjit");
-#else
-        std::string verboseLevel("--jit-verbose=");
-        std::string maxCache("--jit-max-cache=");
-        std::string minCalls("--jit-min-calls=");
-        rubyArgsC.push_back("--jit");
-#endif
         verboseLevel += std::to_string(conf.jit.verboseLevel);
         maxCache += std::to_string(conf.jit.maxCache);
         minCalls += std::to_string(conf.jit.minCalls);
@@ -1673,16 +1532,7 @@ static void mriBindingExecute() {
     if (valid)
         state = ruby_exec_node(node);
     if (state || !valid) {
-        // The message is formatted for and automatically spits
-        // out to the terminal, so let's leave it that way for now
-        /*
-         VALUE exc = rb_errinfo();
-         #if RAPI_FULL >= 250
-         VALUE msg = rb_funcall(exc, rb_intern("full_message"), 0);
-         #else
-         VALUE msg = rb_funcall(exc, rb_intern("message"), 0);
-         #endif
-         */
+        // Ruby already printed its initialization error to the log.
         showMsg("An error occurred while initializing Ruby. (Invalid JIT settings?)");
         ruby_cleanup(state);
         shState->rtData().rqTermAck.set();
@@ -1690,18 +1540,6 @@ static void mriBindingExecute() {
     }
     rb_enc_set_default_internal(rb_enc_from_encoding(rb_utf8_encoding()));
     rb_enc_set_default_external(rb_enc_from_encoding(rb_utf8_encoding()));
-#else
-    ruby_init();
-    rb_eval_string("$KCODE='U'");
-#ifdef __WIN32__
-    if (!conf.winConsole) {
-        VALUE iostr = rb_str_new2("NUL");
-        // Sysinit isn't a thing yet, so send io to /dev/null instead
-        rb_funcall(rb_gv_get("$stderr"), rb_intern("reopen"), 1, iostr);
-        rb_funcall(rb_gv_get("$stdout"), rb_intern("reopen"), 1, iostr);
-    }
-#endif
-#endif
     
     bootRuby.finish();
     topSelf = rgssVer == 1 ? Qnil : rb_eval_string("self");
@@ -1718,12 +1556,6 @@ static void mriBindingExecute() {
 #ifdef __vita__
     /* Pure-Ruby wrappers accompanying the statically linked extensions. */
     rb_ary_push(lpaths, rb_utf8_str_new_cstr("app0:/ruby"));
-#endif
-    
-#if defined(MKXPZ_BUILD_XCODE) && RAPI_MAJOR >= 2
-    std::string resPath = mkxp_fs::getResourcePath();
-    resPath += "/Ruby/" + std::to_string(RAPI_MAJOR) + "." + std::to_string(RAPI_MINOR) + ".0";
-    rb_ary_push(lpaths, rb_str_new(resPath.c_str(), resPath.size()));
 #endif
     
     if (!conf.rubyLoadpaths.empty()) {
@@ -1773,11 +1605,7 @@ static void mriBindingExecute() {
     else
         runRMXPScripts(btData);
     
-#if RAPI_FULL > 187
     VALUE exc = rb_errinfo();
-#else
-    VALUE exc = rb_gv_get("$!");
-#endif
     if (!NIL_P(exc) && !rb_obj_is_kind_of(exc, rb_eSystemExit))
         showExc(exc, btData);
     

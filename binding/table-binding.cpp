@@ -70,11 +70,7 @@ static void tableFree(void *inst) {
   rb_gc_adjust_memory_usage(-bytes);
 }
 
-#if RAPI_FULL > 187
 DEF_TYPE_CUSTOMFREE(Table, tableFree);
-#else
-DEF_ALLOCFUNC_CUSTOMFREE(Table, tableFree);
-#endif
 
 /* The database-load path, and one of the larger allocations a script makes: a
  * Table is a std::vector<int16_t> of x*y*z cells (src/etc/table.cpp), a stock

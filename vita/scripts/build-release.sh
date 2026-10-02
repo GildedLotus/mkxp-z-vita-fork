@@ -223,9 +223,6 @@ with zipfile.ZipFile(vpk_path) as archive:
         die("the packaged ELF's build receipt does not match this tree; rebuild")
     if receipt.get("backend") != "vitagl":
         die("VPK build backend is %r, the release is vitagl" % receipt.get("backend"))
-    if receipt.get("optionalShaders") is not False:
-        die("the ELF was built with optional shaders (%r); the shipped GXP set covers the boot programs only"
-            % receipt.get("optionalShaders"))
     if receipt.get("mesonBuildtype") != "release" or receipt.get("lto") is not False:
         die("the ELF was built as buildtype %r, lto %r; the release is buildtype release without LTO"
             % (receipt.get("mesonBuildtype"), receipt.get("lto")))

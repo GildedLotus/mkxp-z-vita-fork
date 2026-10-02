@@ -11,13 +11,8 @@
 #include "util/exception.h"
 #include "util/debugwriter.h"
 
-#ifdef MKXPZ_EXP_FS
-#include <experimental/filesystem>
-namespace fs = std::experimental::filesystem;
-#else
 #include "ghc/filesystem.hpp"
 namespace fs = ghc::filesystem;
-#endif
 
 #include <fstream>
 
@@ -78,6 +73,7 @@ std::string filesystemImpl::getCurrentDirectory() {
 
 std::string filesystemImpl::normalizePath(const char *path, bool preferred, bool absolute) {
     fs::path stdPath(path);
+    (void)preferred;
     
     if (!stdPath.is_absolute() && absolute)
         stdPath = fs::current_path() / stdPath;
@@ -85,22 +81,8 @@ std::string filesystemImpl::normalizePath(const char *path, bool preferred, bool
     stdPath = stdPath.lexically_normal();
     std::string ret(stdPath);
     for (size_t i = 0; i < ret.length(); i++) {
-        char sep;
-        char sep_alt;
-#ifdef __WIN32__
-        if (preferred) {
-            sep = '\\';
-            sep_alt = '/';
-        }
-        else
-#endif
-        {
-            sep = '/';
-            sep_alt = '\\';
-        }
-        
-        if (ret[i] == sep_alt)
-            ret[i] = sep;
+        if (ret[i] == '\\')
+            ret[i] = '/';
     }
     return ret;
 }

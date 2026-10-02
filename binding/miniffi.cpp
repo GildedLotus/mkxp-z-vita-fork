@@ -1,7 +1,6 @@
 #include "miniffi.h"
 #include <assert.h>
 
-#if defined(__MINGW64__) || defined(__linux__) || defined(__APPLE__) || defined(__vita__) || defined(__psp2__)
 mffi_value miniffi_call_intern(MINIFFI_FUNC target, MiniFFIFuncArgs *p, int nparams) {
     assert(nparams <= MINIFFI_MAX_ARGS);
     // Be sure to add more args to the below line if MINIFFI_MAX_ARGS is bumped
@@ -12,48 +11,3 @@ mffi_value miniffi_call_intern(MINIFFI_FUNC target, MiniFFIFuncArgs *p, int npar
                                  p->params[10], p->params[11], p->params[12],
                                  p->params[13], p->params[14], p->params[15]);
 }
-#else // 32-bit Windows
-#define INTEL_ASM ".intel_syntax noprefix\n"
-__attribute__((noinline))
-mffi_value miniffi_call_intern(MINIFFI_FUNC target, MiniFFIFuncArgs *p, int nparams) {
-    mffi_value ret;
-    void *old_esp = 0;
-
-    asm volatile(INTEL_ASM
-
-                "mov [edi], esp\n"
-                "test ebx, ebx\n"
-                "jz mffi_call_void\n"
-                
-                "shl ebx, 2\n"
-                "mov ecx, ebx\n"
-                
-                "mffi_call_loop:\n"
-                "sub ecx, 4\n"
-                "mov ebx, [esi+ecx]\n"
-                "push ebx\n"
-                "test ecx, ecx\n"
-                "jnz mffi_call_loop\n"
-                
-                "mffi_call_void:\n"
-                "call edx\n"
-                
-                : "=a"(ret)
-                : "b"(nparams), "S"(p), "d"(target), "D"(&old_esp)
-                : "ecx"
-    );
-
-
-    // If esp doesn't match, this was probably a cdecl and not a stdcall.
-    // Move the stack pointer back to where it should be
-    asm volatile(INTEL_ASM
-                "mov edx, [edi]\n"
-                "cmp edx, esp\n"
-                "cmovne esp, edx"
-                :
-                : "D"(&old_esp)
-                : "edx"
-    );
-    return ret;
-}
-#endif

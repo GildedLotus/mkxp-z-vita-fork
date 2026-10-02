@@ -3071,6 +3071,12 @@ void Bitmap::stretchBlt(IntRect destRect,
                 break;
         }
     
+#ifndef MKXPZ_SOFTWARE_BITMAPS
+    if (mode == KGL_SUBTRACT && !isMega()) {
+        Debug() << "kglSubtractRect: GPU-bitmap build has no shader; skipped";
+        return;
+    }
+#endif
 #ifdef MKXPZ_SOFTWARE_BITMAPS
     /* One software path for every combination: mega or not, surface source or
      * not, opacity 255 or not, 1:1 or scaled, mirrored or not. swraster::blit
@@ -3094,7 +3100,7 @@ void Bitmap::stretchBlt(IntRect destRect,
         swraster::Surface srcPx = source.p->swSurface();
 
         /* Both blits live in swraster and share its clipping, mirroring and
-         * sampling: KGL_SUBTRACT is shader/kglSubtract.frag and honours
+         * sampling: KGL_SUBTRACT is upstream shader/kglSubtract.frag and honours
          * `smooth` exactly as the GL path's TEX::setSmooth(true) does.
          * swraster::subtract_blit applies bltNormOpacity's /256 factor for
          * this mode itself, and deliberately has no opacity == 0 early out
@@ -3433,7 +3439,7 @@ void Bitmap::stretchBlt(IntRect destRect,
                                    ((float) sourceWidth / sourceRect.w) * ((float) abs(destRect.w) / gpTex.width),
                                    ((float) sourceHeight / sourceRect.h) * ((float) abs(destRect.h) / gpTex.height));
             
-            BltShader &shader = mode == KGL_SUBTRACT ? shState->shaders().kglSubtract : shState->shaders().blt;
+            BltShader &shader = shState->shaders().blt;
             shader.bind();
             if (srcSurf)
             {
@@ -5785,29 +5791,7 @@ void Bitmap::kglInvert()
             }
         }
     } else {
-        TEXFBO newTex = shState->texPool().request(width(), height());
-
-        FloatRect texRect(rect());
-
-        Quad &quad = shState->gpQuad();
-        quad.setTexPosRect(texRect, texRect);
-        quad.setColor(Vec4(1, 1, 1, 1));
-
-        KglInvertShader &shader = shState->shaders().kglInvert;
-        shader.bind();
-
-        FBO::bind(newTex.fbo);
-        p->pushSetViewport(shader);
-        p->bindTexture(shader, false);
-
-        p->blitQuad(quad);
-
-        p->popViewport();
-
-        TEX::unbind();
-
-        shState->texPool().release(p->gl);
-        p->gl = newTex;
+        Debug() << "kglInvert: GPU-bitmap build has no shader; skipped";
     }
 #endif
 
@@ -5851,29 +5835,7 @@ void Bitmap::kglCompressAlpha()
             ((uint8_t *)p->megaSurface->pixels)[4 * i + 3] = 0;
         }
     } else {
-        TEXFBO newTex = shState->texPool().request(width(), height());
-
-        FloatRect texRect(rect());
-
-        Quad &quad = shState->gpQuad();
-        quad.setTexPosRect(texRect, texRect);
-        quad.setColor(Vec4(1, 1, 1, 1));
-
-        KglCompressAlphaShader &shader = shState->shaders().kglCompressAlpha;
-        shader.bind();
-
-        FBO::bind(newTex.fbo);
-        p->pushSetViewport(shader);
-        p->bindTexture(shader, false);
-
-        p->blitQuad(quad);
-
-        p->popViewport();
-
-        TEX::unbind();
-
-        shState->texPool().release(p->gl);
-        p->gl = newTex;
+        Debug() << "kglCompressAlpha: GPU-bitmap build has no shader; skipped";
     }
 #endif
 
@@ -5985,38 +5947,13 @@ int Bitmap::kglShadowShaderH(int x1, int x2, int y, bool soft)
     } else {
 #ifdef MKXPZ_SOFTWARE_BITMAPS
         /* Unreachable: every Bitmap is CPU-backed. */
-#elif defined(MKXPZ_NO_OPTIONAL_SHADERS)
+#else
         /* kglShadowH not built. Non-mega bitmaps have no CPU path here;
          * skip the effect rather than fail. Mega bitmaps take the branch above. */
         (void)x1; (void)x2; (void)y; (void)soft;
         (void)w; (void)h; (void)x_center; (void)y_center;
         (void)slope1; (void)slope2;
-        Debug() << "kglShadowShaderH: optional shaders disabled; shadow skipped";
-#else
-        TEXFBO newTex = shState->texPool().request(width(), height());
-
-        FloatRect texRect(rect());
-
-        Quad &quad = shState->gpQuad();
-        quad.setTexPosRect(texRect, texRect);
-        quad.setColor(Vec4(1, 1, 1, 1));
-
-        KglShadowShaderH &shader = shState->shaders().kglShadowH;
-        shader.bind();
-        shader.setParams(x1, x2, y, soft, w, h, x_center, y_center, slope1, slope2);
-
-        FBO::bind(newTex.fbo);
-        p->pushSetViewport(shader);
-        p->bindTexture(shader, false);
-
-        p->blitQuad(quad);
-
-        p->popViewport();
-
-        TEX::unbind();
-
-        shState->texPool().release(p->gl);
-        p->gl = newTex;
+        Debug() << "kglShadowShaderH: GPU-bitmap build has no shader; shadow skipped";
 #endif
     }
 
@@ -6127,38 +6064,13 @@ int Bitmap::kglShadowShaderV(int y1, int y2, int x, bool wall, bool soft)
     } else {
 #ifdef MKXPZ_SOFTWARE_BITMAPS
         /* Unreachable: every Bitmap is CPU-backed. */
-#elif defined(MKXPZ_NO_OPTIONAL_SHADERS)
+#else
         /* kglShadowV not built. Non-mega bitmaps have no CPU path here;
          * skip the effect rather than fail. Mega bitmaps take the branch above. */
         (void)y1; (void)y2; (void)x; (void)wall; (void)soft;
         (void)w; (void)h; (void)x_center; (void)y_center;
         (void)slope1; (void)slope2;
-        Debug() << "kglShadowShaderV: optional shaders disabled; shadow skipped";
-#else
-        TEXFBO newTex = shState->texPool().request(width(), height());
-
-        FloatRect texRect(rect());
-
-        Quad &quad = shState->gpQuad();
-        quad.setTexPosRect(texRect, texRect);
-        quad.setColor(Vec4(1, 1, 1, 1));
-
-        KglShadowShaderV &shader = shState->shaders().kglShadowV;
-        shader.bind();
-        shader.setParams(y1, y2, x, wall, soft, w, h, x_center, y_center, slope1, slope2);
-
-        FBO::bind(newTex.fbo);
-        p->pushSetViewport(shader);
-        p->bindTexture(shader, false);
-
-        p->blitQuad(quad);
-
-        p->popViewport();
-
-        TEX::unbind();
-
-        shState->texPool().release(p->gl);
-        p->gl = newTex;
+        Debug() << "kglShadowShaderV: GPU-bitmap build has no shader; shadow skipped";
 #endif
     }
 

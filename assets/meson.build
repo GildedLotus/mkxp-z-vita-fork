@@ -1,23 +1,15 @@
 embedded_assets = [
-    'icon.png',
-    'gamecontrollerdb.txt'
+    'liberation.ttf'
 ]
-
-if get_option('cjk_fallback_font') == true
-    embedded_assets += 'wqymicrohei.ttf'
-else
-    embedded_assets += 'liberation.ttf'
-endif
 
 embedded_assets_f = files(embedded_assets)
 
 count = 0
 foreach file : embedded_assets_f
     # Rewrite xxd's path-derived symbols to the stable ___assets_<basename>
-    # form used by eventthread.cpp / font.cpp / main.cpp. Meson hands xxd
+    # form used by font.cpp. Meson hands xxd
     # a build-dir-relative @INPUT@ path, whose symbol name would otherwise
-    # depend on the source/build layout (see linux/Makefile for the
-    # `xxd -i ../assets/<file>` convention this restores).
+    # depend on the source/build layout.
     global_sources += custom_target(embedded_assets[count],
     input: file,
     output: '@0@.xxd'.format(embedded_assets[count]),

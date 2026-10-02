@@ -52,11 +52,7 @@ static void bitmapFree(void *inst) {
     pixelPressureSync();
 }
 
-#if RAPI_FULL > 187
 DEF_TYPE_CUSTOMFREE(Bitmap, bitmapFree);
-#else
-DEF_ALLOCFUNC_CUSTOMFREE(Bitmap, bitmapFree);
-#endif
 
 /* Collection can still come too late: the heap may be full of dropped Bitmaps
  * (or the script disabled GC). The constructors fail transactionally, so run
@@ -1020,11 +1016,7 @@ RB_METHOD_GUARD_END
 
 void bitmapBindingInit() {
     VALUE klass = rb_define_class("Bitmap", rb_cObject);
-#if RAPI_FULL > 187
     rb_define_alloc_func(klass, classAllocate<&BitmapType>);
-#else
-    rb_define_alloc_func(klass, BitmapAllocate);
-#endif
     
     disposableBindingInit<Bitmap>(klass);
     

@@ -28,11 +28,7 @@
 #include "binding-util.h"
 #include "disposable-binding.h"
 
-#if RAPI_FULL > 187
 DEF_TYPE_CUSTOMFREE(TilemapAutotiles, RUBY_TYPED_NEVER_FREE);
-#else
-#define TilemapAutotilesType "TilemapAutotiles"
-#endif
 
 RB_METHOD_GUARD(tilemapAutotilesSet) {
     Tilemap::Autotiles *a = getPrivateDataNoRaise<Tilemap::Autotiles>(self);
@@ -72,11 +68,7 @@ RB_METHOD(tilemapAutotilesGet) {
     return rb_ary_entry(ary, i);
 }
 
-#if RAPI_FULL > 187
 DEF_TYPE(Tilemap);
-#else
-DEF_ALLOCFUNC(Tilemap);
-#endif
 
 RB_METHOD_GUARD(tilemapInitialize) {
     Tilemap *t = 0;
@@ -174,19 +166,13 @@ DEF_GFX_PROP_I(Tilemap, BlendType)
 
 void tilemapBindingInit() {
     VALUE klass = rb_define_class("TilemapAutotiles", rb_cObject);
-#if RAPI_FULL > 187
     rb_define_alloc_func(klass, classAllocate<&TilemapAutotilesType>);
-#endif
     
     _rb_define_method(klass, "[]=", tilemapAutotilesSet);
     _rb_define_method(klass, "[]", tilemapAutotilesGet);
     
     klass = rb_define_class("Tilemap", rb_cObject);
-#if RAPI_FULL > 187
     rb_define_alloc_func(klass, classAllocate<&TilemapType>);
-#else
-    rb_define_alloc_func(klass, TilemapAllocate);
-#endif
     
     disposableBindingInit<Tilemap>(klass);
     

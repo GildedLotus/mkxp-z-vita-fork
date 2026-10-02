@@ -24,8 +24,7 @@ shows what changed. `capture` writes `MANIFEST` itself.
 
 The boot-time final-presentation probe (`app0:/diagnostics/final-presentation-probe`) changes SimpleShader's
 source, hence its key: a package with the marker is not covered by this set and needs libshacccg on the device
-(the packager asks for `ALLOW_MISSING_SHADERS=1`). An ELF built with `MKXPZ_OPTIONAL_SHADERS=1` is refused by
-its build receipt.
+(the packager asks for `ALLOW_MISSING_SHADERS=1`).
 
 The packager takes this directory by default (`VITAGL_SHADERS_DIR`); `ALLOW_MISSING_SHADERS=1` is for capture
 builds only and is refused by the release.

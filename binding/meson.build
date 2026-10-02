@@ -1,12 +1,9 @@
 
 if get_option('mri_includes') == ''
-    ver = get_option('mri_version')
-    if ver.version_compare('<=1.8')
-        global_args += '-DMKXPZ_LEGACY_RUBY'
-    elif ver.version_compare('>=3.0') and compilers['cpp'].get_id() == 'clang'
+    if compilers['cpp'].get_id() == 'clang'
         global_args += '-fdeclspec'
     endif
-    global_dependencies += dependency('ruby-' + ver)
+    global_dependencies += dependency('ruby-3.1', static: true)
 else
     global_args += ('-I' + get_option('mri_includes'))
     global_dependencies += compilers['cpp'].find_library(get_option('mri_library'), dirs: get_option('mri_libpath'))
@@ -35,10 +32,6 @@ binding_source = [files(
     'tilemapvx-binding.cpp',
     'http-binding.cpp'
 )]
-
-if steamworks == true
-    binding_source += files('cusl-binding.cpp')
-endif
 
 if miniffi == true
     binding_source += files('miniffi-binding.cpp')

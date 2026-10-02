@@ -26,11 +26,6 @@
 #include <sstream>
 #include <vector>
 
-#ifdef __ANDROID__
-#include <android/log.h>
-#endif
-
-
 /* A cheap replacement for qDebug() */
 
 class Debug
@@ -61,15 +56,11 @@ public:
 
 	~Debug()
 	{
-#ifdef __ANDROID__
-		__android_log_write(ANDROID_LOG_DEBUG, "mkxp", buf.str().c_str());
-#else
 		std::cerr << buf.str() << std::endl;
 		/* One failed write sets badbit for good, which would mute every
 		 * later line even after the sink recovers. */
 		if (!std::cerr)
 			std::cerr.clear();
-#endif
 	}
 
 private:

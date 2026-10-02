@@ -250,10 +250,10 @@ struct ALStreamOpenHandler : FileSystem::OpenHandler
 
 /* Filenames openSource() has already reported as undecodable.
  *
- * Upstream prints the line below on every attempt. On this port MIDI never
- * decodes -- fluid-fun's SDL_LoadObject cannot succeed (the Vita
- * SDL2 is built with SDL_LOADSO_DUMMY) and SDL_sound's MIDI decoder is off --
- * and an RPG Maker XP game whose soundtrack is the XP RTP's .mid files
+ * Upstream prints the line below on every attempt. SDL_sound's MIDI decoder
+ * is off on this port (MIDI playback is handled separately by the static
+ * TinySoundFont path), and an RPG Maker XP game whose soundtrack is the XP
+ * RTP's .mid files
  * reopens its BGM on every map change. Alternating between two maps reprints
  * the same two lines forever, and the Vita's log sink is synchronous: two
  * sceIoSyncByFd per line, paid on the thread that changed the map.

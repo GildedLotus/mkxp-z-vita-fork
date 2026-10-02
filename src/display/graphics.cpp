@@ -118,10 +118,6 @@ static const struct SwRasterProfileGate {
 #include <SDL_mutex.h>
 #include <SDL_thread.h>
 
-#ifdef MKXPZ_STEAM
-#include "steamshim_child.h"
-#endif
-
 #include <algorithm>
 #include <atomic>
 #include <errno.h>
@@ -2902,12 +2898,6 @@ void Graphics::update(bool checkForShutdown) {
         p->checkShutDownReset();
     
     p->checkSyncLock();
-    
-    
-#ifdef MKXPZ_STEAM
-    if (STEAMSHIM_alive())
-        STEAMSHIM_pump();
-#endif
     
     requireRenderTargets();
     if (p->frozen) {

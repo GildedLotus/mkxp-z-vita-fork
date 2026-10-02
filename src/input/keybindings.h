@@ -109,7 +109,7 @@ struct SourceDesc
  * jAxisThreshold() returns. BOTH places that gate on an axis read it through
  * the JAXIS_THRESHOLD spelling below -- CtrlAxisBinding::sourceActive() in
  * src/input/input.cpp (which caches it per binding, see there) and the
- * binding capture in src/settingsmenu.cpp -- so a binding captured in the
+ * binding capture in vita/overlay/settings_menu.h -- so a binding captured in the
  * settings menu is captured at exactly the threshold the runtime applies.
  *
  * Off-device nothing calls setJAxisThreshold() and the value stays

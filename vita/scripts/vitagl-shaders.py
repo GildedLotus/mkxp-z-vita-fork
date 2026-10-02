@@ -13,8 +13,8 @@ the hash is XXH3_64 of the shader source exactly as glShaderSource received it. 
 engine submits [probe] + "#define GLSLES" + ["#define FRAGMENT_SHADER"] + common.h +
 body (src/display/gl/shader.cpp setupShaderSource), so the keys are computable from the
 patched mkxp-z tree alone; editing any shader therefore makes the shipped set stale.
-Only the boot set with optional shaders off is covered (what MKXPZ_OPTIONAL_SHADERS=0 builds),
-plus the launcher's program (kVS/kFS in vita/launcher/launcher_gl.c), which is submitted as one bare string.
+The engine's complete boot set is covered, plus the launcher's program (kVS/kFS in
+vita/launcher/launcher_gl.c), which is submitted as one bare string.
 The boot-time final-presentation probe (app0:/diagnostics/final-presentation-probe) prepends a define to
 SimpleShader's source, so its keys are not in the set: a package that carries the marker needs libshacccg.
 """
@@ -67,15 +67,13 @@ def _define(cpp, name):
 
 
 def boot_classes(header):
-    """ShaderSet members before the first optional-shader block, in declaration order, without the
-    GPU-bitmap-only block (#ifndef MKXPZ_SOFTWARE_BITMAPS), which the software-bitmap player never builds."""
+    """ShaderSet members in declaration order, without the GPU-bitmap-only block
+    (#ifndef MKXPZ_SOFTWARE_BITMAPS), which the software-bitmap player never builds."""
     m = re.search(r"struct ShaderSet\s*\{(.*?)\n\};", header, re.S)
     if not m:
         raise ShaderError("shader.h: no ShaderSet")
     names, gpu_bitmaps_only = [], False
     for line in m.group(1).splitlines():
-        if line.startswith("#ifndef MKXPZ_NO_OPTIONAL_SHADERS"):
-            break
         if line.startswith("#ifndef MKXPZ_SOFTWARE_BITMAPS"):
             gpu_bitmaps_only = True
         elif gpu_bitmaps_only and line.startswith("#endif"):

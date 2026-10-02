@@ -105,7 +105,7 @@ defScreenH          vsync                   syncToRefreshrate     enableBlitting
 maxTextureSize      enableHires             textureScalingFactor  framebufferScalingFactor
 atlasScalingFactor  smoothScalingMipmaps    JITEnable             JITVerboseLevel
 JITMaxCache         JITMinCalls             YJITEnable            dataPathOrg
-dataPathApp         iconPath                preferMetalRenderer   dumpAtlas
+dataPathApp         dumpAtlas
 ```
 
 A game that genuinely has something to say about one of them says it in
@@ -459,7 +459,6 @@ not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 | `bitmapSmoothScaling` | int | `0` | — |
 | `bitmapSmoothScalingDown` | int | `0` | — |
 | `smoothScalingMipmaps` | bool | `false` | — |
-| `bicubicSharpness` | int | `100` | — |
 | `enableHires` | bool | `false` | — |
 | `textureScalingFactor` | float | `1.0` | — |
 | `framebufferScalingFactor` | float | `1.0` | — |
@@ -472,7 +471,6 @@ not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 | `frameSkip` | bool | `false` | — |
 | `syncToRefreshrate` | bool | `false` | — |
 | `solidFonts` | array of string | `[]` | — |
-| `preferMetalRenderer` † | bool | `false` | — |
 | `subImageFix` | bool | `false` | — |
 | `enableBlitting` | bool | `true` | — |
 | `integerScalingActive` | bool | `false` | `false` |
@@ -485,7 +483,6 @@ not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 | `allowSymlinks` | bool | `true` | — |
 | `dataPathOrg` | string | `""` | `"mkxp-z"` |
 | `dataPathApp` | string | `""` | `"mkxp-z"` |
-| `iconPath` | string | `""` | — |
 | `execName` | string | `"Game"` | — |
 | `midiSoundFont` | string | `""` | — |
 | `midiChorus` † | bool | `false` | — |
@@ -522,13 +519,11 @@ not. Defaults are mkxp-z's compiled `ConfDef` at pin `826929ee`; the
 
 † **No effect on this build.** The JIT keys: Ruby is built with
 `--disable-jit-support --disable-yjit`, so it only warns. `bindingNames`: the
-Vita binding menu has fixed labels; only the desktop settings window reads
-them. `midiChorus`, `midiReverb`: the TinySoundFont synth has neither effect.
-`preferMetalRenderer`, `dumpAtlas`: desktop-only. `anyAltToggleFS`,
+Vita binding menu has fixed labels. `midiChorus`, `midiReverb`: the TinySoundFont synth has neither effect.
+`dumpAtlas`: desktop-only. `anyAltToggleFS`,
 `enableReset`: only a keyboard can trigger what they gate (Alt+Enter, F12).
 
-`xbrzScalingFactor` exists only in an `MKXPZ_SSL` build and is not compiled
-here.
+`xbrzScalingFactor` is not supported by this fork.
 
 ### Keys that matter on this device
 
@@ -580,11 +575,10 @@ here.
   closed, delete both the file **and** its `.bak`: the reader falls back to
   the `.bak` when the file is missing or invalid, so deleting the file alone
   restores the previous mapping.
-* **`smoothScaling` is an integer**: `0` Nearest, `1` Bilinear, `2` Bicubic,
-  `3` Lanczos3, `4` xBRZ. **The release package offers only `0` and `1`.** It is
-  built without the optional shaders (the Bicubic and Lanczos3 programs), and
-  xBRZ exists only in a build with HTTPS support (`MKXPZ_SSL`), which the Vita
-  build turns off. On such a build every value of `2` or higher is treated as `1` (Bilinear), for
+* **`smoothScaling` is an integer**: `0` Nearest and `1` Bilinear. Legacy
+  values `2` Bicubic, `3` Lanczos3 and `4` xBRZ are accepted for config
+  compatibility, but this Vita-only fork does not build their shaders: every
+  value of `2` or higher is treated as `1` (Bilinear), for
   `smoothScaling`, `smoothScalingDown`, `bitmapSmoothScaling` and
   `bitmapSmoothScalingDown` alike; the log says so once
   (`vita-gfx: smoothScaling N is not built`) for the first two, and nothing for
@@ -619,7 +613,7 @@ direction bindings, trigger axes, raw-axis queries and binding-file contents are
 unchanged. The binding menu's capture uses this action gate for stick input
 when the row is anything but a direction; direction rows and triggers use the
 movement gate described below.
-Y/Z cannot be held together on this default axis. Desktop defaults still use clicks.
+Y/Z cannot be held together on this default axis.
 The handheld mapping has not been tested on a device.
 
 A stored binding file replaces the RGSS rows above. Reset it from the binding
@@ -631,8 +625,7 @@ then put `keybindings.mkxp1`, `.mkxp2` or `.mkxp3` (for XP, VX or Ace) in
 `ux0:/data/mkxp-z/MyGame/`. That folder also becomes the game's settings-file
 folder (`CFG[]=`); `System.data_directory` is unaffected and stays the game's
 own folder. Use a binding file saved by mkxp-z's
-binding editor with the desired controller mapping; do not enable the desktop
-settings window on Vita. Keep both path names nonempty. This overrides the common
+binding editor with the desired controller mapping. Keep both path names nonempty. This overrides the common
 path described above only when config layers are enabled and the packaged
 `app0:/mkxp.json` does not pin `dataPathOrg`/`dataPathApp` at higher priority;
 a root config that pins both must be adjusted when

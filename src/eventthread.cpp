@@ -37,21 +37,10 @@
 #include "sharedstate.h"
 #include "graphics.h"
 
-#ifndef MKXPZ_BUILD_XCODE
-#include "settingsmenu.h"
-#include "gamecontrollerdb.txt.xxd"
-#else
-#include "system/system.h"
-#include "filesystem/filesystem.h"
-#include "TouchBar.h"
-#endif
-
 #include "al-util.h"
 #include "debugwriter.h"
 
-#ifndef __APPLE__
 #include "util/string-util.h"
-#endif
 
 #include <string.h>
 #include <cstdio>
@@ -306,10 +295,7 @@ void EventThread::process(RGSSThreadData &rtData)
     
     initALCFunctions(rtData.alcDev);
     
-    // XXX this function breaks input focus on OSX
-#ifndef __APPLE__
     SDL_SetEventFilter(eventFilter, &rtData);
-#endif
     
     fullscreen = rtData.config.fullscreen;
     int toggleFSMod = rtData.config.anyAltToggleFS ? KMOD_ALT : KMOD_LALT;
@@ -395,20 +381,12 @@ void EventThread::process(RGSSThreadData &rtData)
     };
 #endif
     
-#ifdef MKXPZ_BUILD_XCODE
-    SDL_GameControllerAddMappingsFromFile(mkxp_fs::getPathForAsset("gamecontrollerdb", "txt").c_str());
-#else
-    SDL_GameControllerAddMappingsFromRW(
-        SDL_RWFromConstMem(___assets_gamecontrollerdb_txt, ___assets_gamecontrollerdb_txt_len),
-    1);
-#endif
-    
     SDL_JoystickUpdate();
     
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     /* Vita: SDL 2.32.8 VITA_JoystickGetGamepadMapping always
-     * returns SDL_FALSE, and gamecontrollerdb.txt has no platform:Vita
-     * entry matching SDL_CreateJoystickGUIDForName("PSVita Controller").
+     * returns SDL_FALSE, so SDL has no mapping for the GUID returned by
+     * SDL_CreateJoystickGUIDForName("PSVita Controller").
      * Result: SDL_IsGameController(0)==false, controller never opens,
      * EventThread only handles CONTROLLER* → Input.press? stays false.
      * Register a runtime mapping from the live GUID, then open. */
@@ -499,13 +477,6 @@ void EventThread::process(RGSSThreadData &rtData)
     SDL_StopTextInput();
     
     textInputBuffer.clear();
-#ifndef MKXPZ_BUILD_XCODE
-    SettingsMenu *sMenu = 0;
-#else
-    // Will always be 0
-    void *sMenu = 0;
-#endif
-    
     while (true)
     {
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
@@ -654,21 +625,6 @@ void EventThread::process(RGSSThreadData &rtData)
             break;
         }
 #endif
-#ifndef MKXPZ_BUILD_XCODE
-        if (sMenu && sMenu->onEvent(event))
-        {
-            if (sMenu->destroyReq())
-            {
-                delete sMenu;
-                sMenu = 0;
-                
-                updateCursorState(cursorInWindow && windowFocused, gameScreen);
-            }
-            
-            continue;
-        }
-#endif
-        
         /* Preselect and discard unwanted events here */
         switch (event.type)
         {
@@ -777,14 +733,14 @@ void EventThread::process(RGSSThreadData &rtData)
                     case SDL_WINDOWEVENT_ENTER :
                         cursorInWindow = true;
                         mouseState.inWindow = true;
-                        updateCursorState(cursorInWindow && windowFocused && !sMenu, gameScreen);
+                        updateCursorState(cursorInWindow && windowFocused, gameScreen);
                         
                         break;
                         
                     case SDL_WINDOWEVENT_LEAVE :
                         cursorInWindow = false;
                         mouseState.inWindow = false;
-                        updateCursorState(cursorInWindow && windowFocused && !sMenu, gameScreen);
+                        updateCursorState(cursorInWindow && windowFocused, gameScreen);
                         
                         break;
                         
@@ -795,13 +751,13 @@ void EventThread::process(RGSSThreadData &rtData)
                         
                     case SDL_WINDOWEVENT_FOCUS_GAINED :
                         windowFocused = true;
-                        updateCursorState(cursorInWindow && windowFocused && !sMenu, gameScreen);
+                        updateCursorState(cursorInWindow && windowFocused, gameScreen);
                         
                         break;
                         
                     case SDL_WINDOWEVENT_FOCUS_LOST :
                         windowFocused = false;
-                        updateCursorState(cursorInWindow && windowFocused && !sMenu, gameScreen);
+                        updateCursorState(cursorInWindow && windowFocused, gameScreen);
                         resetInputStates();
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
                         systemChords = VitaSystemChords();
@@ -851,16 +807,6 @@ void EventThread::process(RGSSThreadData &rtData)
 
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
                     settingsMenu.request(false);
-#elif !defined(MKXPZ_BUILD_XCODE)
-                    if (!sMenu)
-                    {
-                        sMenu = new SettingsMenu(rtData);
-                        updateCursorState(false, gameScreen);
-                    }
-                    
-                    sMenu->raise();
-#else
-                    openSettingsWindow();
 #endif
                 }
                 
@@ -1129,18 +1075,12 @@ void EventThread::process(RGSSThreadData &rtData)
                         
                     case REQUEST_MESSAGEBOX :
                     {
-#ifndef __APPLE__
                         // Try to format the message with additional newlines
                         std::string message = copyWithNewlines((const char*) event.user.data1,
                                                                70);
                         SDL_ShowSimpleMessageBox(event.user.code,
                                                  rtData.config.windowTitle.c_str(),
                                                  message.c_str(), win);
-#else
-                        SDL_ShowSimpleMessageBox(event.user.code,
-                                                 rtData.config.windowTitle.c_str(),
-                                                 (const char*)event.user.data1, win);
-#endif
                         free(event.user.data1);
                         msgBoxDone.set();
                         break;
@@ -1153,16 +1093,6 @@ void EventThread::process(RGSSThreadData &rtData)
                     case REQUEST_SETTINGS :
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
                         requestSettingsMenu();
-#elif !defined(MKXPZ_BUILD_XCODE)
-                        if (!sMenu)
-                        {
-                            sMenu = new SettingsMenu(rtData);
-                            updateCursorState(false, gameScreen);
-                        }
-                        
-                        sMenu->raise();
-#else
-                        openSettingsWindow();
 #endif
                         break;
                         
@@ -1220,9 +1150,6 @@ void EventThread::process(RGSSThreadData &rtData)
     }
 #endif
     
-#ifndef MKXPZ_BUILD_XCODE
-    delete sMenu;
-#endif
 }
 
 int EventThread::eventFilter(void *data, SDL_Event *event)
@@ -1488,10 +1415,6 @@ void EventThread::notifyFrame()
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     updateFPSOverlay();
 #endif
-#ifdef MKXPZ_BUILD_XCODE
-    uint32_t frames = round(shState->graphics().averageFrameRate());
-    updateTouchBarFPSDisplay(frames);
-#endif
     if (!fps.sendUpdates)
         return;
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
@@ -1503,9 +1426,7 @@ void EventThread::notifyFrame()
 #endif
     
     SDL_Event event;
-#ifdef MKXPZ_BUILD_XCODE
-    event.user.code = frames;
-#elif defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
+#if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     const double frames = std::round(shState->graphics().averageFrameRate());
     event.user.code = std::isfinite(frames) && frames > 0 && frames <= SDL_MAX_SINT32
                          ? static_cast<Sint32>(frames) : 0;

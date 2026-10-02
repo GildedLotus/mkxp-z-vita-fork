@@ -24,11 +24,7 @@
 #include "viewportelement-binding.h"
 #include "window.h"
 
-#if RAPI_FULL > 187
 DEF_TYPE(Window);
-#else
-DEF_ALLOCFUNC(Window);
-#endif
 
 RB_METHOD_GUARD(windowInitialize) {
     VALUE viewportObj = Qnil;
@@ -81,11 +77,7 @@ DEF_GFX_PROP_I(Window, ContentsOpacity)
 
 void windowBindingInit() {
     VALUE klass = rb_define_class("Window", rb_cObject);
-#if RAPI_FULL > 187
     rb_define_alloc_func(klass, classAllocate<&WindowType>);
-#else
-    rb_define_alloc_func(klass, WindowAllocate);
-#endif
     
     disposableBindingInit<Window>(klass);
     viewportElementBindingInit<Window>(klass);

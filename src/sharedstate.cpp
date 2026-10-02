@@ -460,7 +460,7 @@ void SharedState::initInstance(RGSSThreadData *threadData)
 #ifdef MKXPZ_SOFTWARE_BITMAPS
 		/* ShaderSet's constructor compiled and linked every
 		 * program the engine can use, inside SharedStatePrivate above, and
-		 * nothing compiles lazily (the optional shaders are off on Vita).
+		 * nothing compiles lazily.
 		 * Use each of them once now, one pixel per blend mode per kind
 		 * of target, so the driver builds its per-program code variants
 		 * while there are still sync objects to build them with. */

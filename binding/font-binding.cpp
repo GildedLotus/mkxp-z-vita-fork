@@ -43,11 +43,7 @@ static void collectStrings(VALUE obj, std::vector<std::string> &out) {
   }
 }
 
-#if RAPI_FULL > 187
 DEF_TYPE(Font);
-#else
-DEF_ALLOCFUNC(Font);
-#endif
 
 RB_METHOD(fontDoesExist) {
   RB_UNUSED_PARAM;
@@ -281,11 +277,7 @@ RB_METHOD(FontSetDefaultColor) {
 
 void fontBindingInit() {
   VALUE klass = rb_define_class("Font", rb_cObject);
-#if RAPI_FULL > 187
   rb_define_alloc_func(klass, classAllocate<&FontType>);
-#else
-  rb_define_alloc_func(klass, FontAllocate);
-#endif
 
   Font::initDefaultDynAttribs();
   wrapProperty(klass, &Font::getDefaultColor(), "default_color", ColorType);

@@ -21,10 +21,6 @@
 
 #include "bootprofile.h"
 
-#ifndef MKXPZ_BUILD_XCODE
-#include "icon.png.xxd"
-#endif
-
 #include <alc.h>
 #include <alext.h>
 
@@ -37,14 +33,12 @@
 #include <string.h>
 #include <string>
 #include <unistd.h>
-#include <regex>
 
 #include "binding.h"
 #include "sharedstate.h"
 #include "eventthread.h"
 #include "util/debugwriter.h"
 #include "util/exception.h"
-#include "display/gl/gl-debug.h"
 #include "display/gl/gl-fun.h"
 
 #include "filesystem/filesystem.h"
@@ -77,9 +71,8 @@
 #include <psp2/kernel/processmgr.h>
 #endif
 #if defined(__vita__) && defined(MKXPZ_VITA_LAUNCHER)
-/* One eboot, three modes. Configure copies vita/launcher sources into
- * this directory, so the header resolves through the src/ include path.
- * existing src/ include directory. */
+/* One eboot, three modes. Meson compiles vita/launcher in place and adds
+ * its directory to the include paths. */
 #include "vita_boot.h"
 #else
 /*
@@ -102,38 +95,6 @@ static inline int vita_boot_finish(int rc) { return rc; }
 #endif
 #endif
 
-#if defined(__WIN32__)
-#include "resource.h"
-#include <Winsock2.h>
-#include "util/win-consoleutils.h"
-
-// Try to work around buggy GL drivers that tend to be in Optimus laptops
-// by forcing MKXP to use the dedicated card instead of the integrated one
-#include <windows.h>
-extern "C" {
-__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
-__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
-}
-#endif
-
-#ifdef MKXPZ_STEAM
-#include "steamshim_child.h"
-#endif
-
-#ifdef MKXPZ_BUILD_XCODE
-#include <Availability.h>
-#include "TouchBar.h"
-#if !defined(__MAC_10_15) || __MAC_OS_X_VERSION_MAX_ALLOWED < __MAC_10_15
-#define MKXPZ_INIT_GL_LATER
-#endif
-#endif
-
-#ifndef MKXPZ_INIT_GL_LATER
-#define GLINIT_SHOWERROR(s) showInitError(s)
-#else
-#define GLINIT_SHOWERROR(s) rgssThreadError(threadData, s)
-#endif
-
 static void rgssThreadError(RGSSThreadData *rtData, const std::string &msg);
 static void showInitError(const std::string &msg);
 
@@ -142,24 +103,9 @@ static inline const char *glGetStringInt(GLenum name) {
 }
 
 static void printGLInfo() {
-    const std::string renderer(glGetStringInt(GL_RENDERER));
-    const std::string version(glGetStringInt(GL_VERSION));
-    std::regex rgx("ANGLE \\((.+), ANGLE Metal Renderer: (.+), Version (.+)\\)");
-        
-    std::smatch matches;
-    if (std::regex_search(renderer, matches, rgx)) {
-        
-        Debug() << "Backend           :" << "Metal";
-        Debug() << "Metal Device      :" << matches[2] << "(" + matches[1].str() + ")";
-        Debug() << "Renderer Version  :" << matches[3].str();
-        
-    std::smatch vmatches;
-        if (std::regex_search(version, vmatches, std::regex("\\(ANGLE (.+) git hash: .+\\)"))) {
-            Debug() << "ANGLE Version     :" << vmatches[1].str();
-        }
-        return;
-    }
-    
+  const std::string renderer(glGetStringInt(GL_RENDERER));
+  const std::string version(glGetStringInt(GL_VERSION));
+
   Debug() << "Backend      :" << "OpenGL";
   Debug() << "GL Vendor    :" << glGetStringInt(GL_VENDOR);
   Debug() << "GL Renderer  :" << renderer;
@@ -560,7 +506,6 @@ int rgssThreadFun(void *userdata) {
   vita_glue_trace("trace: rgss thread entered");
 #endif
 
-#ifdef MKXPZ_INIT_GL_LATER
   threadData->glContext =
       initGL(threadData->window, threadData->config, threadData);
   BootProfile::end(BootProfile::GLInit);
@@ -574,9 +519,6 @@ int rgssThreadFun(void *userdata) {
 #endif
   if (!threadData->glContext)
     return 0;
-#else
-  SDL_GL_MakeCurrent(threadData->window, threadData->glContext);
-#endif
 
   /* Setup AL context */
   static const ALCint attrs[] = {
@@ -701,26 +643,6 @@ static void showInitError(const std::string &msg) {
 #endif
 }
 
-static void setupWindowIcon(const Config &conf, SDL_Window *win) {
-  SDL_RWops *iconSrc;
-
-  if (conf.iconPath.empty())
-#ifndef MKXPZ_BUILD_XCODE
-    iconSrc = SDL_RWFromConstMem(___assets_icon_png, ___assets_icon_png_len);
-#else
-    iconSrc = SDL_RWFromFile(mkxp_fs::getPathForAsset("icon", "png").c_str(), "rb");
-#endif
-  else
-    iconSrc = SDL_RWFromFile(conf.iconPath.c_str(), "rb");
-
-  SDL_Surface *iconImg = IMG_Load_RW(iconSrc, SDL_TRUE);
-
-  if (iconImg) {
-    SDL_SetWindowIcon(win, iconImg);
-    SDL_FreeSurface(iconImg);
-  }
-}
-
 static int mkxp_main(int argc, char *argv[]) {
 #ifdef __vita__
     /* Vita platform bootstrap: log redirect, boot clocks,
@@ -789,18 +711,7 @@ static int mkxp_main(int argc, char *argv[]) {
     }
 
 #ifndef WORKDIR_CURRENT
-    char dataDir[512]{};
-#if defined(__linux__)
-    char *tmp{};
-    tmp = getenv("SRCDIR");
-    if (tmp) {
-      strncpy(dataDir, tmp, sizeof(dataDir));
-    }
-#endif
-    if (!dataDir[0]) {
-        strncpy(dataDir, mkxp_fs::getDefaultGameRoot().c_str(), sizeof(dataDir));
-    }
-    mkxp_fs::setCurrentDirectory(dataDir);
+    mkxp_fs::setCurrentDirectory(mkxp_fs::getDefaultGameRoot().c_str());
 #endif
     
     /* now we load the config */
@@ -824,29 +735,6 @@ static int mkxp_main(int argc, char *argv[]) {
     }
 #endif
 
-#if defined(__WIN32__)
-    // Create a debug console in debug mode
-    if (conf.winConsole) {
-      if (setupWindowsConsole()) {
-        reopenWindowsStreams();
-      } else {
-        char buf[200];
-        snprintf(buf, sizeof(buf), "Error allocating console: %lu",
-                GetLastError());
-        showInitError(std::string(buf));
-      }
-    }
-#endif
-
-#ifdef MKXPZ_STEAM
-    if (!STEAMSHIM_init()) {
-      showInitError("Failed to initialize Steamworks. The application cannot "
-                    "continue launching.");
-      SDL_Quit();
-      return 0;
-    }
-#endif
-
     if (conf.windowTitle.empty())
       conf.windowTitle = conf.game.title;
 
@@ -859,10 +747,6 @@ static int mkxp_main(int argc, char *argv[]) {
                     SDL_GetError());
       SDL_Quit();
 
-#ifdef MKXPZ_STEAM
-      STEAMSHIM_deinit();
-#endif
-
       return 0;
     }
 
@@ -871,10 +755,6 @@ static int mkxp_main(int argc, char *argv[]) {
                     SDL_GetError());
       IMG_Quit();
       SDL_Quit();
-
-#ifdef MKXPZ_STEAM
-      STEAMSHIM_deinit();
-#endif
 
       return 0;
     }
@@ -886,22 +766,8 @@ static int mkxp_main(int argc, char *argv[]) {
       IMG_Quit();
       SDL_Quit();
 
-#ifdef MKXPZ_STEAM
-      STEAMSHIM_deinit();
-#endif
-
       return 0;
     }
-#if defined(__WIN32__)
-    WSAData wsadata = {0};
-    if (WSAStartup(0x101, &wsadata) || wsadata.wVersion != 0x101) {
-      char buf[200];
-      snprintf(buf, sizeof(buf), "Error initializing winsock: %08X",
-               WSAGetLastError());
-      showInitError(
-          std::string(buf)); // Not an error worth ending the program over
-    }
-#endif
 
     SDL_Window *win;
     Uint32 winFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_INPUT_FOCUS | SDL_WINDOW_ALLOW_HIGHDPI;
@@ -915,13 +781,6 @@ static int mkxp_main(int argc, char *argv[]) {
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
-
-    // LoadLibrary properly initializes EGL, it won't work otherwise.
-    // Doesn't completely do it though, needs a small patch to SDL
-#ifdef MKXPZ_BUILD_XCODE
-    SDL_setenv("ANGLE_DEFAULT_PLATFORM", (conf.preferMetalRenderer) ? "metal" : "opengl", true);
-    SDL_GL_LoadLibrary("@rpath/libEGL.dylib");
-#endif
 #endif
     
     BootProfile::begin(BootProfile::GLInit);
@@ -938,53 +797,10 @@ static int mkxp_main(int argc, char *argv[]) {
     if (!win) {
       showInitError(std::string("Error creating window: ") + SDL_GetError());
 
-#ifdef MKXPZ_STEAM
-      STEAMSHIM_deinit();
-#endif
       return 0;
     }
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     vita_glue_trace("trace: SDL_CreateWindow ok (vitaGL display path)");
-#endif
-    
-#ifdef MKXPZ_BUILD_XCODE
-    {
-        std::string downloadsPath = "/Users/" + mkxp_sys::getUserName() + "/Downloads";
-        
-        if (mkxp_fs::getCurrentDirectory().find(downloadsPath) == 0) {
-            showInitError(conf.game.title +
-                          " cannot run from the Downloads directory.\n\n" +
-                          "Please move the application to the Applications folder (or anywhere else) " +
-                          "and try again.");
-#ifdef MKXPZ_STEAM
-            STEAMSHIM_deinit();
-#endif
-            return 0;
-        }
-    }
-#endif
-    
-#if defined(MKXPZ_BUILD_XCODE)
-#define DEBUG_FSELECT_MSG "Select the folder from which to load game files. This is the folder containing the game's INI."
-#define DEBUG_FSELECT_PROMPT "Load Game"
-    if (conf.manualFolderSelect) {
-        std::string dataDirStr = mkxp_fs::selectPath(win, DEBUG_FSELECT_MSG, DEBUG_FSELECT_PROMPT);
-        if (!dataDirStr.empty()) {
-            conf.gameFolder = dataDirStr;
-            mkxp_fs::setCurrentDirectory(dataDirStr.c_str());
-            Debug() << "Current directory set to" << dataDirStr;
-            conf.read(argc, argv);
-            conf.readGameINI();
-        }
-    }
-#endif
-
-    /* OSX and Windows have their own native ways of
-     * dealing with icons; don't interfere with them */
-#ifdef __LINUX__
-    setupWindowIcon(conf, win);
-#else
-    (void)setupWindowIcon;
 #endif
 
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
@@ -1011,9 +827,6 @@ static int mkxp_main(int argc, char *argv[]) {
       IMG_Quit();
       SDL_Quit();
 
-#ifdef MKXPZ_STEAM
-      STEAMSHIM_deinit();
-#endif
       return 0;
     }
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
@@ -1029,12 +842,7 @@ static int mkxp_main(int argc, char *argv[]) {
 
     EventThread eventThread;
 
-#ifndef MKXPZ_INIT_GL_LATER
-    SDL_GLContext glCtx = initGL(win, conf, 0);
-    BootProfile::end(BootProfile::GLInit);
-#else
     SDL_GLContext glCtx = NULL;
-#endif
 #ifdef MKXPZ_VITAGL_BACKEND
     vita_glue_vgl_pool_ledger("boot");
 #endif
@@ -1051,11 +859,6 @@ static int mkxp_main(int argc, char *argv[]) {
 
     /* Load and post key bindings */
     rtData.bindingUpdateMsg.post(loadBindings(conf));
-    
-#ifdef MKXPZ_BUILD_XCODE
-    // Create Touch Bar
-    initTouchBar(win, conf);
-#endif
 
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     // Arm before unwinding rtData, eventThread and conf if event processing throws.
@@ -1197,14 +1000,6 @@ static int mkxp_main(int argc, char *argv[]) {
 #endif
     SDL_DestroyWindow(win);
 
-#if defined(__WIN32__)
-    if (wsadata.wVersion)
-      WSACleanup();
-#endif
-
-#ifdef MKXPZ_STEAM
-    STEAMSHIM_deinit();
-#endif
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
     vitaShutdownProgress(VitaShutdownSound);
 #endif
@@ -1300,7 +1095,7 @@ static SDL_GLContext initGL(SDL_Window *win, Config &conf,
                             RGSSThreadData *threadData) {
   SDL_GLContext glCtx{};
 
-  /* Setup GL context. Must be done in main thread since macOS 10.15 */
+  /* The RGSS worker creates and owns the GL context. */
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     
   if (conf.debugMode)
@@ -1309,7 +1104,7 @@ static SDL_GLContext initGL(SDL_Window *win, Config &conf,
   glCtx = SDL_GL_CreateContext(win);
 
   if (!glCtx) {
-    GLINIT_SHOWERROR(std::string("Could not create OpenGL context: ") + SDL_GetError());
+    rgssThreadError(threadData, std::string("Could not create OpenGL context: ") + SDL_GetError());
     return 0;
   }
 #if defined(__vita__) || defined(MKXPZ_HOST_PORT_LOGIC)
@@ -1323,7 +1118,7 @@ static SDL_GLContext initGL(SDL_Window *win, Config &conf,
   /* vitaGL logs a failed boot depth/stencil allocation and carries on; a
    * context that cannot open a scene is refused here, not left black. */
   if (!vglIsDisplayReady()) {
-    GLINIT_SHOWERROR("vitaGL could not allocate the display depth/stencil surfaces");
+    rgssThreadError(threadData, "vitaGL could not allocate the display depth/stencil surfaces");
     SDL_GL_DeleteContext(glCtx);
     return 0;
   }
@@ -1332,7 +1127,7 @@ static SDL_GLContext initGL(SDL_Window *win, Config &conf,
   try {
     initGLFunctions();
   } catch (const Exception &exc) {
-    GLINIT_SHOWERROR(exc.msg);
+    rgssThreadError(threadData, exc.msg);
     SDL_GL_DeleteContext(glCtx);
 
     return 0;
@@ -1365,6 +1160,5 @@ static SDL_GLContext initGL(SDL_Window *win, Config &conf,
   vita_glue_trace("trace: initGL leave");
 #endif
 
-  // GLDebugLogger dLogger;
   return glCtx;
 }

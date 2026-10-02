@@ -26,7 +26,7 @@
 #   - configure-vita.sh injects -L/-I via a generated cross file and
 #     points meson at the wrapper above; nothing is copied into VitaSDK.
 #
-# Pins (match mkxp-z linux/Makefile where possible):
+# Pinned dependency inputs:
 #   The downloads this script makes are pinned in vita/scripts/dep-pins.json (SHA-256 for
 #   tarballs, a full commit for git sources) and refused when they do not match; the other
 #   pins are listed in THIRD-PARTY.md. A fetched tarball tree is sealed with the identity of

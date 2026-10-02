@@ -29,14 +29,9 @@
 #include "binding-util.h"
 #include "disposable-binding.h"
 
-#if RAPI_FULL > 187
 DEF_TYPE_CUSTOMNAME(TilemapVX, "Tilemap");
 
 DEF_TYPE_CUSTOMFREE(BitmapArray, RUBY_TYPED_NEVER_FREE);
-#else
-DEF_ALLOCFUNC(TilemapVX);
-#define BitmapArrayType "BitmapArray"
-#endif
 
 RB_METHOD_GUARD(tilemapVXInitialize) {
     TilemapVX *t = 0;
@@ -155,11 +150,7 @@ RB_METHOD(tilemapVXBitmapsGet) {
 
 void tilemapVXBindingInit() {
     VALUE klass = rb_define_class("Tilemap", rb_cObject);
-#if RAPI_FULL > 187
     rb_define_alloc_func(klass, classAllocate<&TilemapVXType>);
-#else
-    rb_define_alloc_func(klass, TilemapVXAllocate);
-#endif
     
     disposableBindingInit<TilemapVX>(klass);
     
@@ -181,9 +172,7 @@ void tilemapVXBindingInit() {
     }
     
     klass = rb_define_class_under(klass, "BitmapArray", rb_cObject);
-#if RAPI_FULL > 187
     rb_define_alloc_func(klass, classAllocate<&BitmapArrayType>);
-#endif
     
     _rb_define_method(klass, "[]=", tilemapVXBitmapsSet);
     _rb_define_method(klass, "[]", tilemapVXBitmapsGet);

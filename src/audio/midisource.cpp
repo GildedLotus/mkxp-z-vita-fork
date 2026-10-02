@@ -44,8 +44,8 @@
 /* Vocabulary:
  *
  * Tick:
- *   Ticks are the smallest batch of samples that fluidsynth
- *   allows midi state changes to take effect in, ie. if two midi
+ *   Ticks are the smallest batch of samples in which the synthesizer
+ *   applies MIDI state changes, ie. if two MIDI
  *   events are fired within less than a tick, it will look as
  *   if they fired at the same time. Midisource therefore always
  *   synthesizes sample blocks which are multiples of ticks.

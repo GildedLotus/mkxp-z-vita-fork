@@ -53,15 +53,7 @@ static int getButtonArg(VALUE *argv) {
         num = FIX2INT(*argv);
     } else if (SYMBOL_P(*argv)) {
         VALUE symHash = getRbData()->buttoncodeHash;
-#if RAPI_FULL > 187
         num = FIX2INT(rb_hash_lookup2(symHash, *argv, INT2FIX(Input::None)));
-#else
-        VALUE res = rb_hash_aref(symHash, *argv);
-        if (!NIL_P(res))
-            num = FIX2INT(res);
-        else
-            num = Input::None;
-#endif
     } else {
         // FIXME: RMXP allows only few more types that
         // don't make sense (symbols in pre 3, floats)

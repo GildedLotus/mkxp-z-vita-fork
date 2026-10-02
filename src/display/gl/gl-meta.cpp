@@ -1905,12 +1905,11 @@ void vaoUnbind(VAO &vao)
 	}
 }
 
-/* Bicubic, Lanczos3 and xBRZ are not built without optional shaders: they
- * draw as Bilinear, which is said once in the log. */
+/* Bicubic, Lanczos3 and xBRZ are not built on Vita: they draw as Bilinear,
+ * which is said once in the log. */
 static int availableScalingMethod(int method)
 {
-#ifdef MKXPZ_NO_OPTIONAL_SHADERS
-	if (method >= Bicubic)
+	if (method > Bilinear)
 	{
 		static bool logged = false;
 		if (!logged)
@@ -1923,7 +1922,6 @@ static int availableScalingMethod(int method)
 		}
 		return Bilinear;
 	}
-#endif
 	return method;
 }
 
@@ -1990,6 +1988,7 @@ int smoothScalingMethod(int scaleIsSpecial)
 
 static void _blitBegin(FBO::ID fbo, const Vec2i &size, int scaleIsSpecial)
 {
+	(void) scaleIsSpecial;
 	if (HAVE_NATIVE_BLIT)
 	{
 		FBO::boundFramebufferID = fbo;
@@ -2000,53 +1999,11 @@ static void _blitBegin(FBO::ID fbo, const Vec2i &size, int scaleIsSpecial)
 		FBO::bind(fbo);
 		glState.viewport.pushSet(IntRect(0, 0, size.x, size.y));
 
-		switch (smoothScalingMethod(scaleIsSpecial))
-		{
-#ifndef MKXPZ_NO_OPTIONAL_SHADERS
-		case Bicubic:
-		{
-			BicubicShader &shader = shState->shaders().bicubic;
-			shader.bind();
-			shader.applyViewportProj();
-			shader.setTranslation(Vec2i());
-			shader.setTexSize(Vec2i(size.x, size.y));
-			shader.setSharpness(shState->config().bicubicSharpness);
-		}
-
-			break;
-		case Lanczos3:
-		{
-			Lanczos3Shader &shader = shState->shaders().lanczos3;
-			shader.bind();
-			shader.applyViewportProj();
-			shader.setTranslation(Vec2i());
-			shader.setTexSize(Vec2i(size.x, size.y));
-		}
-
-			break;
-#ifdef MKXPZ_SSL
-		case xBRZ:
-		{
-			XbrzShader &shader = shState->shaders().xbrz;
-			shader.bind();
-			shader.applyViewportProj();
-			shader.setTranslation(Vec2i());
-			shader.setTexSize(Vec2i(size.x, size.y));
-			shader.setTargetScale(Vec2(1., 1.));
-		}
-
-			break;
-#endif
-#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
-		default:
-		{
-			SimpleShader &shader = shState->shaders().simple;
-			shader.bind();
-			shader.applyViewportProj();
-			shader.setTranslation(Vec2i());
-			shader.setTexSize(Vec2i(size.x, size.y));
-		}
-		}
+		SimpleShader &shader = shState->shaders().simple;
+		shader.bind();
+		shader.applyViewportProj();
+		shader.setTranslation(Vec2i());
+		shader.setTexSize(Vec2i(size.x, size.y));
 	}
 }
 
@@ -2098,6 +2055,7 @@ void blitBeginScreen(const Vec2i &size, int scaleIsSpecial)
 
 void blitSource(TEXFBO &source, int scaleIsSpecial)
 {
+	(void) scaleIsSpecial;
 	blitSrcWidthLores = source.width;
 	blitSrcHeightLores = source.height;
 	if (source.selfHires != nullptr) {
@@ -2115,43 +2073,9 @@ void blitSource(TEXFBO &source, int scaleIsSpecial)
 	}
 	else
 	{
-		switch (smoothScalingMethod(scaleIsSpecial))
-		{
-#ifndef MKXPZ_NO_OPTIONAL_SHADERS
-		case Bicubic:
-		{
-			BicubicShader &shader = shState->shaders().bicubic;
-			shader.bind();
-			shader.setTexSize(Vec2i(blitSrcWidthHires, blitSrcHeightHires));
-		}
-
-			break;
-		case Lanczos3:
-		{
-			Lanczos3Shader &shader = shState->shaders().lanczos3;
-			shader.bind();
-			shader.setTexSize(Vec2i(blitSrcWidthHires, blitSrcHeightHires));
-		}
-
-			break;
-#ifdef MKXPZ_SSL
-		case xBRZ:
-		{
-			XbrzShader &shader = shState->shaders().xbrz;
-			shader.bind();
-			shader.setTexSize(Vec2i(blitSrcWidthHires, blitSrcHeightHires));
-		}
-
-			break;
-#endif
-#endif /* !MKXPZ_NO_OPTIONAL_SHADERS */
-		default:
-		{
-			SimpleShader &shader = shState->shaders().simple;
-			shader.bind();
-			shader.setTexSize(Vec2i(blitSrcWidthHires, blitSrcHeightHires));
-		}
-		}
+		SimpleShader &shader = shState->shaders().simple;
+		shader.bind();
+		shader.setTexSize(Vec2i(blitSrcWidthHires, blitSrcHeightHires));
 		if (source.selfHires != nullptr) {
 			TEX::bind(source.selfHires->tex);
 		}
@@ -2205,13 +2129,6 @@ void blitRectangle(const IntRect &src, const IntRect &dst, bool smooth)
 	}
 	else
 	{
-#if defined(MKXPZ_SSL) && !defined(MKXPZ_NO_OPTIONAL_SHADERS)
-		if (shState->config().smoothScaling == xBRZ)
-		{
-			XbrzShader &shader = shState->shaders().xbrz;
-			shader.setTargetScale(Vec2((float)(shState->config().xbrzScalingFactor), (float)(shState->config().xbrzScalingFactor)));
-		}
-#endif
 		if (smooth)
 			TEX::setSmooth(true);
 
